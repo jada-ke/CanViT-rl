@@ -1,0 +1,56 @@
+Bootstrap: docker
+From: nvcr.io/nvidia/pytorch:25.11-py3
+
+# NVIDIA PyTorch 25.11 ships with:
+#   - Python 3.12
+#   - PyTorch 2.10.0a0
+#   - CUDA 13.0.x
+# Check https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes
+# for updates if you need a different CUDA version.
+
+%post
+    set -eux
+
+    # Fixed by Codex on 2026-05-29
+    # Problem: The image used `pip install /canvit-rl[dev]`, but this repo now
+    # stores dev dependencies in uv dependency groups and resolves Git sources
+    # such as canvit-eval through [tool.uv.sources].
+    # Solution: Install uv, sync the project into an /opt virtualenv, and expose
+    # that environment at runtime. The venv can see NVIDIA's preinstalled Torch
+    # packages, and uv skips reinstalling torch/torchvision while still resolving
+    # Git sources from the current pyproject.toml.
+    # Result: Container builds use the same dependency resolver as local and
+    # Compute Canada runs can bind the live repo over /canvit-rl safely.
+    python -m pip install --upgrade pip --quiet
+    python -m pip install uv --quiet
+    if ! command -v git >/dev/null 2>&1; then
+        apt-get update
+        apt-get install -y --no-install-recommends git
+        rm -rf /var/lib/apt/lists/*
+    fi
+    cd /canvit-rl
+    UV_PROJECT_ENVIRONMENT=/opt/canvit-rl-venv uv venv --system-site-packages
+    UV_PROJECT_ENVIRONMENT=/opt/canvit-rl-venv uv sync \
+        --group dev \
+        --no-install-package torch \
+        --no-install-package torchvision
+
+%files
+    # Copy the entire repo into the container at build time.
+    # Run: apptainer build canvit_rl.sif apptainer/canvit_rl.def
+    # from the repo root.
+    . /canvit-rl
+
+%environment
+    export PYTHONUNBUFFERED=1
+    export PATH=/opt/canvit-rl-venv/bin:$PATH
+    # Paths set here are available at runtime but NOT at %post time.
+    # Runtime paths (checkpoints, datasets) come from --env or .envrc.
+
+%runscript
+    exec /opt/canvit-rl-venv/bin/python "$@"
+
+%labels
+    Maintainer canvit-rl
+    PyTorch 2.10.0a0
+    Python 3.12

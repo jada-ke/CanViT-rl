@@ -1,0 +1,10 @@
+.envrc
+.envrc.example
+datasets/ADE20k
+checkpoints
+results
+*.sif
+__pycache__
+AGENTS.md
+CHANGE_COMMENTS.md
+codex.md

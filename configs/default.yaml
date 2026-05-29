@@ -1,0 +1,25 @@
+# configs/default.yaml
+
+# --- Device ---
+device: auto  # auto | cpu | cuda | mps
+
+# --- Environment ---
+max_steps: 5
+canvas_grid_size: 64
+
+# --- Datasets ---
+dataset: datasets/ADE20k
+
+# --- Policy ---
+hidden_dim: 256
+
+# --- Training ---
+n_episodes: 1000
+gamma: 0.0        # 0.0 = myopic (pure reward model, policy-agnostic targets)
+lr: 3.e-4
+lambda_scale: 0.01  # reward = Δsim - lambda_scale * scale
+
+# --- Logging & Checkpoints ---
+log_interval: 50
+checkpoint_interval: 50
+checkpoint_dir: checkpoints
