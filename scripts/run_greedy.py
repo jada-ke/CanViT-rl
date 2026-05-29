@@ -182,7 +182,14 @@ def main():
             t=args.t,
             k=args.k,
             device=device,
-            seed=args.seed + ep,
+            # Fixed by Codex on 2026-05-29
+            # Problem: Greedy candidate sampling was seeded by episode order,
+            # so the same image could get different timestep candidates if the
+            # selected image order changed between runs.
+            # Solution: Derive the episode seed from the stable dataset index.
+            # Result: A given image index reproduces its t=1, t=2, ... candidate
+            # pools across reruns with the same base --seed.
+            seed=args.seed + idx,
             mask=mask if args.miou else None,
             probe=probe,
             canvas_grid_size=cfg.canvas_grid_size if args.miou else None,

@@ -148,6 +148,7 @@ def greedy_step(
     max_scale: float = 1.0,
     objective: GreedyObjective = "cosine",
     kl_temperature: float = 1.0,
+    sample_seed: int | None = None,
 ) -> tuple[Viewpoint, RecurrentState, float, float]:
     """
     Evaluate K candidate viewpoints and commit the best one.
@@ -168,6 +169,7 @@ def greedy_step(
         max_scale:      Maximum viewpoint scale.
         objective:      Candidate score: "cosine" or "kl".
         kl_temperature: Temperature for KL softmax distributions.
+        sample_seed: Optional seed for deterministic candidate sampling.
 
     Returns:
         best_vp:        The winning Viewpoint.
@@ -175,14 +177,33 @@ def greedy_step(
         best_sim:       Cosine similarity achieved by the winning viewpoint.
         best_score:     Objective score used to select the winning viewpoint.
     """
-    candidates = random_viewpoints(
-        batch_size=1,
-        device=device,
-        n_viewpoints=k,
-        min_scale=min_scale,
-        max_scale=max_scale,
-        start_with_full_scene=False,
-    )
+    if sample_seed is None:
+        candidates = random_viewpoints(
+            batch_size=1,
+            device=device,
+            n_viewpoints=k,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            start_with_full_scene=False,
+        )
+    else:
+        # Fixed by Codex on 2026-05-29
+        # Problem: Candidate samples changed between reruns, making a given
+        # image/timestep hard to compare even with the same greedy settings.
+        # Solution: Seed only the candidate draw inside a forked RNG context,
+        # using a timestep-specific seed supplied by the episode runner.
+        # Result: Different timesteps still get different candidates, while
+        # rerunning the same seeded episode reproduces each timestep's pool.
+        with torch.random.fork_rng():
+            torch.manual_seed(sample_seed)
+            candidates = random_viewpoints(
+                batch_size=1,
+                device=device,
+                n_viewpoints=k,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                start_with_full_scene=False,
+            )
 
     best_vp = None
     best_state = None
@@ -337,6 +358,7 @@ def run_greedy_episode(
                 device=device,
                 objective=objective,
                 kl_temperature=kl_temperature,
+                sample_seed=None if seed is None else seed + step_idx,
             )
         reward = sim - prev_sim
         prev_sim = sim
@@ -346,7 +368,7 @@ def run_greedy_episode(
         scores.append(score)
         rewards.append(reward)
         scales.append(float(vp.scales[0].item()))
-        centers.append(vp.centers[0].cpu().tolist())
+        centers.append(vp.centers[0].cpu().tolist()) 
         if probe is not None:
             assert mious is not None
             assert mask_dev is not None and canvas_grid_size is not None
