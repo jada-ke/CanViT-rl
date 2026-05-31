@@ -64,6 +64,55 @@ def _score_canvas_cls(
     raise ValueError(f"Unknown greedy objective: {objective!r}")
 
 
+def _seg_logits_from_state(
+    model: GreedyModel,
+    state: RecurrentState,
+    probe: torch.nn.Module,
+    canvas_grid_size: int,
+    batch_size: int,
+) -> torch.Tensor:
+    """Decode ADE20K segmentation logits from a CanViT canvas state."""
+    spatial = model.get_spatial(state.canvas).view(
+        batch_size,
+        canvas_grid_size,
+        canvas_grid_size,
+        -1,
+    )
+    with torch.autocast(device_type=spatial.device.type, enabled=False):
+        return probe(spatial.float()).float()
+
+
+def _score_segmentation_kl(
+    model: GreedyModel,
+    state: RecurrentState,
+    probe: torch.nn.Module,
+    canvas_grid_size: int,
+    target_prob: torch.Tensor,
+    kl_temperature: float,
+    batch_size: int,
+) -> float:
+    """
+    Score a canvas state by negative KL to a full-scene segmentation target.
+    """
+    logits = _seg_logits_from_state(
+        model=model,
+        state=state,
+        probe=probe,
+        canvas_grid_size=canvas_grid_size,
+        batch_size=batch_size,
+    )
+    if logits.shape[-2:] != target_prob.shape[-2:]:
+        logits = F.interpolate(
+            logits,
+            size=target_prob.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    log_prob = F.log_softmax(logits / kl_temperature, dim=1)
+    kl = F.kl_div(log_prob, target_prob, reduction="batchmean")
+    return -float(kl.item())
+
+
 def _mean_iou_from_prediction(
     pred: torch.Tensor,
     mask: torch.Tensor,
@@ -112,14 +161,13 @@ def miou_from_state(
     """
     with torch.inference_mode():
         batch_size = mask.shape[0] if mask.ndim == 3 else 1
-        spatial = model.get_spatial(state.canvas).view(
-            batch_size,
-            canvas_grid_size,
-            canvas_grid_size,
-            -1,
+        logits = _seg_logits_from_state(
+            model=model,
+            state=state,
+            probe=probe,
+            canvas_grid_size=canvas_grid_size,
+            batch_size=batch_size,
         )
-        with torch.autocast(device_type=spatial.device.type, enabled=False):
-            logits = probe(spatial.float())
         if logits.shape[-2:] != mask.shape[-2:]:
             logits = F.interpolate(
                 logits,
@@ -149,6 +197,9 @@ def greedy_step(
     objective: GreedyObjective = "cosine",
     kl_temperature: float = 1.0,
     sample_seed: int | None = None,
+    probe: torch.nn.Module | None = None,
+    canvas_grid_size: int | None = None,
+    seg_kl_target_prob: torch.Tensor | None = None,
 ) -> tuple[Viewpoint, RecurrentState, float, float]:
     """
     Evaluate K candidate viewpoints and commit the best one.
@@ -167,9 +218,12 @@ def greedy_step(
         device:         Torch device.
         min_scale:      Minimum viewpoint scale.
         max_scale:      Maximum viewpoint scale.
-        objective:      Candidate score: "cosine" or "kl".
+        objective:      Candidate score: "cosine", "kl", or "seg-kl".
         kl_temperature: Temperature for KL softmax distributions.
         sample_seed: Optional seed for deterministic candidate sampling.
+        probe: Optional ADE20K probe for segmentation-KL scoring.
+        canvas_grid_size: Canvas grid size for segmentation-KL scoring.
+        seg_kl_target_prob: Full-scene segmentation target distribution.
 
     Returns:
         best_vp:        The winning Viewpoint.
@@ -220,12 +274,26 @@ def greedy_step(
             out = model(glimpse=glimpse, state=state, viewpoint=vp)
             canvas_cls = out.state.recurrent_cls.squeeze(1).float()  # [1, 768]
             sim = reconstruction_reward(canvas_cls, teacher_cls)
-            score = _score_canvas_cls(
-                canvas_cls=canvas_cls,
-                teacher_cls=teacher_cls,
-                objective=objective,
-                kl_temperature=kl_temperature,
-            )
+            if objective == "seg-kl":
+                assert probe is not None
+                assert canvas_grid_size is not None
+                assert seg_kl_target_prob is not None
+                score = _score_segmentation_kl(
+                    model=model,
+                    state=out.state,
+                    probe=probe,
+                    canvas_grid_size=canvas_grid_size,
+                    target_prob=seg_kl_target_prob,
+                    kl_temperature=kl_temperature,
+                    batch_size=image.shape[0],
+                )
+            else:
+                score = _score_canvas_cls(
+                    canvas_cls=canvas_cls,
+                    teacher_cls=teacher_cls,
+                    objective=objective,
+                    kl_temperature=kl_temperature,
+                )
 
             if score > best_score:
                 best_score = score
@@ -246,6 +314,9 @@ def full_scene_step(
     device: torch.device,
     objective: GreedyObjective = "cosine",
     kl_temperature: float = 1.0,
+    probe: torch.nn.Module | None = None,
+    canvas_grid_size: int | None = None,
+    seg_kl_target_prob: torch.Tensor | None = None,
 ) -> tuple[Viewpoint, RecurrentState, float, float]:
     """Commit one full-scene glimpse and return the updated state/similarity."""
     with torch.inference_mode():
@@ -258,12 +329,26 @@ def full_scene_step(
         out = model(glimpse=glimpse, state=state, viewpoint=vp)
         canvas_cls = out.state.recurrent_cls.squeeze(1).float()
         sim = reconstruction_reward(canvas_cls, teacher_cls)
-        score = _score_canvas_cls(
-            canvas_cls=canvas_cls,
-            teacher_cls=teacher_cls,
-            objective=objective,
-            kl_temperature=kl_temperature,
-        )
+        if objective == "seg-kl":
+            assert probe is not None
+            assert canvas_grid_size is not None
+            assert seg_kl_target_prob is not None
+            score = _score_segmentation_kl(
+                model=model,
+                state=out.state,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                target_prob=seg_kl_target_prob,
+                kl_temperature=kl_temperature,
+                batch_size=image.shape[0],
+            )
+        else:
+            score = _score_canvas_cls(
+                canvas_cls=canvas_cls,
+                teacher_cls=teacher_cls,
+                objective=objective,
+                kl_temperature=kl_temperature,
+            )
     return vp, out.state, sim, score
 
 
@@ -302,7 +387,7 @@ def run_greedy_episode(
         canvas_grid_size: Canvas grid size used to reshape the state features.
         start_with_full_scene: If True, timestep 0 is a committed full-scene
             glimpse; later timesteps use greedy K-candidate search.
-        objective: Greedy search objective, either "cosine" or "kl".
+        objective: Greedy search objective: "cosine", "kl", or "seg-kl".
         kl_temperature: Softmax temperature used by the KL objective.
 
     Returns:
@@ -319,14 +404,16 @@ def run_greedy_episode(
         device = next(model.parameters()).device
     if seed is not None:
         torch.manual_seed(seed)
-    if objective not in {"cosine", "kl"}:
-        raise ValueError("objective must be 'cosine' or 'kl'.")
+    if objective not in {"cosine", "kl", "seg-kl"}:
+        raise ValueError("objective must be 'cosine', 'kl', or 'seg-kl'.")
     if kl_temperature <= 0:
         raise ValueError("kl_temperature must be positive.")
     if (mask is None) != (probe is None):
         raise ValueError("Pass both mask and probe to compute per-timestep mIoU.")
     if probe is not None and canvas_grid_size is None:
         raise ValueError("Pass canvas_grid_size when computing per-timestep mIoU.")
+    if objective == "seg-kl" and (probe is None or canvas_grid_size is None):
+        raise ValueError("seg-kl objective requires --miou/probe and canvas_grid_size.")
 
     state = init_state
     prev_sim = 0.0
@@ -334,6 +421,39 @@ def run_greedy_episode(
     viewpoints, sims, scores, rewards, scales, centers = [], [], [], [], [], []
     mious = [] if probe is not None else None
     mask_dev = mask.to(device) if mask is not None else None
+    seg_kl_target_prob = None
+    if objective == "seg-kl":
+        assert probe is not None and canvas_grid_size is not None
+        # Fixed by Codex on 2026-05-29
+        # Problem: KL over CLS embedding coordinates is not an AdaGlimpse-like
+        # task loss and can leave candidate rankings unchanged by temperature.
+        # Solution: Build a full-scene ADE20K probe distribution once per
+        # episode and score candidate states by negative segmentation KL.
+        # Result: The k-armed greedy runner can use a meaningful KL objective
+        # whenever the --miou segmentation probe path is active.
+        with torch.inference_mode():
+            teacher_vp = Viewpoint.full_scene(batch_size=image.shape[0], device=device)
+            teacher_glimpse = sample_at_viewpoint(
+                spatial=image,
+                viewpoint=teacher_vp,
+                glimpse_size_px=glimpse_size_px,
+            )
+            teacher_out = model(
+                glimpse=teacher_glimpse,
+                state=init_state,
+                viewpoint=teacher_vp,
+            )
+            teacher_logits = _seg_logits_from_state(
+                model=model,
+                state=teacher_out.state,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                batch_size=image.shape[0],
+            )
+            seg_kl_target_prob = F.softmax(
+                teacher_logits / kl_temperature,
+                dim=1,
+            ).detach()
 
     for step_idx in range(t):
         if step_idx == 0 and start_with_full_scene:
@@ -346,6 +466,9 @@ def run_greedy_episode(
                 device=device,
                 objective=objective,
                 kl_temperature=kl_temperature,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                seg_kl_target_prob=seg_kl_target_prob,
             )
         else:
             vp, state, sim, score = greedy_step(
@@ -359,6 +482,9 @@ def run_greedy_episode(
                 objective=objective,
                 kl_temperature=kl_temperature,
                 sample_seed=None if seed is None else seed + step_idx,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                seg_kl_target_prob=seg_kl_target_prob,
             )
         reward = sim - prev_sim
         prev_sim = sim

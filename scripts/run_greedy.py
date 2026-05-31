@@ -9,6 +9,7 @@ Usage:
     python scripts/run_greedy.py --miou --episodes 5 --t 5 --k 10 --dataset datasets/ADE20k
     python scripts/run_greedy.py --miou --all --split validation --t 5 --k 10
     python scripts/run_greedy.py --miou --all --split validation --t 5 --k 10 --objective kl
+    python scripts/run_greedy.py --miou --episodes 5 --objective seg-kl --kl-temperature 1.0 --t 5 --k 50
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ def main():
     parser.add_argument("--k", type=int, default=5, help="Candidates per step")
     parser.add_argument(
         "--objective",
-        choices=["cosine", "kl"],
+        choices=["cosine", "kl", "seg-kl"],
         default="cosine",
         help="Greedy candidate-selection objective",
     )
@@ -79,6 +80,9 @@ def main():
         help="Print per-episode step metrics; default is quiet for --all",
     )
     args = parser.parse_args()
+
+    if args.objective == "seg-kl" and not args.miou:
+        parser.error("--objective seg-kl requires --miou")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -254,6 +258,11 @@ def main():
             score_text = (
                 f"kl={-mean_score:.4f}  "
                 f"kl_reduction={mean_objective_reward:+.4f}"
+            )
+        elif args.objective == "seg-kl":
+            score_text = (
+                f"seg_kl={-mean_score:.4f}  "
+                f"seg_kl_reduction={mean_objective_reward:+.4f}"
             )
         else:
             score_text = (
