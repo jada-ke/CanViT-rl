@@ -1,0 +1,413 @@
+"""
+Evaluate a trained AdaGlimpse-like CanViT SAC actor on ADE20K mIoU.
+
+Usage:
+    uv run python scripts/eval_adaglimpse_canvit_sac_miou.py
+    uv run python scripts/eval_adaglimpse_canvit_sac_miou.py \
+        --checkpoint checkpoints/adaglimpse_canvit_sac/latest.pt \
+        --t 5 --miou-mode mean
+    uv run python scripts/eval_adaglimpse_canvit_sac_miou.py \
+        --checkpoint checkpoints/adaglimpse_canvit_sac/actor_final.pt \
+        --t 5 --importance-mode zeros --miou-mode accumulator
+"""
+
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+from canvit_pytorch import (
+    CanViTForSemanticSegmentation,
+    Viewpoint,
+    resolve_canvit_repo,
+    sample_at_viewpoint,
+)
+from canvit_specialize.datasets.ade20k import (
+    ADE20kDataset,
+    IGNORE_LABEL,
+    NUM_CLASSES,
+    make_val_transforms,
+)
+from canvit_specialize.metrics import mIoUAccumulator
+from torch import Tensor
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from canvit_rl.env import CanViTEnvConfig, get_device
+from canvit_rl.greedy import miou_from_state
+from scripts.train_adaglimpse_canvit_sac import (
+    CanViTSequenceEncoder,
+    GaussianActor,
+    _action_to_viewpoint,
+    _append_glimpse,
+    _batch_from_sequence,
+    _empty_sequence,
+    _extract_importance,
+    _extract_local_patches,
+)
+
+
+def _update_miou(
+    acc: mIoUAccumulator,
+    probe: torch.nn.Module,
+    features: Tensor,
+    masks: Tensor,
+) -> None:
+    """Update one timestep's dataset-level mIoU accumulator."""
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        logits = probe(features.float())
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(
+            logits,
+            size=masks.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    acc.update(logits.argmax(dim=1), masks)
+
+
+def _load_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Load either latest.pt dict checkpoints or bare actor_final.pt weights."""
+    # Fixed by Codex on 2026-06-02
+    # Problem: PyTorch 2.6 defaults torch.load(weights_only=True), but
+    # latest.pt contains trusted local argparse metadata with Path objects.
+    # Solution: Load this local evaluator checkpoint with weights_only=False.
+    # Result: Both latest.pt metadata checkpoints and bare actor state_dict
+    # checkpoints can be evaluated without PosixPath safe-global errors.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict) and "actor" in checkpoint:
+        return checkpoint["actor"], dict(checkpoint.get("args", {}))
+    if isinstance(checkpoint, dict):
+        return checkpoint, {}
+    raise TypeError(f"Unsupported checkpoint format at {path}")
+
+
+def _checkpoint_value(
+    checkpoint_args: dict[str, Any],
+    key: str,
+    fallback: Any,
+) -> Any:
+    """Read a training arg from checkpoint metadata with CLI fallback."""
+    return checkpoint_args.get(key.replace("-", "_"), fallback)
+
+
+def _build_actor(
+    *,
+    actor_state: dict[str, torch.Tensor],
+    args: argparse.Namespace,
+    checkpoint_args: dict[str, Any],
+    device: torch.device,
+) -> GaussianActor:
+    """Reconstruct the SAC actor architecture and load checkpoint weights."""
+    d_model = int(_checkpoint_value(checkpoint_args, "d-model", args.d_model))
+    n_heads = int(_checkpoint_value(checkpoint_args, "n-heads", args.n_heads))
+    n_layers = int(_checkpoint_value(checkpoint_args, "n-layers", args.n_layers))
+    n_patches = int(_checkpoint_value(checkpoint_args, "n-patches", args.n_patches))
+    patch_dim = int(_checkpoint_value(checkpoint_args, "patch-dim", args.patch_dim))
+    max_steps = int(_checkpoint_value(checkpoint_args, "t", args.t))
+    encoder = CanViTSequenceEncoder(
+        patch_dim=patch_dim,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        max_steps=max_steps,
+        n_patches=n_patches,
+    )
+    actor = GaussianActor(encoder, d_model).to(device).eval()
+    actor.load_state_dict(actor_state)
+    for param in actor.parameters():
+        param.requires_grad_(False)
+    return actor
+
+
+def _deterministic_action(
+    actor: GaussianActor,
+    batch: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Return tanh(mean) action for deterministic policy evaluation."""
+    mean, _ = actor(batch)
+    return torch.tanh(mean)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=Path("checkpoints/adaglimpse_canvit_sac/latest.pt"),
+    )
+    parser.add_argument("--t", type=int, default=5)
+    parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
+    parser.add_argument(
+        "--split",
+        choices=["training", "validation"],
+        default="validation",
+    )
+    parser.add_argument("--probe-repo", type=str, default=None)
+    parser.add_argument("--output", type=Path, default=Path("results/sac_miou.pt"))
+    parser.add_argument("--max-images", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--min-scale", type=float, default=0.05)
+    parser.add_argument(
+        "--importance-mode",
+        choices=["attention", "zeros", "patch-norm"],
+        default=None,
+    )
+    parser.add_argument("--stochastic", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--n-heads", type=int, default=4)
+    parser.add_argument("--n-layers", type=int, default=2)
+    parser.add_argument("--n-patches", type=int, default=64)
+    parser.add_argument("--patch-dim", type=int, default=768)
+    parser.add_argument(
+        "--miou-mode",
+        choices=["accumulator", "mean"],
+        default="accumulator",
+        help=(
+            "accumulator uses dataset-level mIoUAccumulator; mean averages "
+            "per-image mIoU values without dataset-level integration"
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.t < 0:
+        raise ValueError("--t must be non-negative.")
+    if args.min_scale <= 0 or args.min_scale > 1:
+        raise ValueError("Require 0 < --min-scale <= 1.")
+
+    torch.manual_seed(args.seed)
+    cfg = CanViTEnvConfig()
+    device = get_device()
+    print(f"Device: {device}")
+
+    actor_state, checkpoint_args = _load_checkpoint(args.checkpoint)
+    checkpoint_t = int(_checkpoint_value(checkpoint_args, "t", args.t))
+    if args.t != checkpoint_t:
+        print(
+            f"Using --t {args.t} for rollout; checkpoint actor was trained "
+            f"with max_steps={checkpoint_t}"
+        )
+    n_patches = int(_checkpoint_value(checkpoint_args, "n-patches", args.n_patches))
+    patch_dim = int(_checkpoint_value(checkpoint_args, "patch-dim", args.patch_dim))
+    min_scale = float(_checkpoint_value(checkpoint_args, "min-scale", args.min_scale))
+    importance_mode = args.importance_mode or str(
+        _checkpoint_value(checkpoint_args, "importance-mode", "zeros")
+    )
+
+    actor = _build_actor(
+        actor_state=actor_state,
+        args=args,
+        checkpoint_args=checkpoint_args,
+        device=device,
+    )
+
+    img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
+    dataset = ADE20kDataset(
+        root=Path(args.dataset),
+        split=args.split,
+        img_transform=img_tf,
+        mask_transform=mask_tf,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    print(f"Dataset: {len(dataset)} {args.split} images")
+
+    probe_repo = args.probe_repo or resolve_canvit_repo(
+        f"probe-ade20k-40k-s512-c{cfg.canvas_grid_size}-in21k"
+    )
+    print(f"Loading CanViT segmentation model with probe: {probe_repo}")
+    seg = (
+        CanViTForSemanticSegmentation.from_pretrained_with_probe(
+            pretrained_repo=cfg.checkpoint,
+            probe_repo=probe_repo,
+        )
+        .eval()
+        .to(device)
+    )
+    model = seg.canvit
+    probe = seg.head
+    for param in model.parameters():
+        param.requires_grad_(False)
+    for param in probe.parameters():
+        param.requires_grad_(False)
+
+    n_steps = args.t + 1
+    accs = (
+        [mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device) for _ in range(n_steps)]
+        if args.miou_mode == "accumulator"
+        else None
+    )
+    miou_sums = [0.0 for _ in range(n_steps)]
+    scale_sums = [0.0 for _ in range(n_steps)]
+    count_sums = [0 for _ in range(n_steps)]
+    n_images = 0
+    t_start = time.monotonic()
+
+    with torch.inference_mode():
+        for image_idx, (image, mask) in enumerate(tqdm(loader, desc="Evaluating SAC")):
+            if args.max_images is not None and image_idx >= args.max_images:
+                break
+
+            image = image.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            n_images += 1
+            state = model.init_state(
+                batch_size=1,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+            seq = _empty_sequence(n_patches=n_patches, patch_dim=patch_dim)
+
+            # Fixed by Codex on 2026-06-02
+            # Problem: The SAC policy is trained from a full-scene warmup
+            # context, so validation must reproduce that starting sequence.
+            # Solution: Commit a full-scene glimpse at t=0, append its CanViT
+            # tuple, then let the actor choose the following continuous views.
+            # Result: mIoU-by-t is directly comparable to training logs and the
+            # random baseline with full-scene t=0.
+            full_vp = Viewpoint.full_scene(batch_size=1, device=device)
+            full_glimpse = sample_at_viewpoint(
+                spatial=image,
+                viewpoint=full_vp,
+                glimpse_size_px=cfg.glimpse_size_px,
+            )
+            out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
+            state = out.state
+            patches = _extract_local_patches(out)
+            importance = _extract_importance(
+                out=out,
+                patches=patches,
+                mode=importance_mode,
+            )
+            seq = _append_glimpse(
+                seq=seq,
+                patches=patches,
+                viewpoint=full_vp,
+                importance=importance,
+            )
+
+            step_states = [state]
+            step_scales = [1.0]
+            for _ in range(args.t):
+                batch = _batch_from_sequence(
+                    seq,
+                    max_steps=checkpoint_t,
+                    n_patches=n_patches,
+                    patch_dim=patch_dim,
+                    device=device,
+                )
+                if args.stochastic:
+                    action, _ = actor.sample(batch)
+                else:
+                    action = _deterministic_action(actor, batch)
+                vp = _action_to_viewpoint(action, min_scale=min_scale)
+                glimpse = sample_at_viewpoint(
+                    spatial=image,
+                    viewpoint=vp,
+                    glimpse_size_px=cfg.glimpse_size_px,
+                )
+                out = model(glimpse=glimpse, state=state, viewpoint=vp)
+                state = out.state
+                patches = _extract_local_patches(out)
+                importance = _extract_importance(
+                    out=out,
+                    patches=patches,
+                    mode=importance_mode,
+                )
+                seq = _append_glimpse(
+                    seq=seq,
+                    patches=patches,
+                    viewpoint=vp,
+                    importance=importance,
+                )
+                step_states.append(state)
+                step_scales.append(float(vp.scales[0].detach().cpu().item()))
+
+            for step_idx, step_state in enumerate(step_states):
+                if args.miou_mode == "accumulator":
+                    assert accs is not None
+                    spatial = model.get_spatial(step_state.canvas).view(
+                        1,
+                        cfg.canvas_grid_size,
+                        cfg.canvas_grid_size,
+                        -1,
+                    )
+                    _update_miou(accs[step_idx], probe, spatial, mask)
+                else:
+                    miou_sums[step_idx] += miou_from_state(
+                        model=model,
+                        state=step_state,
+                        probe=probe,
+                        mask=mask,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                    )
+                scale_sums[step_idx] += step_scales[step_idx]
+                count_sums[step_idx] += 1
+
+    if args.miou_mode == "accumulator":
+        assert accs is not None
+        mious = {f"t{t}": acc.compute() for t, acc in enumerate(accs)}
+    else:
+        mious = {f"t{t}": miou_sums[t] / count_sums[t] for t in range(n_steps)}
+    mean_scales = {
+        f"t{t}": scale_sums[t] / count_sums[t] for t in range(n_steps)
+    }
+    wall_time = time.monotonic() - t_start
+
+    title = (
+        "Dataset-Level SAC Actor Metrics"
+        if args.miou_mode == "accumulator"
+        else "Mean SAC Actor Metrics"
+    )
+    print(f"\n--- {title} ---")
+    for step_idx in range(n_steps):
+        key = f"t{step_idx}"
+        label = "full_scene" if step_idx == 0 else "actor"
+        print(
+            f"  t={step_idx} ({label}): "
+            f"scale={mean_scales[key]:.3f}  "
+            f"miou={mious[key]:.4f}"
+        )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "mious": mious,
+            "mean_scales": mean_scales,
+            "metadata": {
+                "policy": "adaglimpse_canvit_sac",
+                "checkpoint": str(args.checkpoint),
+                "dataset": args.dataset,
+                "split": args.split,
+                "n_images": n_images,
+                "canvas_grid_size": cfg.canvas_grid_size,
+                "glimpse_size_px": cfg.glimpse_size_px,
+                "scene_size_px": cfg.scene_size_px,
+                "n_actor_glimpses": args.t,
+                "n_logged_steps": n_steps,
+                "min_scale": min_scale,
+                "importance_mode": importance_mode,
+                "probe_repo": probe_repo,
+                "model_repo": cfg.checkpoint,
+                "seed": args.seed,
+                "stochastic": args.stochastic,
+                "miou_mode": args.miou_mode,
+                "wall_time_seconds": wall_time,
+            },
+        },
+        args.output,
+    )
+    print(f"\nSaved {args.output} after {wall_time:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
