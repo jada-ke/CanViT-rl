@@ -143,6 +143,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("results/sac_miou.pt"))
     parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--progress-interval", type=int, default=50)
     parser.add_argument("--min-scale", type=float, default=0.05)
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -166,6 +167,8 @@ def main() -> None:
         raise ValueError("--t must be non-negative.")
     if args.min_scale <= 0 or args.min_scale > 1:
         raise ValueError("Require 0 < --min-scale <= 1.")
+    if args.progress_interval <= 0:
+        raise ValueError("--progress-interval must be positive.")
 
     torch.manual_seed(args.seed)
     cfg = CanViTEnvConfig()
@@ -236,9 +239,18 @@ def main() -> None:
     count_sums = [0 for _ in range(n_steps)]
     n_images = 0
     t_start = time.monotonic()
+    total_eval_images = len(dataset)
+    if args.max_images is not None:
+        total_eval_images = min(total_eval_images, args.max_images)
+    pbar = tqdm(
+        total=total_eval_images,
+        desc="Evaluating SAC",
+        miniters=args.progress_interval,
+        maxinterval=float("inf"),
+    )
 
     with torch.inference_mode():
-        for image_idx, (image, mask) in enumerate(tqdm(loader, desc="Evaluating SAC")):
+        for image_idx, (image, mask) in enumerate(loader):
             if args.max_images is not None and image_idx >= args.max_images:
                 break
 
@@ -317,6 +329,14 @@ def main() -> None:
                     )
                 scale_sums[step_idx] += step_scales[step_idx]
                 count_sums[step_idx] += 1
+
+            if n_images % args.progress_interval == 0:
+                pbar.update(args.progress_interval)
+
+    remainder = n_images % args.progress_interval
+    if remainder:
+        pbar.update(remainder)
+    pbar.close()
 
     if args.miou_mode == "accumulator":
         assert accs is not None

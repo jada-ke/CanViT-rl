@@ -262,6 +262,34 @@ def _load_pretrained_critic(
     target_q2.load_state_dict(q2.state_dict())
 
 
+def _load_resume_checkpoint(
+    *,
+    path: Path,
+    actor: GaussianActor,
+    q1: ContinuousCritic,
+    q2: ContinuousCritic,
+    target_q1: ContinuousCritic,
+    target_q2: ContinuousCritic,
+    agent: ContinuousSAC,
+) -> tuple[int, int]:
+    """Resume model, optimizer, and counter state from a training checkpoint."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "actor" not in checkpoint:
+        raise ValueError(f"Expected training checkpoint with actor key: {path}")
+    actor.load_state_dict(checkpoint["actor"])
+    q1.load_state_dict(checkpoint["q1"])
+    q2.load_state_dict(checkpoint["q2"])
+    target_q1.load_state_dict(checkpoint.get("target_q1", q1.state_dict()))
+    target_q2.load_state_dict(checkpoint.get("target_q2", q2.state_dict()))
+    if "actor_opt" in checkpoint:
+        agent.actor_opt.load_state_dict(checkpoint["actor_opt"])
+    if "q_opt" in checkpoint:
+        agent.q_opt.load_state_dict(checkpoint["q_opt"])
+    saved_episode = int(checkpoint.get("episode", 0))
+    total_steps = int(checkpoint.get("total_steps", saved_episode))
+    return saved_episode + 1, total_steps
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=1000)
@@ -289,8 +317,9 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-starts", type=int, default=500)
     parser.add_argument("--updates-per-step", type=int, default=1)
-    parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument("--log-interval", type=int, default=500)
     parser.add_argument("--pretrained-critic", type=Path, default=None)
+    parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -302,6 +331,8 @@ def main() -> None:
         raise ValueError("--t must be non-negative.")
     if args.min_scale <= 0 or args.min_scale >= 1:
         raise ValueError("Require 0 < --min-scale < 1.")
+    if args.resume is not None and args.pretrained_critic is not None:
+        raise ValueError("Use either --resume or --pretrained-critic, not both.")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -376,9 +407,28 @@ def main() -> None:
     action_scales = deque(maxlen=args.log_interval * max(args.t, 1))
     data_iter = iter(loader)
     total_steps = 0
+    start_episode = 1
+    if args.resume is not None:
+        print(f"Resuming training checkpoint: {args.resume}")
+        start_episode, total_steps = _load_resume_checkpoint(
+            path=args.resume,
+            actor=actor,
+            q1=q1,
+            q2=q2,
+            target_q1=target_q1,
+            target_q2=target_q2,
+            agent=agent,
+        )
+        print(f"Resumed at episode={start_episode} steps={total_steps}")
 
-    desc = "Training CanViT SAC"
-    for episode in tqdm(range(1, args.episodes + 1), desc=desc):
+    remaining_episodes = max(0, args.episodes - start_episode + 1)
+    pbar = tqdm(
+        total=remaining_episodes,
+        desc="Training CanViT SAC",
+        miniters=args.log_interval,
+        maxinterval=float("inf"),
+    )
+    for episode in range(start_episode, args.episodes + 1):
         try:
             image, mask = next(data_iter)
         except StopIteration:
@@ -407,13 +457,6 @@ def main() -> None:
                 "Unexpected full-scene local patch shape. Pass matching "
                 f"--n-patches and --patch-dim. got={tuple(full_patches.shape)}"
             )
-        # Fixed by Codex on 2026-06-02
-        # Problem: The training loop should expose only the actual mIoU SAC
-        # baseline being run.
-        # Solution: Keep only full-scene warmup plus patch/coordinate sequence
-        # state and train on scaled delta-mIoU.
-        # Result: The code exposes the experiment being run without stale
-        # unrelated auxiliary reward pathways.
         seq = append_glimpse(seq=seq, patches=full_patches, viewpoint=full_vp)
         episode_mious = [
             miou_from_state(
@@ -460,7 +503,10 @@ def main() -> None:
             episode_mious.append(current_miou)
 
             patches = extract_local_patches(out)
-            if patches.shape[1] != args.n_patches or patches.shape[2] != args.patch_dim:
+            if (
+                patches.shape[1] != args.n_patches
+                or patches.shape[2] != args.patch_dim
+            ):
                 raise ValueError(
                     "Unexpected local patch shape. Pass matching --n-patches and "
                     f"--patch-dim. got={tuple(patches.shape)}"
@@ -491,6 +537,7 @@ def main() -> None:
         miou_by_t.append(episode_mious)
         if episode % args.log_interval == 0:
             mean_miou_by_t = _mean_by_step(miou_by_t, args.t + 1)
+            pbar.update(args.log_interval)
             print(
                 f"episode={episode} steps={total_steps} "
                 f"mean_raw_return={sum(raw_returns) / len(raw_returns):+.6f} "
@@ -503,10 +550,21 @@ def main() -> None:
                     "actor": actor.state_dict(),
                     "q1": q1.state_dict(),
                     "q2": q2.state_dict(),
+                    "target_q1": target_q1.state_dict(),
+                    "target_q2": target_q2.state_dict(),
+                    "actor_opt": agent.actor_opt.state_dict(),
+                    "q_opt": agent.q_opt.state_dict(),
                     "args": vars(args),
+                    "episode": episode,
+                    "total_steps": total_steps,
                 },
                 args.checkpoint_dir / "latest.pt",
             )
+
+    remainder = remaining_episodes % args.log_interval
+    if remainder:
+        pbar.update(remainder)
+    pbar.close()
 
     torch.save(actor.state_dict(), args.checkpoint_dir / "actor_final.pt")
     print(f"Saved final actor to {args.checkpoint_dir / 'actor_final.pt'}")

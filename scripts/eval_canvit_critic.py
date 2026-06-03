@@ -169,11 +169,14 @@ def main() -> None:
     parser.add_argument("--patch-dim", type=int, default=768)
     parser.add_argument("--min-scale", type=float, default=None)
     parser.add_argument("--reward-scale", type=float, default=None)
+    parser.add_argument("--progress-interval", type=int, default=10)
     parser.add_argument("--output", type=Path, default=Path("results/critic_eval.pt"))
     args = parser.parse_args()
 
     if args.t < 0 or args.k <= 1:
         raise ValueError("Require --t >= 0 and --k > 1.")
+    if args.progress_interval <= 0:
+        raise ValueError("--progress-interval must be positive.")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -238,11 +241,16 @@ def main() -> None:
     scale_sums = [0.0 for _ in range(args.t + 1)]
     n_images = 0
     t_start = time.monotonic()
+    total_eval_images = min(args.episodes, len(dataset))
+    pbar = tqdm(
+        total=total_eval_images,
+        desc="Evaluating critic",
+        miniters=args.progress_interval,
+        maxinterval=float("inf"),
+    )
 
     with torch.inference_mode():
-        for image_idx, (image, mask) in enumerate(
-            tqdm(loader, desc="Evaluating critic")
-        ):
+        for image_idx, (image, mask) in enumerate(loader):
             if image_idx >= args.episodes:
                 break
             image = image.to(device)
@@ -362,6 +370,14 @@ def main() -> None:
                 current_miou = next_miou
                 miou_sums[step_idx + 1] += current_miou
                 scale_sums[step_idx + 1] += float(vp.scales[0].cpu().item())
+
+            if n_images % args.progress_interval == 0:
+                pbar.update(args.progress_interval)
+
+    remainder = n_images % args.progress_interval
+    if remainder:
+        pbar.update(remainder)
+    pbar.close()
 
     if n_states == 0 or n_images == 0:
         raise RuntimeError("No critic evaluation states were processed.")

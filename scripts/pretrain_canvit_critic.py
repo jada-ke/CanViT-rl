@@ -77,6 +77,7 @@ def main() -> None:
     parser.add_argument("--min-scale", type=float, default=0.05)
     parser.add_argument("--reward-scale", type=float, default=100.0)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--log-interval", type=int, default=50)
     parser.add_argument(
         "--rollout-policy",
         choices=["best", "random"],
@@ -94,6 +95,8 @@ def main() -> None:
         raise ValueError("Require --t >= 0 and --k > 0.")
     if args.min_scale <= 0 or args.min_scale >= 1:
         raise ValueError("Require 0 < --min-scale < 1.")
+    if args.log_interval <= 0:
+        raise ValueError("--log-interval must be positive.")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -150,7 +153,13 @@ def main() -> None:
     losses: list[float] = []
     n_labels = 0
 
-    for episode in tqdm(range(1, args.episodes + 1), desc="Pretraining critic"):
+    pbar = tqdm(
+        total=args.episodes,
+        desc="Pretraining critic",
+        miniters=args.log_interval,
+        maxinterval=float("inf"),
+    )
+    for episode in range(1, args.episodes + 1):
         try:
             image, mask = next(data_iter)
         except StopIteration:
@@ -254,12 +263,18 @@ def main() -> None:
             )
             current_miou = next_miou
 
-        if episode % 50 == 0:
-            recent = losses[-50 * max(args.t, 1) :]
+        if episode % args.log_interval == 0:
+            recent = losses[-args.log_interval * max(args.t, 1) :]
+            pbar.update(args.log_interval)
             print(
                 f"episode={episode} labels={n_labels} "
                 f"mean_q_mse={sum(recent) / len(recent):.4f}"
             )
+
+    remainder = args.episodes % args.log_interval
+    if remainder:
+        pbar.update(remainder)
+    pbar.close()
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
