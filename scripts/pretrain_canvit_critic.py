@@ -56,6 +56,60 @@ def _repeat_batch(
     }
 
 
+def _save_checkpoint(
+    *,
+    path: Path,
+    q1: ContinuousCritic,
+    q2: ContinuousCritic,
+    opt: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    episode: int,
+    n_labels: int,
+    probe_repo: str,
+    cfg: CanViTEnvConfig,
+) -> None:
+    """Save critic pretraining state for resume/eval."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "q1": q1.state_dict(),
+            "q2": q2.state_dict(),
+            "opt": opt.state_dict(),
+            "args": vars(args),
+            "episode": episode,
+            "n_labels": n_labels,
+            "metadata": {
+                "probe_repo": probe_repo,
+                "model_repo": cfg.checkpoint,
+                "canvas_grid_size": cfg.canvas_grid_size,
+                "glimpse_size_px": cfg.glimpse_size_px,
+                "n_labels": n_labels,
+            },
+        },
+        path,
+    )
+
+
+def _load_resume_checkpoint(
+    *,
+    path: Path,
+    q1: ContinuousCritic,
+    q2: ContinuousCritic,
+    opt: torch.optim.Optimizer,
+) -> tuple[int, int]:
+    """Load critic pretraining state and return next episode plus label count."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict) or "q1" not in checkpoint:
+        raise ValueError(f"Expected critic checkpoint with q1/q2 keys: {path}")
+    q1.load_state_dict(checkpoint["q1"])
+    q2.load_state_dict(checkpoint.get("q2", checkpoint["q1"]))
+    if "opt" in checkpoint:
+        opt.load_state_dict(checkpoint["opt"])
+    saved_episode = int(checkpoint.get("episode", 0))
+    n_labels = int(checkpoint.get("n_labels", 0))
+    return saved_episode + 1, n_labels
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=500)
@@ -89,6 +143,7 @@ def main() -> None:
         type=Path,
         default=Path("checkpoints/canvit_critic/pretrained.pt"),
     )
+    parser.add_argument("--resume", type=Path, default=None)
     args = parser.parse_args()
 
     if args.t < 0 or args.k <= 0:
@@ -152,14 +207,26 @@ def main() -> None:
     data_iter = iter(loader)
     losses: list[float] = []
     n_labels = 0
+    start_episode = 1
+    if args.resume is not None:
+        print(f"Resuming critic checkpoint: {args.resume}")
+        start_episode, n_labels = _load_resume_checkpoint(
+            path=args.resume,
+            q1=q1,
+            q2=q2,
+            opt=opt,
+        )
+        print(f"Resumed at episode={start_episode} labels={n_labels}")
 
+    remaining_episodes = max(0, args.episodes - start_episode + 1)
     pbar = tqdm(
-        total=args.episodes,
+        total=remaining_episodes,
         desc="Pretraining critic",
         miniters=args.log_interval,
         maxinterval=float("inf"),
     )
-    for episode in range(1, args.episodes + 1):
+    last_pbar_episode = start_episode - 1
+    for episode in range(start_episode, args.episodes + 1):
         try:
             image, mask = next(data_iter)
         except StopIteration:
@@ -265,34 +332,46 @@ def main() -> None:
 
         if episode % args.log_interval == 0:
             recent = losses[-args.log_interval * max(args.t, 1) :]
-            pbar.update(args.log_interval)
+            pbar.update(episode - last_pbar_episode)
+            last_pbar_episode = episode
             print(
                 f"episode={episode} labels={n_labels} "
                 f"mean_q_mse={sum(recent) / len(recent):.4f}"
             )
+            _save_checkpoint(
+                path=args.output,
+                q1=q1,
+                q2=q2,
+                opt=opt,
+                args=args,
+                episode=episode,
+                n_labels=n_labels,
+                probe_repo=probe_repo,
+                cfg=cfg,
+            )
 
-    remainder = args.episodes % args.log_interval
-    if remainder:
-        pbar.update(remainder)
+    if remaining_episodes:
+        pbar.update(args.episodes - last_pbar_episode)
     pbar.close()
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "q1": q1.state_dict(),
-            "q2": q2.state_dict(),
-            "args": vars(args),
-            "metadata": {
-                "probe_repo": probe_repo,
-                "model_repo": cfg.checkpoint,
-                "canvas_grid_size": cfg.canvas_grid_size,
-                "glimpse_size_px": cfg.glimpse_size_px,
-                "n_labels": n_labels,
-            },
-        },
-        args.output,
-    )
-    print(f"Saved pretrained critic to {args.output}")
+    if remaining_episodes:
+        _save_checkpoint(
+            path=args.output,
+            q1=q1,
+            q2=q2,
+            opt=opt,
+            args=args,
+            episode=args.episodes,
+            n_labels=n_labels,
+            probe_repo=probe_repo,
+            cfg=cfg,
+        )
+        print(f"Saved pretrained critic to {args.output}")
+    else:
+        print(
+            "Resume checkpoint is already at or beyond "
+            f"--episodes={args.episodes}; nothing to train."
+        )
 
 
 if __name__ == "__main__":
