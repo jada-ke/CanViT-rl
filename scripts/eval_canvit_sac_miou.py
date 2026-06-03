@@ -1,14 +1,14 @@
 """
-Evaluate a trained AdaGlimpse-like CanViT SAC actor on ADE20K mIoU.
+Evaluate a trained continuous CanViT SAC actor on ADE20K mIoU.
 
 Usage:
-    uv run python scripts/eval_adaglimpse_canvit_sac_miou.py
-    uv run python scripts/eval_adaglimpse_canvit_sac_miou.py \
-        --checkpoint checkpoints/adaglimpse_canvit_sac/latest.pt \
+    uv run python scripts/eval_canvit_sac_miou.py
+    uv run python scripts/eval_canvit_sac_miou.py \
+        --checkpoint checkpoints/canvit_sac/latest.pt \
         --t 5 --miou-mode mean
-    uv run python scripts/eval_adaglimpse_canvit_sac_miou.py \
-        --checkpoint checkpoints/adaglimpse_canvit_sac/actor_final.pt \
-        --t 5 --importance-mode zeros --miou-mode accumulator
+    uv run python scripts/eval_canvit_sac_miou.py \
+        --checkpoint checkpoints/canvit_sac/actor_final.pt \
+        --t 5 --miou-mode accumulator
 """
 
 from __future__ import annotations
@@ -39,16 +39,14 @@ from tqdm import tqdm
 
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import miou_from_state
-from scripts.train_adaglimpse_canvit_sac import (
-    CanViTSequenceEncoder,
-    GaussianActor,
-    _action_to_viewpoint,
-    _append_glimpse,
-    _batch_from_sequence,
-    _empty_sequence,
-    _extract_importance,
-    _extract_local_patches,
+from canvit_rl.sac_models import CanViTSequenceEncoder, GaussianActor
+from canvit_rl.sac_state import (
+    append_glimpse,
+    batch_from_sequence,
+    empty_sequence,
+    extract_local_patches,
 )
+from scripts.train_canvit_sac import _action_to_viewpoint
 
 
 def _update_miou(
@@ -72,12 +70,6 @@ def _update_miou(
 
 def _load_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """Load either latest.pt dict checkpoints or bare actor_final.pt weights."""
-    # Fixed by Codex on 2026-06-02
-    # Problem: PyTorch 2.6 defaults torch.load(weights_only=True), but
-    # latest.pt contains trusted local argparse metadata with Path objects.
-    # Solution: Load this local evaluator checkpoint with weights_only=False.
-    # Result: Both latest.pt metadata checkpoints and bare actor state_dict
-    # checkpoints can be evaluated without PosixPath safe-global errors.
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(checkpoint, dict) and "actor" in checkpoint:
         return checkpoint["actor"], dict(checkpoint.get("args", {}))
@@ -138,7 +130,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints/adaglimpse_canvit_sac/latest.pt"),
+        default=Path("checkpoints/canvit_sac/latest.pt"),
     )
     parser.add_argument("--t", type=int, default=5)
     parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
@@ -152,11 +144,6 @@ def main() -> None:
     parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--min-scale", type=float, default=0.05)
-    parser.add_argument(
-        "--importance-mode",
-        choices=["attention", "zeros", "patch-norm"],
-        default=None,
-    )
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--d-model", type=int, default=256)
@@ -195,9 +182,6 @@ def main() -> None:
     n_patches = int(_checkpoint_value(checkpoint_args, "n-patches", args.n_patches))
     patch_dim = int(_checkpoint_value(checkpoint_args, "patch-dim", args.patch_dim))
     min_scale = float(_checkpoint_value(checkpoint_args, "min-scale", args.min_scale))
-    importance_mode = args.importance_mode or str(
-        _checkpoint_value(checkpoint_args, "importance-mode", "zeros")
-    )
 
     actor = _build_actor(
         actor_state=actor_state,
@@ -265,15 +249,8 @@ def main() -> None:
                 batch_size=1,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
-            seq = _empty_sequence(n_patches=n_patches, patch_dim=patch_dim)
+            seq = empty_sequence(n_patches=n_patches, patch_dim=patch_dim)
 
-            # Fixed by Codex on 2026-06-02
-            # Problem: The SAC policy is trained from a full-scene warmup
-            # context, so validation must reproduce that starting sequence.
-            # Solution: Commit a full-scene glimpse at t=0, append its CanViT
-            # tuple, then let the actor choose the following continuous views.
-            # Result: mIoU-by-t is directly comparable to training logs and the
-            # random baseline with full-scene t=0.
             full_vp = Viewpoint.full_scene(batch_size=1, device=device)
             full_glimpse = sample_at_viewpoint(
                 spatial=image,
@@ -282,23 +259,17 @@ def main() -> None:
             )
             out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
             state = out.state
-            patches = _extract_local_patches(out)
-            importance = _extract_importance(
-                out=out,
-                patches=patches,
-                mode=importance_mode,
-            )
-            seq = _append_glimpse(
+            patches = extract_local_patches(out)
+            seq = append_glimpse(
                 seq=seq,
                 patches=patches,
                 viewpoint=full_vp,
-                importance=importance,
             )
 
             step_states = [state]
             step_scales = [1.0]
             for _ in range(args.t):
-                batch = _batch_from_sequence(
+                batch = batch_from_sequence(
                     seq,
                     max_steps=checkpoint_t,
                     n_patches=n_patches,
@@ -317,17 +288,11 @@ def main() -> None:
                 )
                 out = model(glimpse=glimpse, state=state, viewpoint=vp)
                 state = out.state
-                patches = _extract_local_patches(out)
-                importance = _extract_importance(
-                    out=out,
-                    patches=patches,
-                    mode=importance_mode,
-                )
-                seq = _append_glimpse(
+                patches = extract_local_patches(out)
+                seq = append_glimpse(
                     seq=seq,
                     patches=patches,
                     viewpoint=vp,
-                    importance=importance,
                 )
                 step_states.append(state)
                 step_scales.append(float(vp.scales[0].detach().cpu().item()))
@@ -384,7 +349,7 @@ def main() -> None:
             "mious": mious,
             "mean_scales": mean_scales,
             "metadata": {
-                "policy": "adaglimpse_canvit_sac",
+                "policy": "canvit_sac",
                 "checkpoint": str(args.checkpoint),
                 "dataset": args.dataset,
                 "split": args.split,
@@ -395,7 +360,6 @@ def main() -> None:
                 "n_actor_glimpses": args.t,
                 "n_logged_steps": n_steps,
                 "min_scale": min_scale,
-                "importance_mode": importance_mode,
                 "probe_repo": probe_repo,
                 "model_repo": cfg.checkpoint,
                 "seed": args.seed,

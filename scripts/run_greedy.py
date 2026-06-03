@@ -5,11 +5,18 @@ Run a greedy episode and print per-step diagnostics.
 
 Usage:
     python scripts/run_greedy.py
-    python scripts/run_greedy.py --episodes 10 --seed 42 --dataset datasets/ADE20k --verbose
-    python scripts/run_greedy.py --miou --episodes 5 --t 5 --k 10 --dataset datasets/ADE20k
+    python scripts/run_greedy.py \
+        --episodes 10 --seed 42 --dataset datasets/ADE20k --verbose
+    python scripts/run_greedy.py \
+        --miou --episodes 5 --t 5 --k 10 --dataset datasets/ADE20k
     python scripts/run_greedy.py --miou --all --split validation --t 5 --k 10
-    python scripts/run_greedy.py --miou --all --split validation --t 5 --k 10 --objective kl
-    python scripts/run_greedy.py --miou --episodes 5 --objective seg-kl --kl-temperature 1.0 --t 5 --k 50
+    python scripts/run_greedy.py \
+        --miou --all --split validation --t 5 --k 10 --objective kl
+    python scripts/run_greedy.py \
+        --miou --episodes 5 --objective seg-kl --kl-temperature 1.0 \
+        --t 5 --k 50
+    python scripts/run_greedy.py \
+        --miou --episodes 5 --objective miou --t 5 --k 50
 """
 
 from __future__ import annotations
@@ -44,7 +51,7 @@ def main():
     parser.add_argument("--k", type=int, default=5, help="Candidates per step")
     parser.add_argument(
         "--objective",
-        choices=["cosine", "kl", "seg-kl"],
+        choices=["cosine", "kl", "seg-kl", "miou"],
         default="cosine",
         help="Greedy candidate-selection objective",
     )
@@ -55,12 +62,24 @@ def main():
         help="Softmax temperature for --objective kl",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--miou", action="store_true", help="Print mIoU after each greedy step")
-    parser.add_argument("--probe-repo", type=str, default=None, help="ADE20K probe repo for --miou")
+    parser.add_argument(
+        "--miou",
+        action="store_true",
+        help="Print mIoU after each greedy step",
+    )
+    parser.add_argument(
+        "--probe-repo",
+        type=str,
+        default=None,
+        help="ADE20K probe repo for --miou",
+    )
     parser.add_argument(
         "--no-full-scene-start",
         action="store_true",
-        help="Use greedy random-candidate search at t=0 instead of a full-scene glimpse",
+        help=(
+            "Use greedy random-candidate search at t=0 instead of a "
+            "full-scene glimpse"
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -81,8 +100,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.objective == "seg-kl" and not args.miou:
-        parser.error("--objective seg-kl requires --miou")
+    if args.objective in {"seg-kl", "miou"} and not args.miou:
+        parser.error(f"--objective {args.objective} requires --miou")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -99,13 +118,7 @@ def main():
         img_transform=img_tf,
         mask_transform=mask_tf,
     )
-    # Fixed by Codex on 2026-05-28
-    # Problem: Greedy diagnostics could only sample a small number of images,
-    # making it awkward to inspect behavior across the full validation split.
-    # Solution: Add --all plus a configurable split, while preserving the
-    # previous --episodes random-sampling flow for quick checks.
-    # Result: The same greedy metrics can be computed over every validation
-    # image with `--all --split validation`.
+
     if args.all:
         indices = list(range(len(dataset)))
         print(f"Dataset: {len(dataset)} {args.split} images, running all")
@@ -119,12 +132,7 @@ def main():
             f"probe-ade20k-40k-s512-c{cfg.canvas_grid_size}-in21k"
         )
         print(f"Loading CanViT segmentation model with probe: {probe_repo}")
-        # Fixed by Codex on 2026-05-25
-        # Problem: Greedy diagnostics could only report teacher-CLS similarity,
-        # not segmentation quality at the committed canvas states.
-        # Solution: When --miou is enabled, load the semantic-segmentation wrapper
-        # and pass its probe into run_greedy_episode for per-timestep mIoU.
-        # Result: The runner prints mIoU beside scale, center, sim, and reward.
+
         seg = (
             CanViTForSemanticSegmentation.from_pretrained_with_probe(
                 pretrained_repo=cfg.checkpoint,
@@ -158,13 +166,6 @@ def main():
     all_mious = [[] for _ in range(args.t)] if args.miou else None
     show_episode_logs = args.verbose or not args.all
 
-    # Fixed by Codex on 2026-05-28
-    # Problem: Full validation greedy runs printed every episode and had no ETA,
-    # making long runs noisy and hard to monitor.
-    # Solution: Wrap the episode loop in tqdm and suppress per-episode logs for
-    # --all unless --verbose is requested.
-    # Result: Full validation runs show progress/ETA and only print aggregate
-    # metrics at the end by default.
     for ep, idx in enumerate(tqdm(indices, desc="Evaluating greedy", unit="img")):
         image, mask = dataset[idx]
         image = image.unsqueeze(0).to(device)  # [1, 3, H, W]
@@ -186,13 +187,6 @@ def main():
             t=args.t,
             k=args.k,
             device=device,
-            # Fixed by Codex on 2026-05-29
-            # Problem: Greedy candidate sampling was seeded by episode order,
-            # so the same image could get different timestep candidates if the
-            # selected image order changed between runs.
-            # Solution: Derive the episode seed from the stable dataset index.
-            # Result: A given image index reproduces its t=1, t=2, ... candidate
-            # pools across reruns with the same base --seed.
             seed=args.seed + idx,
             mask=mask if args.miou else None,
             probe=probe,
@@ -204,7 +198,6 @@ def main():
 
         if show_episode_logs:
             print(f"\n--- Episode {ep + 1} ({img_name}) ---")
-        prev_score = 0.0
         for step, (sim, score, reward, scale, center) in enumerate(
             zip(
                 result["sims"],
@@ -214,8 +207,6 @@ def main():
                 result["centers"],
             )
         ):
-            objective_reward = score - prev_score
-            prev_score = score
             miou_text = ""
             if args.miou:
                 miou = result["mious"][step]
@@ -235,15 +226,8 @@ def main():
             all_scales[step].append(scale)
             all_sims[step].append(sim)
             all_scores[step].append(score)
-            all_objective_rewards[step].append(objective_reward)
+            all_objective_rewards[step].append(reward)
 
-    # Fixed by Codex on 2026-05-28
-    # Problem: Quiet full-run KL experiments only reported scale/mIoU averages,
-    # hiding the mean KL score and per-step objective gain.
-    # Solution: Aggregate sim, objective score, and score deltas per timestep
-    # across the selected dataset.
-    # Result: KL runs report mean KL and KL reduction without requiring
-    # per-episode verbose logs.
     print("\n--- Mean metrics per timestep ---")
     for step in range(args.t):
         step_scales = all_scales[step]
@@ -263,6 +247,11 @@ def main():
             score_text = (
                 f"seg_kl={-mean_score:.4f}  "
                 f"seg_kl_reduction={mean_objective_reward:+.4f}"
+            )
+        elif args.objective == "miou":
+            score_text = (
+                f"candidate_miou={mean_score:.4f}  "
+                f"candidate_miou_gain={mean_objective_reward:+.4f}"
             )
         else:
             score_text = (

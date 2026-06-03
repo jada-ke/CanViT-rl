@@ -5,7 +5,7 @@ Greedy image-independent policy for CanViT active-vision episodes.
 
 At each of T timesteps, samples K candidate viewpoints uniformly at random,
 runs a CanViT forward pass for each (without committing state), and selects
-the candidate with the highest cosine similarity to the teacher CLS.
+the candidate with the highest requested objective score.
 
 Key property: the policy is image-independent — candidates are sampled
 uniformly over the scene regardless of image content. A correct implementation
@@ -199,6 +199,7 @@ def greedy_step(
     sample_seed: int | None = None,
     probe: torch.nn.Module | None = None,
     canvas_grid_size: int | None = None,
+    mask: torch.Tensor | None = None,
     seg_kl_target_prob: torch.Tensor | None = None,
 ) -> tuple[Viewpoint, RecurrentState, float, float]:
     """
@@ -218,11 +219,12 @@ def greedy_step(
         device:         Torch device.
         min_scale:      Minimum viewpoint scale.
         max_scale:      Maximum viewpoint scale.
-        objective:      Candidate score: "cosine", "kl", or "seg-kl".
+        objective:      Candidate score: "cosine", "kl", "seg-kl", or "miou".
         kl_temperature: Temperature for KL softmax distributions.
         sample_seed: Optional seed for deterministic candidate sampling.
-        probe: Optional ADE20K probe for segmentation-KL scoring.
-        canvas_grid_size: Canvas grid size for segmentation-KL scoring.
+        probe: Optional ADE20K probe for segmentation scoring.
+        canvas_grid_size: Canvas grid size for segmentation scoring.
+        mask: Optional ADE20K target mask for mIoU scoring.
         seg_kl_target_prob: Full-scene segmentation target distribution.
 
     Returns:
@@ -241,13 +243,6 @@ def greedy_step(
             start_with_full_scene=False,
         )
     else:
-        # Fixed by Codex on 2026-05-29
-        # Problem: Candidate samples changed between reruns, making a given
-        # image/timestep hard to compare even with the same greedy settings.
-        # Solution: Seed only the candidate draw inside a forked RNG context,
-        # using a timestep-specific seed supplied by the episode runner.
-        # Result: Different timesteps still get different candidates, while
-        # rerunning the same seeded episode reproduces each timestep's pool.
         with torch.random.fork_rng():
             torch.manual_seed(sample_seed)
             candidates = random_viewpoints(
@@ -274,7 +269,18 @@ def greedy_step(
             out = model(glimpse=glimpse, state=state, viewpoint=vp)
             canvas_cls = out.state.recurrent_cls.squeeze(1).float()  # [1, 768]
             sim = reconstruction_reward(canvas_cls, teacher_cls)
-            if objective == "seg-kl":
+            if objective == "miou":
+                assert probe is not None
+                assert canvas_grid_size is not None
+                assert mask is not None
+                score = miou_from_state(
+                    model=model,
+                    state=out.state,
+                    probe=probe,
+                    mask=mask,
+                    canvas_grid_size=canvas_grid_size,
+                )
+            elif objective == "seg-kl":
                 assert probe is not None
                 assert canvas_grid_size is not None
                 assert seg_kl_target_prob is not None
@@ -316,6 +322,7 @@ def full_scene_step(
     kl_temperature: float = 1.0,
     probe: torch.nn.Module | None = None,
     canvas_grid_size: int | None = None,
+    mask: torch.Tensor | None = None,
     seg_kl_target_prob: torch.Tensor | None = None,
 ) -> tuple[Viewpoint, RecurrentState, float, float]:
     """Commit one full-scene glimpse and return the updated state/similarity."""
@@ -329,7 +336,18 @@ def full_scene_step(
         out = model(glimpse=glimpse, state=state, viewpoint=vp)
         canvas_cls = out.state.recurrent_cls.squeeze(1).float()
         sim = reconstruction_reward(canvas_cls, teacher_cls)
-        if objective == "seg-kl":
+        if objective == "miou":
+            assert probe is not None
+            assert canvas_grid_size is not None
+            assert mask is not None
+            score = miou_from_state(
+                model=model,
+                state=out.state,
+                probe=probe,
+                mask=mask,
+                canvas_grid_size=canvas_grid_size,
+            )
+        elif objective == "seg-kl":
             assert probe is not None
             assert canvas_grid_size is not None
             assert seg_kl_target_prob is not None
@@ -387,7 +405,7 @@ def run_greedy_episode(
         canvas_grid_size: Canvas grid size used to reshape the state features.
         start_with_full_scene: If True, timestep 0 is a committed full-scene
             glimpse; later timesteps use greedy K-candidate search.
-        objective: Greedy search objective: "cosine", "kl", or "seg-kl".
+        objective: Greedy search objective: "cosine", "kl", "seg-kl", or "miou".
         kl_temperature: Softmax temperature used by the KL objective.
 
     Returns:
@@ -404,8 +422,8 @@ def run_greedy_episode(
         device = next(model.parameters()).device
     if seed is not None:
         torch.manual_seed(seed)
-    if objective not in {"cosine", "kl", "seg-kl"}:
-        raise ValueError("objective must be 'cosine', 'kl', or 'seg-kl'.")
+    if objective not in {"cosine", "kl", "seg-kl", "miou"}:
+        raise ValueError("objective must be 'cosine', 'kl', 'seg-kl', or 'miou'.")
     if kl_temperature <= 0:
         raise ValueError("kl_temperature must be positive.")
     if (mask is None) != (probe is None):
@@ -414,9 +432,13 @@ def run_greedy_episode(
         raise ValueError("Pass canvas_grid_size when computing per-timestep mIoU.")
     if objective == "seg-kl" and (probe is None or canvas_grid_size is None):
         raise ValueError("seg-kl objective requires --miou/probe and canvas_grid_size.")
+    if objective == "miou" and (
+        probe is None or canvas_grid_size is None or mask is None
+    ):
+        raise ValueError("miou objective requires --miou/probe/mask.")
 
     state = init_state
-    prev_sim = 0.0
+    prev_score = 0.0
 
     viewpoints, sims, scores, rewards, scales, centers = [], [], [], [], [], []
     mious = [] if probe is not None else None
@@ -424,13 +446,6 @@ def run_greedy_episode(
     seg_kl_target_prob = None
     if objective == "seg-kl":
         assert probe is not None and canvas_grid_size is not None
-        # Fixed by Codex on 2026-05-29
-        # Problem: KL over CLS embedding coordinates is not an AdaGlimpse-like
-        # task loss and can leave candidate rankings unchanged by temperature.
-        # Solution: Build a full-scene ADE20K probe distribution once per
-        # episode and score candidate states by negative segmentation KL.
-        # Result: The k-armed greedy runner can use a meaningful KL objective
-        # whenever the --miou segmentation probe path is active.
         with torch.inference_mode():
             teacher_vp = Viewpoint.full_scene(batch_size=image.shape[0], device=device)
             teacher_glimpse = sample_at_viewpoint(
@@ -468,6 +483,7 @@ def run_greedy_episode(
                 kl_temperature=kl_temperature,
                 probe=probe,
                 canvas_grid_size=canvas_grid_size,
+                mask=mask_dev,
                 seg_kl_target_prob=seg_kl_target_prob,
             )
         else:
@@ -484,10 +500,11 @@ def run_greedy_episode(
                 sample_seed=None if seed is None else seed + step_idx,
                 probe=probe,
                 canvas_grid_size=canvas_grid_size,
+                mask=mask_dev,
                 seg_kl_target_prob=seg_kl_target_prob,
             )
-        reward = sim - prev_sim
-        prev_sim = sim
+        reward = score - prev_score
+        prev_score = score
 
         viewpoints.append(vp)
         sims.append(sim)
