@@ -31,7 +31,6 @@ if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
 from canvit_eval.episode import run_episode  # noqa: E402
 from canvit_eval.policies import make_policy  # noqa: E402
 from canvit_pytorch import CanViTForSemanticSegmentation, resolve_canvit_repo
-from canvit_pytorch.teacher import load_teacher
 from canvit_specialize.datasets.ade20k import (
     IGNORE_LABEL,
     NUM_CLASSES,
@@ -60,6 +59,33 @@ def _update_miou(
             align_corners=False,
         )
     acc.update(logits.argmax(dim=1), masks)
+
+
+def _segmentation_ce_loss(
+    probe: torch.nn.Module,
+    features: Tensor,
+    masks: Tensor,
+) -> Tensor:
+    """Compute per-image unweighted segmentation CE for one timestep."""
+    with torch.autocast(device_type=features.device.type, enabled=False):
+        logits = probe(features.float())
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(
+            logits,
+            size=masks.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    pixel_loss = F.cross_entropy(
+        logits,
+        masks.long(),
+        ignore_index=IGNORE_LABEL,
+        reduction="none",
+    )
+    valid = masks != IGNORE_LABEL
+    loss_sum = pixel_loss.flatten(1).sum(dim=1)
+    denom = valid.flatten(1).sum(dim=1).clamp_min(1)
+    return loss_sum / denom
 
 
 def main() -> None:
@@ -119,13 +145,10 @@ def main() -> None:
     for p in probe.parameters():
         p.requires_grad_(False)
 
-    print("Loading teacher...")
-    teacher = load_teacher(cfg.teacher_repo, device)
-
     accs = [mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device) for _ in range(args.t)]
     scale_sums = [0.0 for _ in range(args.t)]
-    sim_sums = [0.0 for _ in range(args.t)]
-    reward_sums = [0.0 for _ in range(args.t)]
+    ce_loss_sums = [0.0 for _ in range(args.t)]
+    loss_reduction_sums = [0.0 for _ in range(args.t)]
     count_sums = [0 for _ in range(args.t)]
     n_images = 0
     t_start = time.monotonic()
@@ -140,7 +163,6 @@ def main() -> None:
             batch_size = images.shape[0]
             n_images += batch_size
 
-            teacher_cls = teacher.forward_norm_features(images).cls
             policy = make_policy(
                 "entropy_coarse_to_fine",
                 batch_size=batch_size,
@@ -151,14 +173,6 @@ def main() -> None:
                 get_spatial_fn=model.get_spatial,
             )
 
-            # Fixed by Codex on 2026-05-27
-            # Problem: The diagnostic entropy-C2F runner recomputed per-image
-            # mIoU at every timestep, which is useful for inspection but not the
-            # same as validation-set mIoU.
-            # Solution: Run canvit-eval's entropy_coarse_to_fine policy in
-            # batches and update one mIoUAccumulator per timestep.
-            # Result: Final mIoU is computed from accumulated intersections and
-            # unions across the evaluated split, matching eval_miou.py's pattern.
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp):
                 steps = run_episode(
                     model=model,
@@ -169,7 +183,7 @@ def main() -> None:
                     glimpse_px=cfg.glimpse_size_px,
                 )
 
-            prev_sim = torch.zeros(batch_size, device=device)
+            prev_ce_loss: Tensor | None = None
             for step in steps:
                 spatial = model.get_spatial(step.state.canvas).view(
                     batch_size,
@@ -179,35 +193,30 @@ def main() -> None:
                 )
                 _update_miou(accs[step.t], probe, spatial, masks)
 
-                # Fixed by Codex on 2026-05-27
-                # Problem: seg.canvit is the backbone inside
-                # CanViTForSemanticSegmentation and does not expose the
-                # pretraining wrapper's predict_scene_teacher_cls method.
-                # Solution: Match greedy.py's diagnostic similarity by comparing
-                # the recurrent CLS state directly against the frozen teacher CLS.
-                # Result: Entropy-C2F accumulator eval reports similarity/reward
-                # without requiring pretraining-only wrapper methods.
-                predicted_cls = step.state.recurrent_cls.squeeze(1)
-                sim = F.cosine_similarity(
-                    predicted_cls.float(),
-                    teacher_cls.float(),
-                    dim=-1,
+                ce_loss = _segmentation_ce_loss(probe, spatial, masks)
+                loss_reduction = (
+                    torch.zeros_like(ce_loss)
+                    if prev_ce_loss is None
+                    else prev_ce_loss - ce_loss
                 )
-                reward = sim - prev_sim
-                prev_sim = sim
+                prev_ce_loss = ce_loss
 
                 scale_sums[step.t] += float(step.viewpoint.scales.detach().sum().item())
-                sim_sums[step.t] += float(sim.detach().sum().item())
-                reward_sums[step.t] += float(reward.detach().sum().item())
+                ce_loss_sums[step.t] += float(ce_loss.detach().sum().item())
+                loss_reduction_sums[step.t] += float(
+                    loss_reduction.detach().sum().item()
+                )
                 count_sums[step.t] += batch_size
 
     mious = {f"t{t}": acc.compute() for t, acc in enumerate(accs)}
     mean_scales = {
         f"t{t}": scale_sums[t] / count_sums[t] for t in range(args.t)
     }
-    mean_sims = {f"t{t}": sim_sums[t] / count_sums[t] for t in range(args.t)}
-    mean_rewards = {
-        f"t{t}": reward_sums[t] / count_sums[t] for t in range(args.t)
+    mean_ce_losses = {
+        f"t{t}": ce_loss_sums[t] / count_sums[t] for t in range(args.t)
+    }
+    mean_loss_reductions = {
+        f"t{t}": loss_reduction_sums[t] / count_sums[t] for t in range(args.t)
     }
     wall_time = time.monotonic() - t_start
 
@@ -217,8 +226,8 @@ def main() -> None:
         print(
             f"  step {t + 1}: "
             f"scale={mean_scales[key]:.3f}  "
-            f"sim={mean_sims[key]:.4f}  "
-            f"reward={mean_rewards[key]:+.4f}  "
+            f"seg_ce={mean_ce_losses[key]:.4f}  "
+            f"loss_reduction={mean_loss_reductions[key]:+.4f}  "
             f"miou={mious[key]:.4f}"
         )
 
@@ -227,8 +236,8 @@ def main() -> None:
         {
             "mious": mious,
             "mean_scales": mean_scales,
-            "mean_sims": mean_sims,
-            "mean_rewards": mean_rewards,
+            "mean_ce_losses": mean_ce_losses,
+            "mean_loss_reductions": mean_loss_reductions,
             "metadata": {
                 "policy": "entropy_coarse_to_fine",
                 "dataset": args.dataset,

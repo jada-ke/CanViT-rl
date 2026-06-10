@@ -45,7 +45,8 @@ From: nvcr.io/nvidia/pytorch:25.11-py3
     export PYTHONUNBUFFERED=1
     export PATH=/opt/canvit-rl-venv/bin:$PATH
     # Paths set here are available at runtime but NOT at %post time.
-    # Runtime paths (checkpoints, datasets) come from --env or .envrc.
+    # Runtime paths and secrets (checkpoints, datasets, COMET_API_KEY) come
+    # from --env or .envrc.
 
 %runscript
     exec /opt/canvit-rl-venv/bin/python "$@"

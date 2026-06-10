@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
+from torch import Tensor
 
 EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
@@ -23,12 +25,49 @@ if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
 from canvit_eval.episode import run_episode  # noqa: E402
 from canvit_eval.policies import make_policy  # noqa: E402
 from canvit_pytorch import CanViTForSemanticSegmentation, resolve_canvit_repo
-from canvit_pytorch.teacher import load_teacher
-from canvit_specialize.datasets.ade20k import ADE20kDataset, make_val_transforms
+from canvit_specialize.datasets.ade20k import (
+    IGNORE_LABEL,
+    ADE20kDataset,
+    make_val_transforms,
+)
 
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import miou_from_state
-from canvit_rl.reward import reconstruction_reward
+
+
+def _segmentation_ce_loss(
+    model,
+    probe: torch.nn.Module,
+    state,
+    mask: Tensor,
+    canvas_grid_size: int,
+) -> float:
+    """Compute unweighted segmentation CE for one committed canvas state."""
+    spatial = model.get_spatial(state.canvas).view(
+        mask.shape[0],
+        canvas_grid_size,
+        canvas_grid_size,
+        -1,
+    )
+    with torch.autocast(device_type=spatial.device.type, enabled=False):
+        logits = probe(spatial.float())
+    if logits.shape[-2:] != mask.shape[-2:]:
+        logits = F.interpolate(
+            logits,
+            size=mask.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    pixel_loss = F.cross_entropy(
+        logits,
+        mask.long(),
+        ignore_index=IGNORE_LABEL,
+        reduction="none",
+    )
+    valid = mask != IGNORE_LABEL
+    loss_sum = pixel_loss.flatten(1).sum(dim=1)
+    denom = valid.flatten(1).sum(dim=1).clamp_min(1)
+    return float((loss_sum / denom).mean().item())
 
 
 def main() -> None:
@@ -78,13 +117,6 @@ def main() -> None:
         img_transform=img_tf,
         mask_transform=mask_tf,
     )
-    # Fixed by Codex on 2026-05-26
-    # Problem: The entropy-C2F runner only sampled a small number of images,
-    # which made it awkward to evaluate the whole ADE20K validation split.
-    # Solution: Add --all to iterate through the selected split sequentially,
-    # while preserving --episodes random sampling for quick diagnostics.
-    # Result: Full validation-set metrics can be computed with the same
-    # per-timestep logging/aggregation path.
     if args.all:
         indices = list(range(len(dataset)))
         print(f"Dataset: {len(dataset)} {args.split} images, running all")
@@ -111,12 +143,9 @@ def main() -> None:
     for p in probe.parameters():
         p.requires_grad_(False)
 
-    print("Loading teacher...")
-    teacher = load_teacher(cfg.teacher_repo, device)
-
     all_scales = [[] for _ in range(args.t)]
-    all_sims = [[] for _ in range(args.t)]
-    all_rewards = [[] for _ in range(args.t)]
+    all_ce_losses = [[] for _ in range(args.t)]
+    all_loss_reductions = [[] for _ in range(args.t)]
     all_mious = [[] for _ in range(args.t)]
 
     for ep, idx in enumerate(indices):
@@ -126,15 +155,6 @@ def main() -> None:
         img_name = dataset.images[idx].name
 
         with torch.inference_mode():
-            teacher_cls = teacher.forward_norm_features(image).cls
-
-            # Fixed by Codex on 2026-05-25
-            # Problem: We needed entropy-guided C2F diagnostics comparable to
-            # run_greedy.py while using the policy implementation from canvit-eval.
-            # Solution: Instantiate canvit_eval.policies.make_policy with
-            # entropy_coarse_to_fine and run it through canvit_eval.episode.
-            # Result: The script reports cumulative similarity, scale, reward,
-            # and mIoU after each entropy-guided C2F timestep.
             policy = make_policy(
                 "entropy_coarse_to_fine",
                 batch_size=1,
@@ -154,14 +174,17 @@ def main() -> None:
             )
 
         print(f"\n--- Episode {ep + 1} ({img_name}) ---")
-        prev_sim = 0.0
+        prev_ce_loss = None
         for step in steps:
-            sim = reconstruction_reward(
-                step.state.recurrent_cls.squeeze(1).float(),
-                teacher_cls,
+            ce_loss = _segmentation_ce_loss(
+                model=model,
+                probe=probe,
+                state=step.state,
+                mask=mask,
+                canvas_grid_size=cfg.canvas_grid_size,
             )
-            reward = sim - prev_sim
-            prev_sim = sim
+            loss_reduction = 0.0 if prev_ce_loss is None else prev_ce_loss - ce_loss
+            prev_ce_loss = ce_loss
             scale = float(step.viewpoint.scales[0].item())
             center = step.viewpoint.centers[0].detach().cpu().tolist()
             miou = miou_from_state(
@@ -173,31 +196,33 @@ def main() -> None:
             )
 
             all_scales[step.t].append(scale)
-            all_sims[step.t].append(sim)
-            all_rewards[step.t].append(reward)
+            all_ce_losses[step.t].append(ce_loss)
+            all_loss_reductions[step.t].append(loss_reduction)
             all_mious[step.t].append(miou)
 
             print(
                 f"  step {step.t + 1}: "
                 f"scale={scale:.3f}  "
                 f"center=({center[0]:+.3f}, {center[1]:+.3f})  "
-                f"sim={sim:.4f}  "
-                f"reward={reward:+.4f}  "
+                f"seg_ce={ce_loss:.4f}  "
+                f"loss_reduction={loss_reduction:+.4f}  "
                 f"miou={miou:.4f}"
             )
 
     print("\n--- Mean metrics per timestep ---")
     for step in range(args.t):
         mean_scale = sum(all_scales[step]) / len(all_scales[step])
-        mean_sim = sum(all_sims[step]) / len(all_sims[step])
-        mean_reward = sum(all_rewards[step]) / len(all_rewards[step])
+        mean_ce_loss = sum(all_ce_losses[step]) / len(all_ce_losses[step])
+        mean_loss_reduction = (
+            sum(all_loss_reductions[step]) / len(all_loss_reductions[step])
+        )
         mean_miou = sum(all_mious[step]) / len(all_mious[step])
         bar = "*" * int(mean_scale * 20)
         print(
             f"  step {step + 1}: "
             f"scale={mean_scale:.3f} {bar}  "
-            f"sim={mean_sim:.4f}  "
-            f"reward={mean_reward:+.4f}  "
+            f"seg_ce={mean_ce_loss:.4f}  "
+            f"loss_reduction={mean_loss_reduction:+.4f}  "
             f"miou={mean_miou:.4f}"
         )
 

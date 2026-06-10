@@ -5,19 +5,13 @@ Greedy image-independent policy for CanViT active-vision episodes.
 
 At each of T timesteps, samples K candidate viewpoints uniformly at random,
 runs a CanViT forward pass for each (without committing state), and selects
-the candidate with the highest requested objective score.
-
-Key property: the policy is image-independent — candidates are sampled
-uniformly over the scene regardless of image content. A correct implementation
-should exhibit emergent coarse-to-fine structure: early steps favor wide
-glimpses (large scale, fast reward gain) and later steps favor finer ones
-(small scale, marginal gains). If this doesn't emerge, something is wrong
-with the reward or the forward pass.
+the candidate with the lowest segmentation cross-entropy loss.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeAlias
+from dataclasses import fields, is_dataclass
+from typing import TYPE_CHECKING, Any, Callable, TypeAlias
 
 import torch
 import torch.nn.functional as F
@@ -31,37 +25,69 @@ from canvit_pytorch.model import RecurrentState
 from canvit_pytorch.policies import random_viewpoints
 from canvit_specialize.datasets.ade20k import IGNORE_LABEL, NUM_CLASSES
 
-from canvit_rl.reward import reconstruction_reward
-
 if TYPE_CHECKING:
     from canvit_pytorch import CanViT
 else:
     CanViT = Any
 
-GreedyObjective = str
 GreedyModel: TypeAlias = CanViT | CanViTForPretrainingHFHub
 
 
-def _score_canvas_cls(
-    canvas_cls: torch.Tensor,
-    teacher_cls: torch.Tensor,
-    objective: GreedyObjective,
-    kl_temperature: float,
-) -> float:
-    """
-    Score a candidate canvas state for greedy selection.
+def _replace_tensor_fields(obj: Any, fn: Callable[[torch.Tensor], torch.Tensor]) -> Any:
+    """Apply a batch-tensor transform while preserving the upstream container."""
+    if hasattr(obj, "_replace"):
+        values = {
+            name: fn(value) if torch.is_tensor(value) else value
+            for name, value in zip(obj._fields, obj)
+        }
+        return obj._replace(**values)
+    if is_dataclass(obj):
+        values = {
+            field.name: fn(value) if torch.is_tensor(value) else value
+            for field in fields(obj)
+            for value in [getattr(obj, field.name)]
+        }
+        return type(obj)(**values)
+    values = {
+        key: fn(value) if torch.is_tensor(value) else value
+        for key, value in vars(obj).items()
+    }
+    return type(obj)(**values)
 
-    Cosine is the default baseline. KL treats teacher/canvas CLS vectors as
-    temperature-softmax distributions and maximizes negative KL(teacher||canvas).
-    """
-    if objective == "cosine":
-        return reconstruction_reward(canvas_cls, teacher_cls)
-    if objective == "kl":
-        teacher_prob = F.softmax(teacher_cls.float() / kl_temperature, dim=-1)
-        canvas_log_prob = F.log_softmax(canvas_cls.float() / kl_temperature, dim=-1)
-        kl = F.kl_div(canvas_log_prob, teacher_prob, reduction="batchmean")
-        return -float(kl.item())
-    raise ValueError(f"Unknown greedy objective: {objective!r}")
+
+def _repeat_state_chunks(state: RecurrentState, chunks: int) -> RecurrentState:
+    """Repeat a batched recurrent state in chunk order: [cand0 batch, cand1 batch]."""
+    return _replace_tensor_fields(
+        state,
+        lambda tensor: tensor
+        if tensor.ndim == 0
+        else tensor.repeat((chunks,) + (1,) * (tensor.ndim - 1)),
+    )
+
+
+def _index_state_batch(state: RecurrentState, index: torch.Tensor) -> RecurrentState:
+    """Select batch rows from a recurrent state after batched candidate scoring."""
+    return _replace_tensor_fields(
+        state,
+        lambda tensor: tensor if tensor.ndim == 0 else tensor.index_select(0, index),
+    )
+
+
+def _make_viewpoint_like(template: Viewpoint, centers: torch.Tensor, scales: torch.Tensor) -> Viewpoint:
+    """Build a Viewpoint without depending on the exact upstream container type."""
+    if hasattr(template, "_replace"):
+        return template._replace(centers=centers, scales=scales)
+    if is_dataclass(template):
+        values = {
+            field.name: getattr(template, field.name)
+            for field in fields(template)
+        }
+        values.update({"centers": centers, "scales": scales})
+        return type(template)(**values)
+    try:
+        return type(template)(centers=centers, scales=scales)
+    except TypeError:
+        return Viewpoint(centers=centers, scales=scales)
 
 
 def _seg_logits_from_state(
@@ -82,17 +108,17 @@ def _seg_logits_from_state(
         return probe(spatial.float()).float()
 
 
-def _score_segmentation_kl(
+def _segmentation_cross_entropy_losses(
     model: GreedyModel,
     state: RecurrentState,
     probe: torch.nn.Module,
     canvas_grid_size: int,
-    target_prob: torch.Tensor,
-    kl_temperature: float,
+    mask: torch.Tensor,
     batch_size: int,
-) -> float:
+    ignore_label: int = IGNORE_LABEL,
+) -> torch.Tensor:
     """
-    Score a canvas state by negative KL to a full-scene segmentation target.
+    Evaluate per-image ADE20K segmentation CE from a CanViT canvas state.
     """
     logits = _seg_logits_from_state(
         model=model,
@@ -101,16 +127,30 @@ def _score_segmentation_kl(
         canvas_grid_size=canvas_grid_size,
         batch_size=batch_size,
     )
-    if logits.shape[-2:] != target_prob.shape[-2:]:
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    mask = mask.long()
+    if logits.shape[-2:] != mask.shape[-2:]:
         logits = F.interpolate(
             logits,
-            size=target_prob.shape[-2:],
+            size=mask.shape[-2:],
             mode="bilinear",
             align_corners=False,
         )
-    log_prob = F.log_softmax(logits / kl_temperature, dim=1)
-    kl = F.kl_div(log_prob, target_prob, reduction="batchmean")
-    return -float(kl.item())
+    # Fixed by Codex on 2026-06-09
+    # Problem: Greedy selection was scalar and serial, so K candidates could not
+    # share one GPU forward pass. Solution: keep unreduced CE and reduce per
+    # image, allowing candidate losses to be compared after a [B*K] forward.
+    pixel_loss = F.cross_entropy(
+        logits,
+        mask,
+        ignore_index=ignore_label,
+        reduction="none",
+    )
+    valid = mask != ignore_label
+    loss_sum = pixel_loss.flatten(1).sum(dim=1)
+    denom = valid.flatten(1).sum(dim=1).clamp_min(1)
+    return loss_sum / denom
 
 
 def _mean_iou_from_prediction(
@@ -188,22 +228,18 @@ def greedy_step(
     model: GreedyModel,
     image: torch.Tensor,
     state: RecurrentState,
-    teacher_cls: torch.Tensor,
     k: int,
     glimpse_size_px: int,
     device: torch.device,
     min_scale: float = 0.10,
     max_scale: float = 1.0,
-    objective: GreedyObjective = "cosine",
-    kl_temperature: float = 1.0,
     sample_seed: int | None = None,
     probe: torch.nn.Module | None = None,
     canvas_grid_size: int | None = None,
     mask: torch.Tensor | None = None,
-    seg_kl_target_prob: torch.Tensor | None = None,
-) -> tuple[Viewpoint, RecurrentState, float, float]:
+) -> tuple[Viewpoint, RecurrentState, float]:
     """
-    Evaluate K candidate viewpoints and commit the best one.
+    Evaluate K candidate viewpoints and commit the lowest-loss one.
 
     Candidates are sampled using canvit_pytorch's random_viewpoints, which
     uses a safe-box-area scale distribution p(s) ~ (1-s) and constrains
@@ -213,26 +249,24 @@ def greedy_step(
         model:          Frozen CanViT model.
         image:          Current scene tensor, shape [1, 3, H, W].
         state:          Current RecurrentState (not mutated).
-        teacher_cls:    Frozen teacher CLS, shape [1, 768].
         k:              Number of candidates to evaluate.
         glimpse_size_px: Glimpse resolution in pixels.
         device:         Torch device.
         min_scale:      Minimum viewpoint scale.
         max_scale:      Maximum viewpoint scale.
-        objective:      Candidate score: "cosine", "kl", "seg-kl", or "miou".
-        kl_temperature: Temperature for KL softmax distributions.
         sample_seed: Optional seed for deterministic candidate sampling.
-        probe: Optional ADE20K probe for segmentation scoring.
+        probe: ADE20K probe for segmentation scoring.
         canvas_grid_size: Canvas grid size for segmentation scoring.
-        mask: Optional ADE20K target mask for mIoU scoring.
-        seg_kl_target_prob: Full-scene segmentation target distribution.
+        mask: ADE20K target mask for cross-entropy scoring.
 
     Returns:
         best_vp:        The winning Viewpoint.
         best_state:     The RecurrentState after committing the winning viewpoint.
-        best_sim:       Cosine similarity achieved by the winning viewpoint.
-        best_score:     Objective score used to select the winning viewpoint.
+        best_score:     Segmentation cross-entropy loss used for selection.
     """
+    if probe is None or canvas_grid_size is None or mask is None:
+        raise ValueError("greedy_step requires probe, canvas_grid_size, and mask.")
+
     if sample_seed is None:
         candidates = random_viewpoints(
             batch_size=1,
@@ -256,8 +290,7 @@ def greedy_step(
 
     best_vp = None
     best_state = None
-    best_score = -float("inf")
-    best_sim = -float("inf")
+    best_score = float("inf")
 
     with torch.inference_mode():
         for vp in candidates:
@@ -267,65 +300,38 @@ def greedy_step(
                 glimpse_size_px=glimpse_size_px,
             )
             out = model(glimpse=glimpse, state=state, viewpoint=vp)
-            canvas_cls = out.state.recurrent_cls.squeeze(1).float()  # [1, 768]
-            sim = reconstruction_reward(canvas_cls, teacher_cls)
-            if objective == "miou":
-                assert probe is not None
-                assert canvas_grid_size is not None
-                assert mask is not None
-                score = miou_from_state(
-                    model=model,
-                    state=out.state,
-                    probe=probe,
-                    mask=mask,
-                    canvas_grid_size=canvas_grid_size,
-                )
-            elif objective == "seg-kl":
-                assert probe is not None
-                assert canvas_grid_size is not None
-                assert seg_kl_target_prob is not None
-                score = _score_segmentation_kl(
-                    model=model,
-                    state=out.state,
-                    probe=probe,
-                    canvas_grid_size=canvas_grid_size,
-                    target_prob=seg_kl_target_prob,
-                    kl_temperature=kl_temperature,
-                    batch_size=image.shape[0],
-                )
-            else:
-                score = _score_canvas_cls(
-                    canvas_cls=canvas_cls,
-                    teacher_cls=teacher_cls,
-                    objective=objective,
-                    kl_temperature=kl_temperature,
-                )
+            score = _segmentation_cross_entropy_losses(
+                model=model,
+                state=out.state,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                mask=mask,
+                batch_size=image.shape[0],
+            )[0].item()
 
-            if score > best_score:
+            if score < best_score:
                 best_score = score
-                best_sim = sim
                 best_vp = vp
                 best_state = out.state
 
     assert best_vp is not None and best_state is not None
-    return best_vp, best_state, best_sim, best_score
+    return best_vp, best_state, best_score
 
 
 def full_scene_step(
     model: GreedyModel,
     image: torch.Tensor,
     state: RecurrentState,
-    teacher_cls: torch.Tensor,
     glimpse_size_px: int,
     device: torch.device,
-    objective: GreedyObjective = "cosine",
-    kl_temperature: float = 1.0,
     probe: torch.nn.Module | None = None,
     canvas_grid_size: int | None = None,
     mask: torch.Tensor | None = None,
-    seg_kl_target_prob: torch.Tensor | None = None,
-) -> tuple[Viewpoint, RecurrentState, float, float]:
-    """Commit one full-scene glimpse and return the updated state/similarity."""
+) -> tuple[Viewpoint, RecurrentState, float]:
+    """Commit one full-scene glimpse and return the updated state/loss."""
+    if probe is None or canvas_grid_size is None or mask is None:
+        raise ValueError("full_scene_step requires probe, canvas_grid_size, and mask.")
+
     with torch.inference_mode():
         vp = Viewpoint.full_scene(batch_size=image.shape[0], device=device)
         glimpse = sample_at_viewpoint(
@@ -334,46 +340,129 @@ def full_scene_step(
             glimpse_size_px=glimpse_size_px,
         )
         out = model(glimpse=glimpse, state=state, viewpoint=vp)
-        canvas_cls = out.state.recurrent_cls.squeeze(1).float()
-        sim = reconstruction_reward(canvas_cls, teacher_cls)
-        if objective == "miou":
-            assert probe is not None
-            assert canvas_grid_size is not None
-            assert mask is not None
-            score = miou_from_state(
-                model=model,
-                state=out.state,
-                probe=probe,
-                mask=mask,
-                canvas_grid_size=canvas_grid_size,
+        score = _segmentation_cross_entropy_losses(
+            model=model,
+            state=out.state,
+            probe=probe,
+            canvas_grid_size=canvas_grid_size,
+            mask=mask,
+            batch_size=image.shape[0],
+        ).mean().item()
+    return vp, out.state, score
+
+
+def greedy_step_batch(
+    model: GreedyModel,
+    images: torch.Tensor,
+    state: RecurrentState,
+    k: int,
+    glimpse_size_px: int,
+    device: torch.device,
+    min_scale: float = 0.10,
+    max_scale: float = 1.0,
+    sample_seed: int | None = None,
+    probe: torch.nn.Module | None = None,
+    canvas_grid_size: int | None = None,
+    masks: torch.Tensor | None = None,
+) -> tuple[Viewpoint, RecurrentState, torch.Tensor]:
+    """
+    Evaluate B*K candidates in one forward and commit one low-loss candidate per image.
+    """
+    if probe is None or canvas_grid_size is None or masks is None:
+        raise ValueError("greedy_step_batch requires probe, canvas_grid_size, and masks.")
+    batch_size = images.shape[0]
+    if sample_seed is None:
+        candidates = random_viewpoints(
+            batch_size=batch_size,
+            device=device,
+            n_viewpoints=k,
+            min_scale=min_scale,
+            max_scale=max_scale,
+            start_with_full_scene=False,
+        )
+    else:
+        with torch.random.fork_rng():
+            torch.manual_seed(sample_seed)
+            candidates = random_viewpoints(
+                batch_size=batch_size,
+                device=device,
+                n_viewpoints=k,
+                min_scale=min_scale,
+                max_scale=max_scale,
+                start_with_full_scene=False,
             )
-        elif objective == "seg-kl":
-            assert probe is not None
-            assert canvas_grid_size is not None
-            assert seg_kl_target_prob is not None
-            score = _score_segmentation_kl(
-                model=model,
-                state=out.state,
-                probe=probe,
-                canvas_grid_size=canvas_grid_size,
-                target_prob=seg_kl_target_prob,
-                kl_temperature=kl_temperature,
-                batch_size=image.shape[0],
-            )
-        else:
-            score = _score_canvas_cls(
-                canvas_cls=canvas_cls,
-                teacher_cls=teacher_cls,
-                objective=objective,
-                kl_temperature=kl_temperature,
-            )
-    return vp, out.state, sim, score
+
+    centers = torch.cat([vp.centers for vp in candidates], dim=0)
+    scales = torch.cat([vp.scales for vp in candidates], dim=0)
+    candidate_vp = _make_viewpoint_like(candidates[0], centers=centers, scales=scales)
+    candidate_images = images.repeat((k,) + (1,) * (images.ndim - 1))
+    candidate_masks = masks.repeat((k,) + (1,) * (masks.ndim - 1))
+    candidate_state = _repeat_state_chunks(state, k)
+
+    with torch.inference_mode():
+        glimpse = sample_at_viewpoint(
+            spatial=candidate_images,
+            viewpoint=candidate_vp,
+            glimpse_size_px=glimpse_size_px,
+        )
+        out = model(glimpse=glimpse, state=candidate_state, viewpoint=candidate_vp)
+        losses = _segmentation_cross_entropy_losses(
+            model=model,
+            state=out.state,
+            probe=probe,
+            canvas_grid_size=canvas_grid_size,
+            mask=candidate_masks,
+            batch_size=batch_size * k,
+        ).view(k, batch_size)
+
+    best_candidate = losses.argmin(dim=0)
+    batch_index = torch.arange(batch_size, device=device)
+    flat_index = best_candidate * batch_size + batch_index
+    best_state = _index_state_batch(out.state, flat_index)
+    best_vp = _make_viewpoint_like(
+        candidates[0],
+        centers=centers.index_select(0, flat_index),
+        scales=scales.index_select(0, flat_index),
+    )
+    best_losses = losses[best_candidate, batch_index]
+    return best_vp, best_state, best_losses
+
+
+def full_scene_step_batch(
+    model: GreedyModel,
+    images: torch.Tensor,
+    state: RecurrentState,
+    glimpse_size_px: int,
+    device: torch.device,
+    probe: torch.nn.Module | None = None,
+    canvas_grid_size: int | None = None,
+    masks: torch.Tensor | None = None,
+) -> tuple[Viewpoint, RecurrentState, torch.Tensor]:
+    """Commit a full-scene glimpse for a batch and return per-image losses."""
+    if probe is None or canvas_grid_size is None or masks is None:
+        raise ValueError("full_scene_step_batch requires probe, canvas_grid_size, and masks.")
+    with torch.inference_mode():
+        vp = Viewpoint.full_scene(batch_size=images.shape[0], device=device)
+        glimpse = sample_at_viewpoint(
+            spatial=images,
+            viewpoint=vp,
+            glimpse_size_px=glimpse_size_px,
+        )
+        out = model(glimpse=glimpse, state=state, viewpoint=vp)
+        losses = _segmentation_cross_entropy_losses(
+            model=model,
+            state=out.state,
+            probe=probe,
+            canvas_grid_size=canvas_grid_size,
+            mask=masks,
+            batch_size=images.shape[0],
+        )
+    return vp, out.state, losses
 
 
 def run_greedy_episode(
     model: GreedyModel,
     image: torch.Tensor,
-    teacher_cls: torch.Tensor,
     init_state: RecurrentState,
     t: int = 5,
     k: int = 3,
@@ -384,8 +473,8 @@ def run_greedy_episode(
     probe: torch.nn.Module | None = None,
     canvas_grid_size: int | None = None,
     start_with_full_scene: bool = True,
-    objective: GreedyObjective = "cosine",
-    kl_temperature: float = 1.0,
+    compute_miou: bool = False,
+    keep_states: bool = False,
 ) -> dict:
     """
     Run a full greedy episode of T steps with K candidates per step.
@@ -393,126 +482,88 @@ def run_greedy_episode(
     Args:
         model:          Frozen CanViT model.
         image:          Scene tensor, shape [1, 3, H, W].
-        teacher_cls:    Frozen teacher CLS, shape [1, 768].
         init_state:     Initial RecurrentState (from model.init_state).
         t:              Number of timesteps.
         k:              Number of candidates per step.
         glimpse_size_px: Glimpse resolution in pixels.
         device:         Torch device.
         seed:           Optional random seed for reproducibility.
-        mask:           Optional ADE20K target mask, shape [1, H, W] or [H, W].
-        probe:          Optional segmentation probe for per-timestep mIoU.
+        mask:           ADE20K target mask, shape [1, H, W] or [H, W].
+        probe:          Segmentation probe for CE scoring and mIoU diagnostics.
         canvas_grid_size: Canvas grid size used to reshape the state features.
         start_with_full_scene: If True, timestep 0 is a committed full-scene
             glimpse; later timesteps use greedy K-candidate search.
-        objective: Greedy search objective: "cosine", "kl", "seg-kl", or "miou".
-        kl_temperature: Softmax temperature used by the KL objective.
-
+        compute_miou:   If True, include per-step mIoU diagnostics.
+        keep_states:    If True, return committed CanViT recurrent states for
+            downstream inspection/visualization.
     Returns:
         Dictionary with per-step diagnostics:
             - viewpoints: list of chosen Viewpoint objects
-            - sims:       list of cosine similarities after each step
-            - scores:     list of objective scores used for selection
-            - rewards:    list of delta rewards (gain per step)
+            - scores:     list of segmentation CE losses used for selection
+            - rewards:    list of loss reductions (positive means lower loss)
             - scales:     list of chosen scales (for coarse-to-fine analysis)
             - centers:    list of chosen centers
+            - states:     optional list of committed recurrent states
             - mious:      optional list of mIoU after each committed step
     """
     if device is None:
         device = next(model.parameters()).device
     if seed is not None:
         torch.manual_seed(seed)
-    if objective not in {"cosine", "kl", "seg-kl", "miou"}:
-        raise ValueError("objective must be 'cosine', 'kl', 'seg-kl', or 'miou'.")
-    if kl_temperature <= 0:
-        raise ValueError("kl_temperature must be positive.")
-    if (mask is None) != (probe is None):
-        raise ValueError("Pass both mask and probe to compute per-timestep mIoU.")
-    if probe is not None and canvas_grid_size is None:
-        raise ValueError("Pass canvas_grid_size when computing per-timestep mIoU.")
-    if objective == "seg-kl" and (probe is None or canvas_grid_size is None):
-        raise ValueError("seg-kl objective requires --miou/probe and canvas_grid_size.")
-    if objective == "miou" and (
-        probe is None or canvas_grid_size is None or mask is None
-    ):
-        raise ValueError("miou objective requires --miou/probe/mask.")
+    if probe is None or canvas_grid_size is None or mask is None:
+        raise ValueError(
+            "Greedy segmentation CE selection requires probe, "
+            "canvas_grid_size, and mask."
+        )
 
     state = init_state
-    prev_score = 0.0
+    prev_score: float | None = None
 
-    viewpoints, sims, scores, rewards, scales, centers = [], [], [], [], [], []
-    mious = [] if probe is not None else None
+    viewpoints, scores, rewards, scales, centers, states = [], [], [], [], [], []
+    mious = [] if compute_miou else None
     mask_dev = mask.to(device) if mask is not None else None
-    seg_kl_target_prob = None
-    if objective == "seg-kl":
-        assert probe is not None and canvas_grid_size is not None
-        with torch.inference_mode():
-            teacher_vp = Viewpoint.full_scene(batch_size=image.shape[0], device=device)
-            teacher_glimpse = sample_at_viewpoint(
-                spatial=image,
-                viewpoint=teacher_vp,
-                glimpse_size_px=glimpse_size_px,
-            )
-            teacher_out = model(
-                glimpse=teacher_glimpse,
-                state=init_state,
-                viewpoint=teacher_vp,
-            )
-            teacher_logits = _seg_logits_from_state(
-                model=model,
-                state=teacher_out.state,
-                probe=probe,
-                canvas_grid_size=canvas_grid_size,
-                batch_size=image.shape[0],
-            )
-            seg_kl_target_prob = F.softmax(
-                teacher_logits / kl_temperature,
-                dim=1,
-            ).detach()
 
     for step_idx in range(t):
         if step_idx == 0 and start_with_full_scene:
-            vp, state, sim, score = full_scene_step(
+            vp, state, score = full_scene_step(
                 model=model,
                 image=image,
                 state=state,
-                teacher_cls=teacher_cls,
                 glimpse_size_px=glimpse_size_px,
                 device=device,
-                objective=objective,
-                kl_temperature=kl_temperature,
                 probe=probe,
                 canvas_grid_size=canvas_grid_size,
                 mask=mask_dev,
-                seg_kl_target_prob=seg_kl_target_prob,
             )
         else:
-            vp, state, sim, score = greedy_step(
+            vp, state, score = greedy_step(
                 model=model,
                 image=image,
                 state=state,
-                teacher_cls=teacher_cls,
                 k=k,
                 glimpse_size_px=glimpse_size_px,
                 device=device,
-                objective=objective,
-                kl_temperature=kl_temperature,
                 sample_seed=None if seed is None else seed + step_idx,
                 probe=probe,
                 canvas_grid_size=canvas_grid_size,
                 mask=mask_dev,
-                seg_kl_target_prob=seg_kl_target_prob,
             )
-        reward = score - prev_score
+        reward = 0.0 if prev_score is None else prev_score - score
         prev_score = score
 
         viewpoints.append(vp)
-        sims.append(sim)
         scores.append(score)
         rewards.append(reward)
         scales.append(float(vp.scales[0].item()))
-        centers.append(vp.centers[0].cpu().tolist()) 
-        if probe is not None:
+        centers.append(vp.centers[0].cpu().tolist())
+        # Fixed by Codex on 2026-06-09
+        # Problem: the k-greedy visualizer could show where the policy looked,
+        # but not what segmentation canvas that sequence produced.
+        # Solution: optionally retain the committed recurrent state after each
+        # step so visualization tools can decode per-timestep predictions.
+        if keep_states:
+            states.append(state)
+        if compute_miou:
             assert mious is not None
             assert mask_dev is not None and canvas_grid_size is not None
             mious.append(
@@ -527,12 +578,118 @@ def run_greedy_episode(
 
     result = {
         "viewpoints": viewpoints,
-        "sims": sims,
         "scores": scores,
         "rewards": rewards,
         "scales": scales,
         "centers": centers,
     }
+    if keep_states:
+        result["states"] = states
+    if mious is not None:
+        result["mious"] = mious
+    return result
+
+
+def run_greedy_batch(
+    model: GreedyModel,
+    images: torch.Tensor,
+    init_state: RecurrentState,
+    t: int = 5,
+    k: int = 3,
+    glimpse_size_px: int = 128,
+    device: torch.device | None = None,
+    seed: int | None = None,
+    masks: torch.Tensor | None = None,
+    probe: torch.nn.Module | None = None,
+    canvas_grid_size: int | None = None,
+    start_with_full_scene: bool = True,
+    compute_miou: bool = False,
+    keep_states: bool = False,
+) -> dict:
+    """
+    Run batched greedy episodes, evaluating each step's B*K candidates together.
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    if seed is not None:
+        torch.manual_seed(seed)
+    if probe is None or canvas_grid_size is None or masks is None:
+        raise ValueError(
+            "Greedy segmentation CE selection requires probe, "
+            "canvas_grid_size, and masks."
+        )
+
+    state = init_state
+    prev_scores: torch.Tensor | None = None
+    masks_dev = masks.to(device)
+    batch_size = images.shape[0]
+
+    viewpoints, scores, rewards, scales, centers, states = [], [], [], [], [], []
+    mious = [] if compute_miou else None
+
+    for step_idx in range(t):
+        if step_idx == 0 and start_with_full_scene:
+            vp, state, step_scores = full_scene_step_batch(
+                model=model,
+                images=images,
+                state=state,
+                glimpse_size_px=glimpse_size_px,
+                device=device,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                masks=masks_dev,
+            )
+        else:
+            vp, state, step_scores = greedy_step_batch(
+                model=model,
+                images=images,
+                state=state,
+                k=k,
+                glimpse_size_px=glimpse_size_px,
+                device=device,
+                sample_seed=None if seed is None else seed + step_idx,
+                probe=probe,
+                canvas_grid_size=canvas_grid_size,
+                masks=masks_dev,
+            )
+        step_rewards = torch.zeros_like(step_scores) if prev_scores is None else prev_scores - step_scores
+        prev_scores = step_scores
+
+        viewpoints.append(vp)
+        scores.append(step_scores.detach())
+        rewards.append(step_rewards.detach())
+        scales.append(vp.scales.detach())
+        centers.append(vp.centers.detach())
+        if keep_states:
+            states.append(state)
+        if compute_miou:
+            assert mious is not None
+            image_mious = []
+            for image_idx in range(batch_size):
+                one_state = _index_state_batch(
+                    state,
+                    torch.tensor([image_idx], device=device),
+                )
+                image_mious.append(
+                    miou_from_state(
+                        model=model,
+                        state=one_state,
+                        probe=probe,
+                        mask=masks_dev[image_idx : image_idx + 1],
+                        canvas_grid_size=canvas_grid_size,
+                    )
+                )
+            mious.append(torch.tensor(image_mious, device=device))
+
+    result = {
+        "viewpoints": viewpoints,
+        "scores": scores,
+        "rewards": rewards,
+        "scales": scales,
+        "centers": centers,
+    }
+    if keep_states:
+        result["states"] = states
     if mious is not None:
         result["mious"] = mious
     return result

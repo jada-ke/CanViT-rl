@@ -177,14 +177,6 @@ def main() -> None:
                 if step_idx == 0:
                     vp = Viewpoint.full_scene(batch_size=batch_size, device=device)
                 else:
-                    # Fixed by Codex on 2026-06-01
-                    # Problem: The random comparison needed the same t=0
-                    # context as the learned policy, followed by unconstrained
-                    # random CanViT viewpoints with a small minimum scale.
-                    # Solution: Use upstream random_viewpoints after the
-                    # full-scene state, setting min_scale from the CLI.
-                    # Result: This baseline tests random continuous glimpses
-                    # without reusing the EG-F2C tile action set.
                     vp = random_viewpoints(
                         batch_size=batch_size,
                         device=device,
@@ -217,13 +209,6 @@ def main() -> None:
                     )
                     _update_miou(accs[step_idx], probe, spatial, masks)
                 else:
-                    # Fixed by Codex on 2026-06-01
-                    # Problem: Dataset-level accumulation is accurate but slow,
-                    # and averaging batched mIoU can hide per-image variation.
-                    # Solution: In mean mode, force loader batch_size=1 and
-                    # average one miou_from_state result per image.
-                    # Result: Quick diagnostics avoid accumulator integration
-                    # and avoid computing the mean over multi-image batches.
                     miou_sums[step_idx] += (
                         miou_from_state(
                             model=model,
