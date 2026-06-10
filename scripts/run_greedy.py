@@ -130,6 +130,7 @@ def _mean_metrics(
     return metrics
 
 
+@torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=10)
@@ -345,10 +346,10 @@ def main():
         )
 
         for step in range(args.t):
-            scores = result["scores"][step]
-            rewards = result["rewards"][step]
-            scales = result["scales"][step]
-            centers = result["centers"][step]
+            scores = result["scores"][step].detach()
+            rewards = result["rewards"][step].detach()
+            scales = result["scales"][step].detach()
+            centers = result["centers"][step].detach()
             scale_sums[step] += float(scales.sum().item())
             score_sums[step] += float(scores.sum().item())
             loss_reduction_sums[step] += float(rewards.sum().item())
@@ -389,11 +390,6 @@ def main():
             )
             progress_metrics["progress/images_seen"] = n_images_seen
             progress_metrics["progress/batches_seen"] = batch_idx + 1
-            # Fixed by Codex on 2026-06-10
-            # Problem: greedy sweeps reported accuracy/loss but not how fast
-            # the GPU was processing committed or candidate glimpse forwards.
-            # Solution: time each completed rollout batch and log both
-            # committed glimpses/sec and k-greedy candidate glimpses/sec.
             progress_metrics["throughput/batch_committed_glimpses_per_sec"] = (
                 batch_committed_gps
             )
