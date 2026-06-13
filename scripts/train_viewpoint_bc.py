@@ -6,8 +6,9 @@ timestep feature. CanViT and the ADE20K probe stay frozen; k-greedy supplies
 batched teacher actions and mIoU diagnostics.
 
 Example:
-    uv run python scripts/train_viewpoint_bc.py --batches 500  --max-samples 1\
-        --batch-size 1 --k 32 --log-std-penalty 0 --experiment-name bc-im1-k32
+    uv run python scripts/train_viewpoint_bc.py --batches 100  --max-samples 1\
+        --batch-size 1 --k 16 --log-std-penalty 0 \
+        --experiment-name bc-im1-k16 --comet-log-interval 10
     uv run python scripts/train_viewpoint_bc.py --optuna-trials 20 --batches 50
 """
 
@@ -48,7 +49,6 @@ from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import greedy_step_batch
 from canvit_rl.viewpoint_policy import (
     ViewpointGaussianActor,
-    ViewpointHistoryEncoder,
     action_to_viewpoint,
     viewpoint_to_action,
 )
@@ -160,14 +160,12 @@ def _build_actor(
     device: torch.device,
 ) -> ViewpointGaussianActor:
     """Construct the image-independent Gaussian actor."""
-    encoder = ViewpointHistoryEncoder(
+    return ViewpointGaussianActor(
         d_model=args.d_model,
         max_steps=args.max_history,
-        state_mode=args.state_mode,
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
-    )
-    return ViewpointGaussianActor(encoder, args.d_model).to(device)
+    ).to(device)
 
 
 def _save_checkpoint(
@@ -277,6 +275,10 @@ def train_once(
     action_std_y_window: list[float] = []
     action_std_x_window: list[float] = []
     action_std_scale_window: list[float] = []
+    action_error_y_window: list[float] = []
+    action_error_x_window: list[float] = []
+    action_error_scale_window: list[float] = []
+    grad_norm_window: list[float] = []
 
     elapsed_seconds = 0.0
     committed_glimpses = 0
@@ -371,9 +373,15 @@ def train_once(
                 + args.min_scale
             )
             action_mean_scale_window.append(float(decoded_scale.mean().detach()))
-            action_std_y_window.append(float(pred_action[:, 0].std().detach()))
-            action_std_x_window.append(float(pred_action[:, 1].std().detach()))
-            action_std_scale_window.append(float(pred_action[:, 2].std().detach()))
+            action_std_y_window.append(
+                float(pred_action[:, 0].std(unbiased=False).detach())
+            )
+            action_std_x_window.append(
+                float(pred_action[:, 1].std(unbiased=False).detach())
+            )
+            action_std_scale_window.append(
+                float(decoded_scale.std(unbiased=False).detach())
+            )
 
             teacher_vp, teacher_state, _ = greedy_step_batch(
                 model=model,
@@ -393,6 +401,12 @@ def train_once(
                 float(teacher_vp.scales.detach().mean())
             )
             target_action = viewpoint_to_action(teacher_vp, min_scale=args.min_scale)
+            action_error = (pred_action - target_action).abs()
+            action_error_y_window.append(float(action_error[:, 0].mean().detach()))
+            action_error_x_window.append(float(action_error[:, 1].mean().detach()))
+            action_error_scale_window.append(
+                float(action_error[:, 2].mean().detach())
+            )
             step_loss = F.mse_loss(pred_action, target_action)
             if args.log_std_penalty:
                 step_loss = step_loss + args.log_std_penalty * log_std.pow(2).mean()
@@ -484,7 +498,11 @@ def train_once(
         batch_loss = batch_loss / max(args.t, 1)
         optimizer.zero_grad()
         batch_loss.backward()
-        torch.nn.utils.clip_grad_norm_(actor.parameters(), args.grad_clip)
+        total_grad_norm = torch.nn.utils.clip_grad_norm_(
+            actor.parameters(),
+            args.grad_clip,
+        )
+        grad_norm_window.append(float(total_grad_norm))
         optimizer.step()
 
         _sync_for_timing(device)
@@ -527,6 +545,10 @@ def train_once(
                 "action/std_y": _mean(action_std_y_window),
                 "action/std_x": _mean(action_std_x_window),
                 "action/std_scale": _mean(action_std_scale_window),
+                "grad/total_norm": _mean(grad_norm_window),
+                "bc/error_y": _mean(action_error_y_window),
+                "bc/error_x": _mean(action_error_x_window),
+                "bc/error_scale": _mean(action_error_scale_window),
             }
             # Log learned steps only (step 0 warmup excluded — identical for
             # both teacher and actor so it carries no comparative signal).
@@ -571,6 +593,10 @@ def train_once(
             action_std_y_window.clear()
             action_std_x_window.clear()
             action_std_scale_window.clear()
+            action_error_y_window.clear()
+            action_error_x_window.clear()
+            action_error_scale_window.clear()
+            grad_norm_window.clear()
 
         if batch_idx % args.checkpoint_interval == 0:
             _save_checkpoint(
@@ -621,10 +647,6 @@ def run_optuna(args: argparse.Namespace) -> None:
         trial_args.d_model = trial.suggest_categorical("d_model", [128, 256, 384])
         trial_args.rff_dim = trial.suggest_categorical("rff_dim", [64, 128, 256])
         trial_args.rff_seed = trial.suggest_int("rff_seed", 1, 10_000)
-        trial_args.state_mode = trial.suggest_categorical(
-            "state_mode",
-            ["vpe", "vpe_timestep"],
-        )
         trial_args.seed = args.seed + trial.number
         trial_args.checkpoint_dir = args.checkpoint_dir / f"trial_{trial.number}"
         return train_once(trial_args, trial_number=trial.number)
@@ -670,11 +692,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-scale", type=float, default=0.05)
     parser.add_argument(
-        "--state-mode",
-        choices=["vpe", "vpe_timestep"],
-        default="vpe_timestep",
-    )
-    parser.add_argument(
         "--rff-dim",
         type=int,
         default=128,
@@ -717,7 +734,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comet-workspace", type=str, default=None)
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--comet-tags", type=str, default="viewpoint-bc")
-    parser.add_argument("--comet-log-interval", type=int, default=10)
+    parser.add_argument("--comet-log-interval", type=int, default=25)
     parser.add_argument("--optuna-trials", type=int, default=0)
     parser.add_argument("--optuna-study-name", type=str, default="viewpoint-bc")
     parser.add_argument("--optuna-storage", type=str, default=None)

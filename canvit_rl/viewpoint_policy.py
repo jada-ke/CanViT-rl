@@ -31,64 +31,67 @@ def action_to_viewpoint(
     return Viewpoint(centers=centers, scales=scales)
 
 
-class ViewpointHistoryEncoder(nn.Module):
-    """MLP encoder over previous viewpoint positions and looked-at timesteps."""
+# class ViewpointHistoryEncoder(nn.Module):
+#     """Previous encoder kept here temporarily for comparison.
+#
+#     It projected flattened VPE history into a separate latent vector before
+#     the actor head, and optionally appended timestep features. The current
+#     actor below removes that middle encoder and feeds flattened VPE directly
+#     to the actor head.
+#     """
+# def __init__(
+#         self,
+#         *,
+#         d_model: int,
+#         max_steps: int,
+#         state_mode: str,
+#         rff_dim: int,
+#         rff_seed: int,
+#     ) -> None:
+#         super().__init__()
+#         if state_mode not in {"vpe", "vpe_timestep"}:
+#             raise ValueError("state_mode must be 'vpe' or 'vpe_timestep'.")
+#         self.max_steps = max_steps
+#         self.state_mode = state_mode
+#         self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
+#         step_dim = 1 if state_mode == "vpe_timestep" else 0
+#         slot_dim = self.vpe.output_dim + step_dim
+#         self.net = nn.Sequential(
+#             nn.LayerNorm(max_steps * slot_dim),
+#             nn.Linear(max_steps * slot_dim, d_model),
+#             nn.GELU(),
+#             nn.Linear(d_model, d_model),
+#             nn.GELU(),
+#             nn.LayerNorm(d_model),
+#         )
+
+
+class ViewpointGaussianActor(nn.Module):
+    """Tanh-squashed Gaussian actor over VPE-encoded viewpoint history."""
 
     def __init__(
         self,
         *,
         d_model: int,
         max_steps: int,
-        state_mode: str,
         rff_dim: int,
         rff_seed: int,
     ) -> None:
         super().__init__()
-        if state_mode not in {"vpe", "vpe_timestep"}:
-            raise ValueError("state_mode must be 'vpe' or 'vpe_timestep'.")
         self.max_steps = max_steps
-        self.state_mode = state_mode
         self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
-        step_dim = 1 if state_mode == "vpe_timestep" else 0
-        slot_dim = self.vpe.output_dim + step_dim
-        self.net = nn.Sequential(
+        slot_dim = self.vpe.output_dim
+        # Fixed by Codex on 2026-06-13
+        # Problem: the image-independent actor still had a separate history MLP,
+        # adding an unnecessary abstraction between VPE history and policy head.
+        # Solution: encode each viewed slot with CanViT VPE, mask empty slots,
+        # flatten the fixed history, and let the actor head predict the action.
+        # Result: the policy matches the intended History -> VPE -> flatten ->
+        # ActorHead path without a separate ViewpointHistoryEncoder module.
+        self.head = nn.Sequential(
             nn.LayerNorm(max_steps * slot_dim),
             nn.Linear(max_steps * slot_dim, d_model),
             nn.GELU(),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-        )
-
-    def forward(self, coords: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = coords.shape
-        if seq_len > self.max_steps:
-            raise ValueError(f"seq_len={seq_len} exceeds max_steps={self.max_steps}.")
-
-        vpe = self.vpe(
-            y=coords[..., 0].float(),
-            x=coords[..., 1].float(),
-            s=coords[..., 2].float().clamp_min(1e-6),
-        )
-        step_ids = torch.arange(seq_len, device=coords.device)[None, :]
-        valid_steps = step_ids < lengths[:, None]
-        vpe = vpe * valid_steps[..., None].float()
-        if self.state_mode == "vpe_timestep":
-            denom = max(self.max_steps - 1, 1)
-            looked_at_t = step_ids.to(coords.dtype) / float(denom)
-            time_feature = looked_at_t.expand(batch_size, -1)[..., None]
-            time_feature = time_feature * valid_steps[..., None].float()
-            vpe = torch.cat([vpe, time_feature], dim=-1)
-        return self.net(vpe.reshape(batch_size, -1))
-
-
-class ViewpointGaussianActor(nn.Module):
-    """Tanh-squashed Gaussian actor over image-independent viewpoint history."""
-
-    def __init__(self, encoder: ViewpointHistoryEncoder, d_model: int) -> None:
-        super().__init__()
-        self.encoder = encoder
-        self.head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, 6),
@@ -98,7 +101,19 @@ class ViewpointGaussianActor(nn.Module):
         self,
         batch: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        z = self.encoder(batch["coords"], batch["lengths"])
+        coords = batch["coords"]
+        lengths = batch["lengths"]
+        batch_size, seq_len, _ = coords.shape
+        if seq_len > self.max_steps:
+            raise ValueError(f"seq_len={seq_len} exceeds max_steps={self.max_steps}.")
+        vpe = self.vpe(
+            y=coords[..., 0].float(),
+            x=coords[..., 1].float(),
+            s=coords[..., 2].float().clamp_min(1e-6),
+        )
+        step_ids = torch.arange(seq_len, device=coords.device)[None, :]
+        valid_steps = step_ids < lengths[:, None]
+        z = (vpe * valid_steps[..., None].float()).reshape(batch_size, -1)
         mean, log_std = self.head(z).chunk(2, dim=-1)
         return mean, log_std.clamp(-5.0, 2.0)
 
