@@ -201,6 +201,11 @@ def _make_step_windows(n_steps: int) -> list[list[float]]:
     return [[] for _ in range(n_steps)]
 
 
+def _mean_nested(step_windows: list[list[float]]) -> float:
+    """Average metric values across all step windows."""
+    return _mean([value for values in step_windows for value in values])
+
+
 def train_once(
     args: argparse.Namespace,
     *,
@@ -265,6 +270,12 @@ def train_once(
     teacher_ce_windows = _make_step_windows(args.t)
     actor_ce_windows = _make_step_windows(args.t)
     teacher_scale_windows = _make_step_windows(args.t)
+    teacher_std_y_windows = _make_step_windows(args.t)
+    teacher_std_x_windows = _make_step_windows(args.t)
+    teacher_std_scale_windows = _make_step_windows(args.t)
+    actor_std_y_windows = _make_step_windows(args.t)
+    actor_std_x_windows = _make_step_windows(args.t)
+    actor_std_scale_windows = _make_step_windows(args.t)
 
     rand_miou_windows = _make_step_windows(args.t)
     rand_ce_windows = _make_step_windows(args.t)
@@ -272,9 +283,6 @@ def train_once(
     action_mean_y_window: list[float] = []
     action_mean_x_window: list[float] = []
     action_mean_scale_window: list[float] = []
-    action_std_y_window: list[float] = []
-    action_std_x_window: list[float] = []
-    action_std_scale_window: list[float] = []
     action_error_y_window: list[float] = []
     action_error_x_window: list[float] = []
     action_error_scale_window: list[float] = []
@@ -373,15 +381,6 @@ def train_once(
                 + args.min_scale
             )
             action_mean_scale_window.append(float(decoded_scale.mean().detach()))
-            action_std_y_window.append(
-                float(pred_action[:, 0].std(unbiased=False).detach())
-            )
-            action_std_x_window.append(
-                float(pred_action[:, 1].std(unbiased=False).detach())
-            )
-            action_std_scale_window.append(
-                float(decoded_scale.std(unbiased=False).detach())
-            )
 
             teacher_vp, teacher_state, _ = greedy_step_batch(
                 model=model,
@@ -399,6 +398,15 @@ def train_once(
             )
             teacher_scale_windows[step_idx].append(
                 float(teacher_vp.scales.detach().mean())
+            )
+            teacher_std_y_windows[step_idx].append(
+                float(teacher_vp.centers[:, 0].std(unbiased=False).detach())
+            )
+            teacher_std_x_windows[step_idx].append(
+                float(teacher_vp.centers[:, 1].std(unbiased=False).detach())
+            )
+            teacher_std_scale_windows[step_idx].append(
+                float(teacher_vp.scales.std(unbiased=False).detach())
             )
             target_action = viewpoint_to_action(teacher_vp, min_scale=args.min_scale)
             action_error = (pred_action - target_action).abs()
@@ -436,6 +444,15 @@ def train_once(
                     {"coords": actor_coords, "lengths": actor_lengths}
                 )
                 actor_vp = action_to_viewpoint(actor_action, min_scale=args.min_scale)
+                actor_std_y_windows[step_idx].append(
+                    float(actor_vp.centers[:, 0].std(unbiased=False).detach())
+                )
+                actor_std_x_windows[step_idx].append(
+                    float(actor_vp.centers[:, 1].std(unbiased=False).detach())
+                )
+                actor_std_scale_windows[step_idx].append(
+                    float(actor_vp.scales.std(unbiased=False).detach())
+                )
                 actor_glimpse = sample_at_viewpoint(
                     spatial=images,
                     viewpoint=actor_vp,
@@ -531,7 +548,7 @@ def train_once(
                 "bc/loss": _mean(loss_window),
                 "throughput/committed_glimpses_per_sec": batch_gps,
                 "throughput/candidate_glimpses_per_sec": batch_candidate_gps,
-                # Action statistics — watch std collapse toward 0 for mode collapse
+                # Action means plus actual teacher/actor batch spread diagnostics.
                 "action/mean_y": _mean(action_mean_y_window),
                 "action/mean_x": _mean(action_mean_x_window),
                 "action/mean_scale": _mean(action_mean_scale_window),
@@ -542,9 +559,12 @@ def train_once(
                         for value in step_values
                     ]
                 ),
-                "action/std_y": _mean(action_std_y_window),
-                "action/std_x": _mean(action_std_x_window),
-                "action/std_scale": _mean(action_std_scale_window),
+                "teacher/std_y": _mean_nested(teacher_std_y_windows),
+                "teacher/std_x": _mean_nested(teacher_std_x_windows),
+                "teacher/std_scale": _mean_nested(teacher_std_scale_windows),
+                "actor/std_y": _mean_nested(actor_std_y_windows),
+                "actor/std_x": _mean_nested(actor_std_x_windows),
+                "actor/std_scale": _mean_nested(actor_std_scale_windows),
                 "grad/total_norm": _mean(grad_norm_window),
                 "bc/error_y": _mean(action_error_y_window),
                 "bc/error_x": _mean(action_error_x_window),
@@ -585,14 +605,17 @@ def train_once(
             teacher_ce_windows = _make_step_windows(args.t)
             actor_ce_windows = _make_step_windows(args.t)
             teacher_scale_windows = _make_step_windows(args.t)
+            teacher_std_y_windows = _make_step_windows(args.t)
+            teacher_std_x_windows = _make_step_windows(args.t)
+            teacher_std_scale_windows = _make_step_windows(args.t)
+            actor_std_y_windows = _make_step_windows(args.t)
+            actor_std_x_windows = _make_step_windows(args.t)
+            actor_std_scale_windows = _make_step_windows(args.t)
             rand_miou_windows = _make_step_windows(args.t)
             rand_ce_windows = _make_step_windows(args.t)
             action_mean_y_window.clear()
             action_mean_x_window.clear()
             action_mean_scale_window.clear()
-            action_std_y_window.clear()
-            action_std_x_window.clear()
-            action_std_scale_window.clear()
             action_error_y_window.clear()
             action_error_x_window.clear()
             action_error_scale_window.clear()

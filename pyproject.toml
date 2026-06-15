@@ -24,6 +24,7 @@ dependencies = [
     "safetensors>=0.7.0",
     "canvit-specialize",
     "comet-ml>=3.49.0",
+    "optuna>=4.0.0",
 ]
 
 [project.optional-dependencies]
