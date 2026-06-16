@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from canvit_pytorch import VPEEncoder
 
 
 class CanViTSequenceEncoder(nn.Module):
@@ -117,4 +118,49 @@ class ContinuousCritic(nn.Module):
         action: torch.Tensor,
     ) -> torch.Tensor:
         z = self.encoder(batch["patches"], batch["coords"], batch["lengths"])
+        return self.q(torch.cat([z, action], dim=-1)).squeeze(-1)
+
+
+class ViewpointHistoryCritic(nn.Module):
+    """Q(history, action) critic over the same VPE history used by BC actor."""
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        max_steps: int,
+        rff_dim: int,
+        rff_seed: int,
+    ) -> None:
+        super().__init__()
+        self.max_steps = max_steps
+        self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
+        slot_dim = self.vpe.output_dim
+        self.q = nn.Sequential(
+            nn.LayerNorm(max_steps * slot_dim + 3),
+            nn.Linear(max_steps * slot_dim + 3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        coords = batch["coords"]
+        lengths = batch["lengths"]
+        batch_size, seq_len, _ = coords.shape
+        if seq_len > self.max_steps:
+            raise ValueError(f"seq_len={seq_len} exceeds max_steps={self.max_steps}.")
+        vpe = self.vpe(
+            y=coords[..., 0].float(),
+            x=coords[..., 1].float(),
+            s=coords[..., 2].float().clamp_min(1e-6),
+        )
+        step_ids = torch.arange(seq_len, device=coords.device)[None, :]
+        valid_steps = step_ids < lengths[:, None]
+        z = (vpe * valid_steps[..., None].float()).reshape(batch_size, -1)
         return self.q(torch.cat([z, action], dim=-1)).squeeze(-1)
