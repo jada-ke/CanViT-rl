@@ -472,7 +472,15 @@ def _sample_candidate_batch(
                     )
                 )
             records.append(sample_records)
-    return action_batch, reward_batch, records, out.state
+    # Fixed by Codex on 2026-06-17
+    # Problem: B*K labels/actions are produced under torch.inference_mode()
+    # because CanViT/probe are frozen, but inference tensors cannot be saved by
+    # autograd when the critic loss backpropagates through q(history, action).
+    # Solution: Clone the supervised critic inputs/targets into normal detached
+    # tensors before returning them to the train step.
+    # Result: Frozen label generation stays inference-only while q1/q2 MSE can
+    # run a normal backward pass.
+    return action_batch.clone(), reward_batch.clone(), records, out.state
 
 
 def _evaluate_once(
@@ -1100,7 +1108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--comet-log-interval", type=int, default=10)
+    parser.add_argument("--comet-log-interval", type=int, default=25)
     parser.add_argument(
         "--rollout-policy",
         choices=["best", "random"],
