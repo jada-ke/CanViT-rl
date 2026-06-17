@@ -3,7 +3,7 @@ Train continuous SAC critics from k-candidate CE-improvement oracle labels.
 
 Usage:
     uv run python scripts/pretrain_canvit_critic.py --batches 100 --max-samples 1 --batch-size 1 --t 1 --k 16 \
-        --experiment-name critic-im1-k16-t1
+        --test-images 8 --checkpoint-dir checkpoints/canvit_critic --experiment-name critic-im1-k16-t1
     uv run python scripts/pretrain_canvit_critic.py --optuna-trials 20 --batches 50
 """
 
@@ -229,6 +229,11 @@ def _limit_dataset(dataset, max_samples: int | None, *, offset: int = 0):
     return torch.utils.data.Subset(dataset, range(start, stop))
 
 
+def _checkpoint_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    """Return latest/best checkpoint paths inside the configured directory."""
+    return args.checkpoint_dir / "latest.pt", args.checkpoint_dir / "best.pt"
+
+
 def _save_checkpoint(
     *,
     path: Path,
@@ -328,6 +333,11 @@ def _collect_state_metrics(
     worst_reward_idx = int(np.argmin(rewards_np))
     best_q_idx = int(np.argmax(q_np))
     random_idx = random.randrange(len(rewards_np))
+    reward_desc = np.argsort(rewards_np)[::-1]
+    top3 = set(reward_desc[: min(3, len(reward_desc))])
+    top5 = set(reward_desc[: min(5, len(reward_desc))])
+    q_best = float(q_np[best_reward_idx])
+    q_worst = float(q_np[worst_reward_idx])
     return {
         "reward/mean": float(np.mean(rewards_np)),
         "reward/std": float(np.std(rewards_np)),
@@ -342,9 +352,13 @@ def _collect_state_metrics(
         "critic/spearman": _spearman(q_np, rewards_np),
         "critic/pearson": _pearson(q_np, rewards_np),
         "critic/top1_match": float(best_q_idx == best_reward_idx),
-        "q/best": float(q_np[best_reward_idx]),
+        "critic/top3_match": float(best_q_idx in top3),
+        "critic/top5_match": float(best_q_idx in top5),
+        "critic/top1_vs_random": float(rewards_np[best_q_idx] > rewards_np[random_idx]),
+        "q/best": q_best,
         "q/random": float(q_np[random_idx]),
-        "q/worst": float(q_np[worst_reward_idx]),
+        "q/worst": q_worst,
+        "q_gap_best_worst": q_best - q_worst,
     }
 
 
@@ -466,7 +480,44 @@ def _evaluate_once(
         "eval/critic_spearman": metrics["critic/spearman"],
         "eval/critic_pearson": metrics["critic/pearson"],
         "eval/critic_top1_match": metrics["critic/top1_match"],
+        "eval/critic_top3_match": metrics["critic/top3_match"],
+        "eval/critic_top5_match": metrics["critic/top5_match"],
+        "eval/critic_top1_vs_random": metrics["critic/top1_vs_random"],
+        "eval/q_gap_best_worst": metrics["q_gap_best_worst"],
     }, eval_iter
+
+
+def _evaluate_many(
+    *,
+    q1: ViewpointHistoryCritic,
+    q2: ViewpointHistoryCritic,
+    eval_iter,
+    eval_loader: DataLoader,
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[dict[str, float], Any]:
+    """Average held-out ranking metrics across --test-images images."""
+    windows: dict[str, list[float]] = {}
+    for _ in range(args.test_images):
+        metrics, eval_iter = _evaluate_once(
+            q1=q1,
+            q2=q2,
+            eval_iter=eval_iter,
+            eval_loader=eval_loader,
+            model=model,
+            probe=probe,
+            cfg=cfg,
+            args=args,
+            device=device,
+        )
+        for key, value in metrics.items():
+            if not np.isnan(value):
+                windows.setdefault(key, []).append(float(value))
+    windows["eval/test_images"] = [float(args.test_images)]
+    return {key: _mean(values) for key, values in windows.items()}, eval_iter
 
 
 def train_once(
@@ -483,6 +534,8 @@ def train_once(
         raise ValueError("Require 0 < --min-scale < 1.")
     if args.comet_log_interval <= 0:
         raise ValueError("--comet-log-interval must be positive.")
+    if args.test_images <= 0:
+        raise ValueError("--test-images must be positive.")
     if args.max_history < args.t + 1:
         raise ValueError(
             f"--max-history ({args.max_history}) must be >= t+1 ({args.t + 1})."
@@ -551,6 +604,7 @@ def train_once(
         param.requires_grad_(False)
 
     q1, q2 = _build_critics(args, device)
+    latest_path, best_path = _checkpoint_paths(args)
     opt = torch.optim.AdamW(
         list(q1.parameters()) + list(q2.parameters()),
         lr=args.lr,
@@ -758,7 +812,7 @@ def train_once(
 
         should_log = batch_idx % args.comet_log_interval == 0
         if should_log:
-            eval_metrics, eval_iter = _evaluate_once(
+            eval_metrics, eval_iter = _evaluate_many(
                 q1=q1,
                 q2=q2,
                 eval_iter=eval_iter,
@@ -786,7 +840,7 @@ def train_once(
 
             current_top1 = metrics.get("critic/top1_match", float("-inf"))
             _save_checkpoint(
-                path=args.output,
+                path=latest_path,
                 q1=q1,
                 q2=q2,
                 opt=opt,
@@ -804,7 +858,7 @@ def train_once(
                 # Result: Saved best.pt optimizes action selection quality for SAC validation.
                 best_top1 = current_top1
                 _save_checkpoint(
-                    path=args.best_output,
+                    path=best_path,
                     q1=q1,
                     q2=q2,
                     opt=opt,
@@ -818,7 +872,7 @@ def train_once(
             metric_windows.clear()
 
     if metric_windows:
-        eval_metrics, eval_iter = _evaluate_once(
+        eval_metrics, eval_iter = _evaluate_many(
             q1=q1,
             q2=q2,
             eval_iter=eval_iter,
@@ -845,7 +899,7 @@ def train_once(
         if current_top1 > best_top1:
             best_top1 = current_top1
             _save_checkpoint(
-                path=args.best_output,
+                path=best_path,
                 q1=q1,
                 q2=q2,
                 opt=opt,
@@ -859,7 +913,7 @@ def train_once(
 
     final_metric = best_top1 if best_top1 != float("-inf") else 0.0
     _save_checkpoint(
-        path=args.output,
+        path=latest_path,
         q1=q1,
         q2=q2,
         opt=opt,
@@ -873,8 +927,8 @@ def train_once(
     if comet_exp is not None:
         comet_exp.log_metric("final/critic_top1_match", final_metric)
         comet_exp.end()
-    print(f"Saved latest CE critic to {args.output}")
-    print(f"Best top1 checkpoint: {args.best_output} ({final_metric:.4f})")
+    print(f"Saved latest CE critic to {latest_path}")
+    print(f"Best top1 checkpoint: {best_path} ({final_metric:.4f})")
     return final_metric
 
 
@@ -898,10 +952,7 @@ def run_optuna(args: argparse.Namespace) -> None:
         trial_args.rff_dim = trial.suggest_categorical("rff_dim", [64, 128, 256])
         trial_args.rff_seed = trial.suggest_int("rff_seed", 1, 10_000)
         trial_args.seed = args.seed + trial.number
-        trial_args.output = args.output.with_name(f"trial_{trial.number}_latest.pt")
-        trial_args.best_output = args.best_output.with_name(
-            f"trial_{trial.number}_best.pt"
-        )
+        trial_args.checkpoint_dir = args.checkpoint_dir / f"trial_{trial.number}"
         return train_once(trial_args, trial_number=trial.number)
 
     study = optuna.create_study(
@@ -943,9 +994,15 @@ def parse_args() -> argparse.Namespace:
         help="Restrict held-out evaluation images.",
     )
     parser.add_argument(
+        "--test-images",
+        type=int,
+        default=1,
+        help="Held-out images to average at each validation/logging interval.",
+    )
+    parser.add_argument(
         "--split",
         choices=["training", "validation"],
-        default="validation",
+        default="training",
     )
     parser.add_argument(
         "--eval-split",
@@ -988,14 +1045,16 @@ def parse_args() -> argparse.Namespace:
         help="How to advance the state after labeling each K-candidate set.",
     )
     parser.add_argument(
-        "--output",
+        "--checkpoint-dir",
         type=Path,
-        default=Path("checkpoints/canvit_critic/latest.pt"),
+        default=Path("checkpoints/canvit_critic"),
     )
+    parser.add_argument("--output", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--best-output",
         type=Path,
-        default=Path("checkpoints/canvit_critic/best.pt"),
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--no-comet", action="store_true")
@@ -1007,6 +1066,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optuna-study-name", type=str, default="critic-ce-greedy")
     parser.add_argument("--optuna-storage", type=str, default=None)
     args = parser.parse_args()
+    if args.output is not None:
+        args.checkpoint_dir = args.output.parent
+    if args.best_output is not None:
+        args.checkpoint_dir = args.best_output.parent
     return args
 
 
