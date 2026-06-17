@@ -40,6 +40,12 @@ from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
 from canvit_rl.env import CanViTEnvConfig, get_device
+from canvit_rl.greedy import (
+    _index_state_batch,
+    _make_viewpoint_like,
+    _repeat_state_chunks,
+    _segmentation_cross_entropy_losses,
+)
 from canvit_rl.sac_models import ViewpointHistoryCritic
 
 
@@ -68,84 +74,22 @@ def _repeat_batch(
     }
 
 
-def _concat_batches(
-    batches: list[dict[str, torch.Tensor]],
-) -> dict[str, torch.Tensor]:
-    """Concatenate per-image critic states into one train batch."""
-    return {
-        key: torch.cat([batch[key] for batch in batches], dim=0)
-        for key in batches[0]
-    }
-
-
-def _empty_history(*, max_steps: int) -> dict[str, Any]:
-    """Create an empty fixed-slot viewpoint history on CPU."""
-    return {"coords": torch.zeros(max_steps, 3), "length": 0}
-
-
 def _append_history(
     *,
-    history: dict[str, Any],
+    coords: torch.Tensor,
+    lengths: torch.Tensor,
     viewpoint: Viewpoint,
-    max_steps: int,
-) -> dict[str, Any]:
-    """Append one Viewpoint to the fixed-slot history state."""
-    length = int(history["length"])
-    if length >= max_steps:
+    step: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write a batched Viewpoint into the next fixed-slot history entry."""
+    if step >= coords.shape[1]:
         raise ValueError(
-            f"History length {length} reached max_steps={max_steps}; "
+            f"History slot {step} reached max_steps={coords.shape[1]}; "
             "increase --max-history."
         )
-    coords = history["coords"].clone()
-    coords[length] = torch.cat(
-        [
-            viewpoint.centers[0].detach().float().cpu(),
-            viewpoint.scales[0:1].detach().float().cpu(),
-        ],
-        dim=0,
-    )
-    return {"coords": coords, "length": length + 1}
-
-
-def _batch_from_history(
-    history: dict[str, Any],
-    *,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Convert one CPU viewpoint history into a one-item critic batch."""
-    return {
-        "coords": history["coords"][None].to(device),
-        "lengths": torch.as_tensor([history["length"]], device=device),
-    }
-
-
-def _segmentation_ce(
-    *,
-    model,
-    probe: torch.nn.Module,
-    state,
-    mask: torch.Tensor,
-    canvas_grid_size: int,
-) -> float:
-    """Decode a canvas state and return pixel-averaged segmentation CE."""
-    spatial = model.get_spatial(state.canvas).view(
-        mask.shape[0],
-        canvas_grid_size,
-        canvas_grid_size,
-        -1,
-    )
-    with torch.autocast(device_type=spatial.device.type, enabled=False):
-        logits = probe(spatial.float())
-    if logits.shape[-2:] != mask.shape[-2:]:
-        logits = F.interpolate(
-            logits,
-            size=mask.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-    return float(
-        F.cross_entropy(logits, mask.long(), ignore_index=IGNORE_LABEL).detach()
-    )
+    coords[:, step, :2] = viewpoint.centers.detach().float()
+    coords[:, step, 2] = viewpoint.scales.detach().float()
+    return coords, lengths + 1
 
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
@@ -383,34 +327,152 @@ def _sample_candidates(
         max_scale=1.0,
         start_with_full_scene=False,
     )
-    actions = []
-    rewards = []
-    records = []
     with torch.inference_mode():
-        for candidate_vp in candidates:
-            glimpse = sample_at_viewpoint(
-                spatial=image,
-                viewpoint=candidate_vp,
-                glimpse_size_px=cfg.glimpse_size_px,
+        centers = torch.cat([vp.centers for vp in candidates], dim=0)
+        scales = torch.cat([vp.scales for vp in candidates], dim=0)
+        candidate_vp = _make_viewpoint_like(
+            candidates[0],
+            centers=centers,
+            scales=scales,
+        )
+        candidate_images = image.repeat((args.k,) + (1,) * (image.ndim - 1))
+        candidate_masks = mask.repeat((args.k,) + (1,) * (mask.ndim - 1))
+        candidate_state = _repeat_state_chunks(state, args.k)
+        glimpse = sample_at_viewpoint(
+            spatial=candidate_images,
+            viewpoint=candidate_vp,
+            glimpse_size_px=cfg.glimpse_size_px,
+        )
+        out = model(glimpse=glimpse, state=candidate_state, viewpoint=candidate_vp)
+        ce_after = _segmentation_cross_entropy_losses(
+            model=model,
+            state=out.state,
+            probe=probe,
+            canvas_grid_size=cfg.canvas_grid_size,
+            mask=candidate_masks,
+            batch_size=args.k,
+        )
+        rewards = torch.as_tensor(current_ce, device=device) - ce_after
+        actions = _viewpoint_to_action(candidate_vp, min_scale=args.min_scale)
+
+        records = []
+        for candidate_idx in range(args.k):
+            index = torch.as_tensor([candidate_idx], device=device)
+            vp = _make_viewpoint_like(
+                candidates[0],
+                centers=centers.index_select(0, index),
+                scales=scales.index_select(0, index),
             )
-            out = model(glimpse=glimpse, state=state, viewpoint=candidate_vp)
-            ce_after = _segmentation_ce(
-                model=model,
-                state=out.state,
-                probe=probe,
-                mask=mask,
-                canvas_grid_size=cfg.canvas_grid_size,
+            records.append(
+                (
+                    float(rewards[candidate_idx].detach().cpu().item()),
+                    vp,
+                    _index_state_batch(out.state, index),
+                    float(ce_after[candidate_idx].detach().cpu().item()),
+                )
             )
-            reward = current_ce - ce_after
-            action = _viewpoint_to_action(candidate_vp, min_scale=args.min_scale)
-            actions.append(action.squeeze(0))
-            rewards.append(reward)
-            records.append((reward, candidate_vp, out, ce_after))
-    return (
-        torch.stack(actions).to(device),
-        torch.as_tensor(rewards, device=device, dtype=torch.float32),
-        records,
+    return actions.to(device), rewards.float(), records
+
+
+def _sample_candidate_batch(
+    *,
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    state,
+    current_ce: torch.Tensor,
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    list[list[tuple[float, Viewpoint, int, float]]],
+    Any,
+]:
+    """Generate B*K CE-reduction labels with one batched CanViT forward."""
+    batch_size = int(images.shape[0])
+    candidates = random_viewpoints(
+        batch_size=batch_size,
+        device=device,
+        n_viewpoints=args.k,
+        min_scale=args.min_scale,
+        max_scale=1.0,
+        start_with_full_scene=False,
     )
+    with torch.inference_mode():
+        centers = torch.cat([vp.centers for vp in candidates], dim=0)
+        scales = torch.cat([vp.scales for vp in candidates], dim=0)
+        candidate_vp = _make_viewpoint_like(
+            candidates[0],
+            centers=centers,
+            scales=scales,
+        )
+        candidate_images = images.repeat((args.k,) + (1,) * (images.ndim - 1))
+        candidate_masks = masks.repeat((args.k,) + (1,) * (masks.ndim - 1))
+        candidate_state = _repeat_state_chunks(state, args.k)
+        glimpse = sample_at_viewpoint(
+            spatial=candidate_images,
+            viewpoint=candidate_vp,
+            glimpse_size_px=cfg.glimpse_size_px,
+        )
+        out = model(glimpse=glimpse, state=candidate_state, viewpoint=candidate_vp)
+        ce_after = _segmentation_cross_entropy_losses(
+            model=model,
+            state=out.state,
+            probe=probe,
+            canvas_grid_size=cfg.canvas_grid_size,
+            mask=candidate_masks,
+            batch_size=batch_size * args.k,
+        ).view(args.k, batch_size)
+        rewards_by_candidate = current_ce.to(dtype=ce_after.dtype)[None, :] - ce_after
+        candidate_actions = _viewpoint_to_action(
+            candidate_vp,
+            min_scale=args.min_scale,
+        )
+
+        sample_major_index = (
+            torch.arange(batch_size, device=device)[:, None]
+            + torch.arange(args.k, device=device)[None, :] * batch_size
+        ).reshape(-1)
+        action_batch = candidate_actions.index_select(0, sample_major_index)
+        reward_batch = rewards_by_candidate.transpose(0, 1).reshape(-1).float()
+
+        records: list[list[tuple[float, Viewpoint, int, float]]] = []
+        for sample_idx in range(batch_size):
+            sample_records = []
+            for candidate_idx in range(args.k):
+                flat_index = candidate_idx * batch_size + sample_idx
+                flat_index_tensor = torch.as_tensor([flat_index], device=device)
+                vp = _make_viewpoint_like(
+                    candidates[0],
+                    centers=centers.index_select(0, flat_index_tensor),
+                    scales=scales.index_select(0, flat_index_tensor),
+                )
+                sample_records.append(
+                    (
+                        float(
+                            rewards_by_candidate[
+                                candidate_idx,
+                                sample_idx,
+                            ]
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
+                        vp,
+                        flat_index,
+                        float(
+                            ce_after[candidate_idx, sample_idx]
+                            .detach()
+                            .cpu()
+                            .item()
+                        ),
+                    )
+                )
+            records.append(sample_records)
+    return action_batch, reward_batch, records, out.state
 
 
 def _evaluate_once(
@@ -434,7 +496,8 @@ def _evaluate_once(
     image = image.to(device, non_blocking=True)
     mask = mask.to(device, non_blocking=True)
     state = model.init_state(batch_size=1, canvas_grid_size=cfg.canvas_grid_size)
-    history = _empty_history(max_steps=args.max_history)
+    coords = torch.zeros(1, args.max_history, 3, device=device)
+    lengths = torch.zeros(1, dtype=torch.long, device=device)
 
     full_vp = Viewpoint.full_scene(batch_size=1, device=device)
     with torch.inference_mode():
@@ -445,19 +508,26 @@ def _evaluate_once(
         )
         full_out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
         state = full_out.state
-        current_ce = _segmentation_ce(
-            model=model,
-            state=state,
-            probe=probe,
-            mask=mask,
-            canvas_grid_size=cfg.canvas_grid_size,
+        current_ce = float(
+            _segmentation_cross_entropy_losses(
+                model=model,
+                state=state,
+                probe=probe,
+                canvas_grid_size=cfg.canvas_grid_size,
+                mask=mask,
+                batch_size=1,
+            )[0]
+            .detach()
+            .cpu()
+            .item()
         )
-    history = _append_history(
-        history=history,
+    coords, lengths = _append_history(
+        coords=coords,
+        lengths=lengths,
         viewpoint=full_vp,
-        max_steps=args.max_history,
+        step=0,
     )
-    batch = _batch_from_history(history, device=device)
+    batch = {"coords": coords, "lengths": lengths}
     actions, rewards, _ = _sample_candidates(
         image=image,
         mask=mask,
@@ -649,82 +719,61 @@ def train_once(
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         actual_batch_size = int(images.shape[0])
-        samples: list[dict[str, Any]] = []
+        state = model.init_state(
+            batch_size=actual_batch_size,
+            canvas_grid_size=cfg.canvas_grid_size,
+        )
+        coords = torch.zeros(
+            actual_batch_size,
+            args.max_history,
+            3,
+            device=device,
+        )
+        lengths = torch.zeros(actual_batch_size, dtype=torch.long, device=device)
 
-        for sample_idx in range(actual_batch_size):
-            image = images[sample_idx : sample_idx + 1]
-            mask = masks[sample_idx : sample_idx + 1]
-            state = model.init_state(
-                batch_size=1,
+        full_vp = Viewpoint.full_scene(batch_size=actual_batch_size, device=device)
+        full_glimpse = sample_at_viewpoint(
+            spatial=images,
+            viewpoint=full_vp,
+            glimpse_size_px=cfg.glimpse_size_px,
+        )
+        with torch.inference_mode():
+            full_out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
+            state = full_out.state
+            current_ce = _segmentation_cross_entropy_losses(
+                model=model,
+                state=state,
+                probe=probe,
                 canvas_grid_size=cfg.canvas_grid_size,
+                mask=masks,
+                batch_size=actual_batch_size,
             )
-            history = _empty_history(max_steps=args.max_history)
-
-            full_vp = Viewpoint.full_scene(batch_size=1, device=device)
-            full_glimpse = sample_at_viewpoint(
-                spatial=image,
-                viewpoint=full_vp,
-                glimpse_size_px=cfg.glimpse_size_px,
-            )
-            with torch.inference_mode():
-                full_out = model(
-                    glimpse=full_glimpse,
-                    state=state,
-                    viewpoint=full_vp,
-                )
-                state = full_out.state
-                current_ce = _segmentation_ce(
-                    model=model,
-                    state=state,
-                    probe=probe,
-                    mask=mask,
-                    canvas_grid_size=cfg.canvas_grid_size,
-                )
-            history = _append_history(
-                history=history,
-                viewpoint=full_vp,
-                max_steps=args.max_history,
-            )
-            samples.append(
-                {
-                    "image": image,
-                    "mask": mask,
-                    "state": state,
-                    "history": history,
-                    "current_ce": current_ce,
-                }
-            )
+        coords, lengths = _append_history(
+            coords=coords,
+            lengths=lengths,
+            viewpoint=full_vp,
+            step=0,
+        )
+        history_step = 1
 
         batch_loss = 0.0
         for step_idx in range(args.t):
-            step_obs: list[dict[str, torch.Tensor]] = []
-            step_actions: list[torch.Tensor] = []
-            step_rewards: list[torch.Tensor] = []
-            step_records: list[list[tuple[float, Viewpoint, Any, float]]] = []
-
-            for sample in samples:
-                state_batch = _batch_from_history(sample["history"], device=device)
-                actions, rewards, candidate_records = _sample_candidates(
-                    image=sample["image"],
-                    mask=sample["mask"],
+            history_batch = {"coords": coords, "lengths": lengths}
+            action_batch, reward_batch, step_records, candidate_state = (
+                _sample_candidate_batch(
+                    images=images,
+                    masks=masks,
+                    state=state,
+                    current_ce=current_ce,
                     model=model,
                     probe=probe,
-                    state=sample["state"],
                     cfg=cfg,
                     args=args,
-                    current_ce=sample["current_ce"],
                     device=device,
                 )
-                step_obs.append(state_batch)
-                step_actions.append(actions)
-                step_rewards.append(rewards)
-                step_records.append(candidate_records)
-
-            obs_batch = _concat_batches(
-                [_repeat_batch(state_batch, args.k) for state_batch in step_obs]
             )
-            action_batch = torch.cat(step_actions, dim=0)
-            reward_batch = torch.cat(step_rewards, dim=0)
+
+            obs_batch = _repeat_batch(history_batch, args.k)
             q1_pred = q1(obs_batch, action_batch)
             q2_pred = q2(obs_batch, action_batch)
             q1_loss = F.mse_loss(q1_pred, reward_batch)
@@ -754,20 +803,22 @@ def train_once(
             }.items():
                 metric_windows.setdefault(key, []).append(value)
 
-            for sample, state_batch, actions, rewards, candidate_records in zip(
-                samples,
-                step_obs,
-                step_actions,
-                step_rewards,
-                step_records,
-                strict=True,
-            ):
+            action_view = action_batch.view(actual_batch_size, args.k, -1)
+            reward_view = reward_batch.view(actual_batch_size, args.k)
+            next_vps: list[Viewpoint] = []
+            next_ces: list[float] = []
+            next_indices: list[int] = []
+            for sample_idx, candidate_records in enumerate(step_records):
+                state_batch = {
+                    "coords": coords[sample_idx : sample_idx + 1],
+                    "lengths": lengths[sample_idx : sample_idx + 1],
+                }
                 state_metrics = _collect_state_metrics(
                     q1=q1,
                     q2=q2,
                     batch=_repeat_batch(state_batch, args.k),
-                    action_batch=actions,
-                    reward_batch=rewards,
+                    action_batch=action_view[sample_idx],
+                    reward_batch=reward_view[sample_idx],
                 )
                 state_metrics.update(
                     {
@@ -782,19 +833,35 @@ def train_once(
                         metric_windows.setdefault(key, []).append(float(value))
 
                 if args.rollout_policy == "best":
-                    _, next_vp, next_out, next_ce = max(
+                    _, next_vp, next_index, next_ce = max(
                         candidate_records,
                         key=lambda item: item[0],
                     )
                 else:
-                    _, next_vp, next_out, next_ce = random.choice(candidate_records)
-                sample["state"] = next_out.state
-                sample["history"] = _append_history(
-                    history=sample["history"],
-                    viewpoint=next_vp,
-                    max_steps=args.max_history,
-                )
-                sample["current_ce"] = next_ce
+                    _, next_vp, next_index, next_ce = random.choice(candidate_records)
+                next_vps.append(next_vp)
+                next_indices.append(next_index)
+                next_ces.append(next_ce)
+
+            next_index_tensor = torch.as_tensor(next_indices, device=device)
+            state = _index_state_batch(candidate_state, next_index_tensor)
+            next_vp = _make_viewpoint_like(
+                next_vps[0],
+                centers=torch.cat([vp.centers for vp in next_vps], dim=0),
+                scales=torch.cat([vp.scales for vp in next_vps], dim=0),
+            )
+            coords, lengths = _append_history(
+                coords=coords,
+                lengths=lengths,
+                viewpoint=next_vp,
+                step=history_step,
+            )
+            current_ce = torch.as_tensor(
+                next_ces,
+                device=device,
+                dtype=current_ce.dtype,
+            )
+            history_step += 1
 
         _sync_for_timing(device)
         elapsed_seconds += time.perf_counter() - batch_start
@@ -852,10 +919,6 @@ def train_once(
                 cfg=cfg,
             )
             if current_top1 > best_top1:
-                # Fixed by Codex on 2026-06-15
-                # Problem: Lowest MSE can select critics with poor action rankings.
-                # Solution: Track the best checkpoint by top-1 oracle agreement.
-                # Result: Saved best.pt optimizes action selection quality for SAC validation.
                 best_top1 = current_top1
                 _save_checkpoint(
                     path=best_path,
