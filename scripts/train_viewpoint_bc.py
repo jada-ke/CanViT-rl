@@ -8,7 +8,7 @@ batched teacher actions and mIoU diagnostics.
 Example:
     uv run python scripts/train_viewpoint_bc.py --batches 100  --max-samples 1\
         --batch-size 1 --k 16 --log-std-penalty 0 \
-        --experiment-name bc-im1-k16 --comet-log-interval 10
+        --experiment-name bc-im1-k16 --comet-log-interval 10 --checkpoint-dir checkpoints/viewpoint_bc/im1-k16
     uv run python scripts/train_viewpoint_bc.py --optuna-trials 20 --batches 50
 """
 
@@ -735,7 +735,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-history",
         type=int,
-        default=2,
+        default=6,
         help=(
             "Maximum number of viewpoint history slots. Must be >= t+1 "
             "(one warmup full-scene glimpse plus t learned steps). Default: 16."

@@ -3,7 +3,8 @@ Train continuous SAC critics from k-candidate CE-improvement oracle labels.
 
 Usage:
     uv run python scripts/pretrain_canvit_critic.py --batches 100 --max-samples 1 --batch-size 1 --t 1 --k 16 \
-        --test-images 8 --checkpoint-dir checkpoints/canvit_critic --experiment-name critic-im1-k16-t1
+        --test-images 8 --checkpoint-dir checkpoints/canvit_critic --experiment-name critic-im1-k16-t1 \
+        --comet-log-interval 10 --max-history 2
     uv run python scripts/pretrain_canvit_critic.py --optuna-trials 20 --batches 50
 """
 
@@ -1098,7 +1099,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-history",
         type=int,
-        default=16,
+        default=6,
         help=(
             "Maximum number of viewpoint history slots. Must be >= t+1 "
             "(one warmup full-scene glimpse plus t learned steps)."
