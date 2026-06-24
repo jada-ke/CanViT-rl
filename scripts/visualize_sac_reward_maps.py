@@ -25,15 +25,15 @@ Example:
         --output-dir results/sac_canvas_reward_maps
 
     uv run python scripts/visualize_sac_reward_maps.py \
-        --checkpoint checkpoints/canvas_sac/synthetic-ade-im1-t2/best.pt \
+        --checkpoint checkpoints/canvas_sac/synthetic-im1-t1_2000/best.pt \
         --dataset synthetic_segmentation \
         --split training \
         --image-index 0 \
-        --state-steps 0,1 \
+        --state-steps 0 \
         --grid-size 21 \
         --scales 0.25,0.50 \
         --chunk-size 16 \
-        --output-dir results/sac_canvas_reward_maps
+        --output-dir results/sac_canvas_reward_maps/synthetic-im1-t1_2000
 """
 
 from __future__ import annotations
@@ -59,6 +59,7 @@ from canvit_specialize.datasets.ade20k import (
 from PIL import Image
 from tqdm import tqdm
 
+from canvit_rl.ade_labels import remap_ade_mask_labels
 from canvit_rl.canvas_state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import _repeat_state_chunks, _segmentation_cross_entropy_losses
@@ -79,9 +80,18 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
 
     IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-    def __init__(self, *, root: Path, scene_size_px: int, img_transform) -> None:
-        image_dir = root / "images"
-        mask_dir = root / "masks"
+    def __init__(
+        self,
+        *,
+        root: Path,
+        split: str,
+        scene_size_px: int,
+        img_transform,
+    ) -> None:
+        split_image_dir = root / "images" / split
+        split_mask_dir = root / "masks" / split
+        image_dir = split_image_dir if split_image_dir.is_dir() else root / "images"
+        mask_dir = split_mask_dir if split_mask_dir.is_dir() else root / "masks"
         if not image_dir.is_dir():
             raise FileNotFoundError(f"Image dir not found: {image_dir}")
         if not mask_dir.is_dir():
@@ -113,21 +123,35 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
             resample=resample_nearest,
         )
         # Fixed by Codex on 2026-06-23
-        # Problem: ADE-embedded synthetic masks contain real ADE class ids plus
-        # 255 padding, so binarizing them would destroy reward-map CE targets.
-        # Solution: preserve nearest-neighbor resized labels as integer class
-        # ids, including IGNORE_LABEL=255 outside the embedded scene.
+        # Fixed by Codex on 2026-06-24
+        # Problem: Older synthetic masks may contain raw ADE ids 1..150, and
+        # label 150 is out of bounds for reward-map CE targets.
+        # Solution: preserve semantic labels but normalize raw ADE ids to
+        # zero-based 0..149 while keeping IGNORE_LABEL=255 padding.
         # Result: Reward maps can read synthetic roots without ADE-style split
-        # subfolders while retaining semantic targets.
-        mask_tensor = torch.from_numpy(np.asarray(mask).astype(np.int64))
+        # subfolders while retaining valid semantic targets.
+        mask_tensor = torch.from_numpy(
+            remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
+        )
         return image_tensor, mask_tensor
 
 
 def _build_dataset(*, root: Path, split: str, cfg: CanViTEnvConfig, img_tf, mask_tf):
     """Auto-detect synthetic roots; otherwise use ADE20K split folders."""
-    if (root / "images").is_dir() and (root / "masks").is_dir():
+    if (
+        ((root / "images" / split).is_dir() and (root / "masks" / split).is_dir())
+        or ((root / "images").is_dir() and (root / "masks").is_dir())
+    ):
+        # Fixed by Codex on 2026-06-24
+        # Problem: Reward-map visualization needed to read the same synthetic
+        # training/validation split layout produced by the generator.
+        # Solution: detect images/<split> and masks/<split> first, falling back
+        # to the old flat images/ and masks/ layout.
+        # Result: --dataset synthetic_segmentation --split validation reads the
+        # validation synthetic split without custom paths.
         return SyntheticSegmentationDataset(
             root=root,
+            split=split,
             scene_size_px=cfg.scene_size_px,
             img_transform=img_tf,
         )
@@ -687,7 +711,15 @@ def visualize_reward_maps_for_indices(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="datasets/ADE20k",
+        help=(
+            "ADE20K root, or synthetic root containing images/<split> and "
+            "masks/<split> folders."
+        ),
+    )
     parser.add_argument("--split", choices=["training", "validation"], default="validation")
     parser.add_argument("--image-index", type=int, action="append", default=None)
     parser.add_argument("--episodes", type=int, default=2)

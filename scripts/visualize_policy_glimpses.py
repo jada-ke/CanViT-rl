@@ -4,7 +4,7 @@ Visualize where active-view policies look over a CanViT episode.
 Usage:
     python scripts/visualize_policy_glimpses.py
     python scripts/visualize_policy_glimpses.py --image-index 0 --t 5 --k 32
-    python scripts/visualize_policy_glimpses.py --policy eg-c2f --t 5 --image-index 0
+    python scripts/visualize_policy_glimpses.py --policy eg-c2f --t 5 --image-index 3648 --split training
     python scripts/visualize_policy_glimpses.py \
         --policy viewpoint-bc \
         --policy-checkpoint checkpoints/viewpoint_bc/im32_k16_t1/latest.pt \
@@ -28,12 +28,12 @@ Usage:
         --output-dir results/canvas_policy_glimpses
 
   uv run python scripts/visualize_policy_glimpses.py \
-        --policy eg-c2f  \
-        --policy-checkpoint checkpoints/canvas_sac/synthetic-ade-im1-t2/best.pt \
+        --policy canvas-sac  \
+        --policy-checkpoint checkpoints/canvas_sac/synthetic-im1-t1_2000/best.pt \
         --dataset synthetic_segmentation \
-        --t 21 \
+        --t 1 \
         --image-index 0  \
-        --output-dir results/canvas_policy_glimpses/synthetic-ade-im1-t2
+        --output-dir results/canvas_policy_glimpses/synthetic-im1-t1_2000
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
 from canvit_eval.episode import run_episode  # noqa: E402
 from canvit_eval.policies import make_policy  # noqa: E402
 
+from canvit_rl.ade_labels import remap_ade_mask_labels
 from canvit_rl.canvas_state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import miou_from_state, run_greedy_episode
@@ -85,9 +86,18 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
 
     IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-    def __init__(self, *, root: Path, scene_size_px: int, img_transform) -> None:
-        image_dir = root / "images"
-        mask_dir = root / "masks"
+    def __init__(
+        self,
+        *,
+        root: Path,
+        split: str,
+        scene_size_px: int,
+        img_transform,
+    ) -> None:
+        split_image_dir = root / "images" / split
+        split_mask_dir = root / "masks" / split
+        image_dir = split_image_dir if split_image_dir.is_dir() else root / "images"
+        mask_dir = split_mask_dir if split_mask_dir.is_dir() else root / "masks"
         if not image_dir.is_dir():
             raise FileNotFoundError(f"Image dir not found: {image_dir}")
         if not mask_dir.is_dir():
@@ -118,22 +128,35 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
             (self.scene_size_px, self.scene_size_px),
             resample=resample_nearest,
         )
-        # Fixed by Codex on 2026-06-23
-        # Problem: ADE-embedded synthetic masks contain real ADE class ids plus
-        # 255 padding, so binarizing them would destroy visualization metrics.
-        # Solution: preserve nearest-neighbor resized labels as integer class
-        # ids, including IGNORE_LABEL=255 outside the embedded scene.
+        # Fixed by Codex on 2026-06-24
+        # Problem: Older synthetic masks may contain raw ADE ids 1..150, and
+        # label 150 is out of bounds for visualization CE metrics.
+        # Solution: preserve semantic labels but normalize raw ADE ids to
+        # zero-based 0..149 while keeping IGNORE_LABEL=255 padding.
         # Result: Synthetic roots can be visualized without ADE-style split
-        # subfolders while retaining semantic targets.
-        mask_tensor = torch.from_numpy(np.asarray(mask).astype(np.int64))
+        # subfolders while retaining valid semantic targets.
+        mask_tensor = torch.from_numpy(
+            remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
+        )
         return image_tensor, mask_tensor
 
 
 def _build_dataset(*, root: Path, split: str, cfg: CanViTEnvConfig, img_tf, mask_tf):
     """Auto-detect synthetic roots; otherwise use ADE20K split folders."""
-    if (root / "images").is_dir() and (root / "masks").is_dir():
+    if (
+        ((root / "images" / split).is_dir() and (root / "masks" / split).is_dir())
+        or ((root / "images").is_dir() and (root / "masks").is_dir())
+    ):
+        # Fixed by Codex on 2026-06-24
+        # Problem: Policy-glimpse visualization needed to read the same
+        # synthetic training/validation split layout produced by the generator.
+        # Solution: detect images/<split> and masks/<split> first, falling back
+        # to the old flat images/ and masks/ layout.
+        # Result: --dataset synthetic_segmentation --split validation reads the
+        # validation synthetic split without custom paths.
         return SyntheticSegmentationDataset(
             root=root,
+            split=split,
             scene_size_px=cfg.scene_size_px,
             img_transform=img_tf,
         )
@@ -844,7 +867,15 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--image-index", type=int, action="append", default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="datasets/ADE20k",
+        help=(
+            "ADE20K root, or synthetic root containing images/<split> and "
+            "masks/<split> folders."
+        ),
+    )
     parser.add_argument(
         "--split",
         choices=["training", "validation"],

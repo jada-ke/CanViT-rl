@@ -10,17 +10,18 @@ This is the canvas-state analogue of scripts/train_viewpoint_sac.py:
 Example:
     python scripts/train_canvas_sac.py \
     --dataset synthetic_segmentation \
-    --batches 500 --batch-size 1 --max-samples 1 --t 1 \
+    --batches 2000 --batch-size 1 --max-samples 1 --t 1 \
     --eval-images 1 --eval-batch-size 1 --eval-split training\
     --replay-batch-size 4 \
-    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1
+    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1_2000 \
+    --experiment-name synthetic-im1-t1_2000
 
     uv run python scripts/train_canvas_sac.py \
         --dataset synthetic_segmentation \
-        --batches 1000 --batch-size 1 --max-samples 1 --t 2 \
+        --batches 1000 --batch-size 1 --max-samples 1 --t 1 \
         --eval-images 1 --eval-batch-size 1 \
         --replay-batch-size 8 \
-        --checkpoint-dir checkpoints/canvas_sac/synthetic-ade-im1-t2
+        --checkpoint-dir checkpoints/canvas_sac/synthetic-ade-im1-t1 \
         --experiment-name synthetic-ade-im1-t2
 """
 
@@ -66,6 +67,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
+from canvit_rl.ade_labels import remap_ade_mask_labels
 from canvit_rl.canvas_state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
@@ -103,7 +105,7 @@ def _limit_dataset(dataset, max_samples: int | None, *, offset: int = 0):
 
 
 class SyntheticSegmentationDataset(torch.utils.data.Dataset):
-    """Image/mask folder dataset for simple binary synthetic segmentation."""
+    """Image/mask folder dataset for ADE-embedded synthetic segmentation."""
 
     IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -156,13 +158,16 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
             resample=resample_nearest,
         )
         # Fixed by Codex on 2026-06-23
-        # Problem: ADE-embedded synthetic masks contain real ADE class ids plus
-        # 255 padding, so binarizing them would destroy the CE target.
-        # Solution: preserve nearest-neighbor resized uint8 labels as integer
-        # class ids, including IGNORE_LABEL=255 outside the embedded scene.
-        # Result: The frozen ADE probe is trained/evaluated against meaningful
-        # semantic labels in the inserted region only.
-        mask_tensor = torch.from_numpy(np.asarray(mask).astype(np.int64))
+        # Fixed by Codex on 2026-06-24
+        # Problem: Older synthetic masks may contain raw ADE ids 1..150, and
+        # label 150 is out of bounds for a 150-channel CE target.
+        # Solution: preserve semantic labels but normalize raw ADE ids to
+        # zero-based 0..149 while keeping IGNORE_LABEL=255 padding.
+        # Result: The frozen ADE probe is trained/evaluated against valid CE
+        # targets in the inserted region only.
+        mask_tensor = torch.from_numpy(
+            remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
+        )
         return image_tensor, mask_tensor
 
 
@@ -176,9 +181,11 @@ def _build_segmentation_dataset(
 ):
     """Build either ADE20K or folder-based synthetic segmentation data."""
     dataset_root = Path(args.dataset)
+    split_image_dir = dataset_root / "images" / split
+    split_mask_dir = dataset_root / "masks" / split
     inferred_synthetic = (
-        (dataset_root / "images").is_dir()
-        and (dataset_root / "masks").is_dir()
+        (split_image_dir.is_dir() and split_mask_dir.is_dir())
+        or ((dataset_root / "images").is_dir() and (dataset_root / "masks").is_dir())
     )
     dataset_format = (
         "synthetic"
@@ -194,8 +201,25 @@ def _build_segmentation_dataset(
             img_transform=img_tf,
             mask_transform=mask_tf,
         )
-    image_dir = Path(args.synthetic_image_dir) if args.synthetic_image_dir else dataset_root / "images"
-    mask_dir = Path(args.synthetic_mask_dir) if args.synthetic_mask_dir else dataset_root / "masks"
+    if args.synthetic_image_dir:
+        image_dir = Path(args.synthetic_image_dir)
+    elif split_image_dir.is_dir():
+        image_dir = split_image_dir
+    else:
+        image_dir = dataset_root / "images"
+    if args.synthetic_mask_dir:
+        mask_dir = Path(args.synthetic_mask_dir)
+    elif split_mask_dir.is_dir():
+        mask_dir = split_mask_dir
+    else:
+        mask_dir = dataset_root / "masks"
+    # Fixed by Codex on 2026-06-24
+    # Problem: Synthetic data now has real training/validation splits, but the
+    # trainer previously read only flat images/ and masks/ directories.
+    # Solution: prefer images/<split> and masks/<split> when present, while
+    # retaining explicit directory overrides and old flat-root compatibility.
+    # Result: Canvas SAC can train and evaluate against separate synthetic
+    # splits using only --dataset synthetic_segmentation.
     return SyntheticSegmentationDataset(
         image_dir=image_dir,
         mask_dir=mask_dir,
@@ -1423,14 +1447,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--replay-batch-size", type=int, default=256)
     parser.add_argument("--t", type=int, default=1)
-    parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="datasets/ADE20k",
+        help=(
+            "ADE20K root, or synthetic root containing images/<split> and "
+            "masks/<split> folders."
+        ),
+    )
     parser.add_argument(
         "--dataset-format",
         choices=["auto", "ade20k", "synthetic"],
         default="auto",
         help=(
-            "auto detects folder data with images/ and masks/ subdirectories; "
-            "use ade20k or synthetic to force a format."
+            "auto detects folder data with images/<split>/masks/<split> or "
+            "flat images/ and masks/ subdirectories; use ade20k or synthetic "
+            "to force a format."
         ),
     )
     parser.add_argument(

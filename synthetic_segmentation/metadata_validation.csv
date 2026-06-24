@@ -1,0 +1,4 @@
+sample,split,source_image,source_mask,source_zoom_position,crop_fraction,requested_crop_fraction,source_zoom,source_crop_x0,source_crop_y0,source_crop_x1,source_crop_y1,embed_x0,embed_y0,embed_x1,embed_y1
+sample_00000_ADE_val_00001699.png,validation,datasets/ADE20k/images/validation/ADE_val_00001699.jpg,datasets/ADE20k/annotations/validation/ADE_val_00001699.png,random,0.326171875,0.32691543610266394,2.770903495873614,185,295,431,480,35,23,202,149
+sample_00001_ADE_val_00001288.png,validation,datasets/ADE20k/images/validation/ADE_val_00001288.jpg,datasets/ADE20k/annotations/validation/ADE_val_00001288.png,random,0.591796875,0.5921270884060588,2.3225266371354203,74,20,184,130,25,97,328,400
+sample_00002_ADE_val_00001267.png,validation,datasets/ADE20k/images/validation/ADE_val_00001267.jpg,datasets/ADE20k/annotations/validation/ADE_val_00001267.png,random,0.314453125,0.31506163886243393,1.5559472062201842,81,46,246,211,181,107,342,268
