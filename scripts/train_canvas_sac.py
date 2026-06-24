@@ -1,29 +1,27 @@
 """
-Train image-independent SAC over viewpoint history for CanViT active vision.
+Train image-dependent SAC over the current layernorm-pooled CanViT canvas.
 
-The learned state is the same fixed-slot viewpoint history used by
-scripts/train_viewpoint_bc.py and scripts/pretrain_canvit_critic.py:
+This is the canvas-state analogue of scripts/train_viewpoint_sac.py:
 
-    state = previous Viewpoints
+    state  = current CanViT canvas summary + compact viewpoint history
     action = next Viewpoint
-    reward = CE_before - CE_after
+    reward = (CE_before - CE_after) / CE_before
 
 Example:
-    uv run python scripts/train_viewpoint_sac.py \
-        --actor-checkpoint checkpoints/viewpoint_bc/im1-k16/actor_final.pt \
-        --critic-checkpoint checkpoints/canvit_critic/im1-k16-t1/best.pt 
-    uv run python scripts/train_viewpoint_sac.py \
-        --batches 500 --batch-size 1  --max-samples 1 --t 1 \
-        --eval-images 8 \
-        --checkpoint-dir checkpoints/viewpoint_sac \
-        --no-comet \
-        --reward-map-images 2 \
-        --reward-map-grid-size 21 \
-        --reward-map-scales 0.25,0.50 \
-        --reward-map-output-dir results/sac_reward_maps
-        --experiment-name pretrain-sac-im1-500 \
-        --actor-checkpoint checkpoints/viewpoint_bc/im1-k16/actor_final.pt \
-        --critic-checkpoint checkpoints/canvit_critic/im1-k16-t1/best.pt
+    python scripts/train_canvas_sac.py \
+    --dataset synthetic_segmentation \
+    --batches 500 --batch-size 1 --max-samples 1 --t 1 \
+    --eval-images 1 --eval-batch-size 1 --eval-split training\
+    --replay-batch-size 4 \
+    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1
+
+    uv run python scripts/train_canvas_sac.py \
+        --dataset synthetic_segmentation \
+        --batches 1000 --batch-size 1 --max-samples 1 --t 2 \
+        --eval-images 1 --eval-batch-size 1 \
+        --replay-batch-size 8 \
+        --checkpoint-dir checkpoints/canvas_sac/synthetic-ade-im1-t2
+        --experiment-name synthetic-ade-im1-t2
 """
 
 from __future__ import annotations
@@ -35,9 +33,14 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
 try:
+    # Fixed by Codex on 2026-06-23
+    # Problem: Importing Comet after torch triggers Comet's auto-logging
+    # warning and can miss framework hooks.
+    # Solution: import Comet before torch while keeping it optional for
+    # --no-comet runs and environments without comet_ml installed.
+    # Result: Comet can attach torch logging hooks without breaking dry runs.
     from comet_ml import Experiment
 except ImportError:
     Experiment = None
@@ -59,61 +62,35 @@ from canvit_specialize.datasets.ade20k import (
     make_val_transforms,
 )
 from canvit_specialize.metrics import mIoUAccumulator
+from PIL import Image
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
-EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
-if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
-    sys.path.insert(0, str(EVAL_REPO))
-
-try:
-    from canvit_eval.episode import run_episode
-    from canvit_eval.policies import make_policy
-except ImportError:
-    run_episode = None
-    make_policy = None
-
+from canvit_rl.canvas_state import (
+    append_viewpoint_history,
+    canvas_layernorm_spatial,
+    empty_viewpoint_history,
+)
+from canvit_rl.canvit_precision import configure_frozen_canvit_precision
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import _segmentation_cross_entropy_losses
-from canvit_rl.sac_models import ViewpointHistoryCritic
-from canvit_rl.viewpoint_policy import ViewpointGaussianActor, action_to_viewpoint
+from canvit_rl.reward import relative_ce_reduction
+from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.viewpoint_policy import action_to_viewpoint
 
 try:
     from visualize_sac_reward_maps import visualize_reward_maps_for_indices
 except ImportError:
     from scripts.visualize_sac_reward_maps import visualize_reward_maps_for_indices
 
+EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
+if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
+    sys.path.insert(0, str(EVAL_REPO))
 
 def _sync_for_timing(device: torch.device) -> None:
     """Synchronize CUDA kernels before reading throughput timings."""
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-
-
-def _make_comet_experiment(args: argparse.Namespace):
-    """Create a Comet experiment unless disabled for local dry runs."""
-    if args.no_comet:
-        return None
-    if Experiment is None:
-        raise RuntimeError(
-            "Comet logging is enabled by default, but comet_ml is not installed. "
-            "Install comet-ml or run with --no-comet."
-        )
-    comet_kwargs = dict(
-        project_name=args.comet_project,
-        auto_param_logging=True,
-        auto_metric_logging=True,
-    )
-    if args.comet_workspace:
-        comet_kwargs["workspace"] = args.comet_workspace
-    experiment = Experiment(**comet_kwargs)
-    experiment.set_name(args.experiment_name or "viewpoint-history-sac")
-    if args.comet_tags:
-        experiment.add_tags(
-            [tag.strip() for tag in args.comet_tags.split(",") if tag.strip()]
-        )
-    experiment.log_parameters(vars(args))
-    return experiment
 
 
 def _limit_dataset(dataset, max_samples: int | None, *, offset: int = 0):
@@ -125,40 +102,106 @@ def _limit_dataset(dataset, max_samples: int | None, *, offset: int = 0):
     return torch.utils.data.Subset(dataset, range(start, stop))
 
 
-def _append_history(
-    *,
-    coords: torch.Tensor,
-    lengths: torch.Tensor,
-    viewpoint: Viewpoint,
-    step: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Write one batched Viewpoint into the fixed-slot history tensor."""
-    if step >= coords.shape[1]:
-        raise ValueError(
-            f"History slot {step} is out of range for max_history={coords.shape[1]}."
+class SyntheticSegmentationDataset(torch.utils.data.Dataset):
+    """Image/mask folder dataset for simple binary synthetic segmentation."""
+
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def __init__(
+        self,
+        *,
+        image_dir: Path,
+        mask_dir: Path,
+        scene_size_px: int,
+        img_transform,
+    ) -> None:
+        if not image_dir.is_dir():
+            raise FileNotFoundError(f"Synthetic image directory not found: {image_dir}")
+        if not mask_dir.is_dir():
+            raise FileNotFoundError(f"Synthetic mask directory not found: {mask_dir}")
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.scene_size_px = scene_size_px
+        self.img_transform = img_transform
+        self.images = sorted(
+            path
+            for path in image_dir.iterdir()
+            if path.suffix.lower() in self.IMAGE_EXTENSIONS
         )
-    # Fixed by Codex on 2026-06-18
-    # Problem: Full SAC must use the same state contract as actor BC and critic
-    # pretraining, otherwise loaded checkpoints answer a different question.
-    # Solution: Keep history as batched GPU tensors and append every rollout
-    # Viewpoint in lockstep with the environment timestep.
-    # Result: Actor, critic, pretraining, and SAC all consume Q(history, action).
-    coords[:, step, :2] = viewpoint.centers.detach().float()
-    coords[:, step, 2] = viewpoint.scales.detach().float()
-    return coords, lengths + 1
+        if not self.images:
+            raise ValueError(f"No synthetic images found in {image_dir}")
+        mask_by_stem = {
+            path.stem: path
+            for path in mask_dir.iterdir()
+            if path.suffix.lower() in self.IMAGE_EXTENSIONS
+        }
+        missing = [path.name for path in self.images if path.stem not in mask_by_stem]
+        if missing:
+            raise ValueError(
+                "Missing synthetic masks with matching stems for: "
+                + ", ".join(missing[:10])
+            )
+        self.masks = [mask_by_stem[path.stem] for path in self.images]
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image = Image.open(self.images[index]).convert("RGB")
+        mask = Image.open(self.masks[index]).convert("L")
+        image_tensor = self.img_transform(image)
+        resample_nearest = getattr(Image, "Resampling", Image).NEAREST
+        mask = mask.resize(
+            (self.scene_size_px, self.scene_size_px),
+            resample=resample_nearest,
+        )
+        # Fixed by Codex on 2026-06-23
+        # Problem: ADE-embedded synthetic masks contain real ADE class ids plus
+        # 255 padding, so binarizing them would destroy the CE target.
+        # Solution: preserve nearest-neighbor resized uint8 labels as integer
+        # class ids, including IGNORE_LABEL=255 outside the embedded scene.
+        # Result: The frozen ADE probe is trained/evaluated against meaningful
+        # semantic labels in the inserted region only.
+        mask_tensor = torch.from_numpy(np.asarray(mask).astype(np.int64))
+        return image_tensor, mask_tensor
 
 
-def _batch_from_arrays(
+def _build_segmentation_dataset(
     *,
-    coords: np.ndarray,
-    lengths: np.ndarray,
-    device: torch.device,
-) -> dict[str, torch.Tensor]:
-    """Convert replay arrays into an actor/critic history batch."""
-    return {
-        "coords": torch.as_tensor(coords, device=device),
-        "lengths": torch.as_tensor(lengths, device=device),
-    }
+    args: argparse.Namespace,
+    cfg: CanViTEnvConfig,
+    split: str,
+    img_tf,
+    mask_tf,
+):
+    """Build either ADE20K or folder-based synthetic segmentation data."""
+    dataset_root = Path(args.dataset)
+    inferred_synthetic = (
+        (dataset_root / "images").is_dir()
+        and (dataset_root / "masks").is_dir()
+    )
+    dataset_format = (
+        "synthetic"
+        if args.dataset_format == "auto" and inferred_synthetic
+        else "ade20k"
+        if args.dataset_format == "auto"
+        else args.dataset_format
+    )
+    if dataset_format == "ade20k":
+        return ADE20kDataset(
+            root=dataset_root,
+            split=split,
+            img_transform=img_tf,
+            mask_transform=mask_tf,
+        )
+    image_dir = Path(args.synthetic_image_dir) if args.synthetic_image_dir else dataset_root / "images"
+    mask_dir = Path(args.synthetic_mask_dir) if args.synthetic_mask_dir else dataset_root / "masks"
+    return SyntheticSegmentationDataset(
+        image_dir=image_dir,
+        mask_dir=mask_dir,
+        scene_size_px=cfg.scene_size_px,
+        img_transform=img_tf,
+    )
 
 
 def _segmentation_metrics(
@@ -181,7 +224,7 @@ def _segmentation_metrics(
     )
     miou = None
     if acc is not None:
-        spatial = model.get_spatial(state.canvas).view(
+        spatial = model.get_spatial(state.canvas).reshape(
             masks.shape[0],
             cfg.canvas_grid_size,
             cfg.canvas_grid_size,
@@ -237,14 +280,162 @@ def _grad_norm(parameters) -> float:
     return total ** 0.5
 
 
-class HistoryReplayBuffer:
-    """Replay buffer for image-independent SAC transitions."""
+def _eval_random_batch(
+    *,
+    model,
+    probe: torch.nn.Module,
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    canvit_dtype: torch.dtype,
+    acc: mIoUAccumulator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Roll out random learned viewpoints after a full-scene warm-up."""
+    device = images.device
+    state = model.init_state(batch_size=images.shape[0], canvas_grid_size=cfg.canvas_grid_size)
+    full_vp = Viewpoint.full_scene(batch_size=images.shape[0], device=device)
+    with torch.inference_mode():
+        full_glimpse = sample_at_viewpoint(
+            spatial=images,
+            viewpoint=full_vp,
+            glimpse_size_px=cfg.glimpse_size_px,
+        ).to(dtype=canvit_dtype)
+        full_out = model(
+            glimpse=full_glimpse,
+            state=state,
+            viewpoint=full_vp,
+        )
+        state = full_out.state
+        initial_ce, _ = _segmentation_metrics(
+            model=model, probe=probe, state=state, masks=masks, cfg=cfg
+        )
+        for _ in range(args.t):
+            vp = random_viewpoints(
+                batch_size=images.shape[0],
+                device=device,
+                n_viewpoints=1,
+                min_scale=args.min_scale,
+                max_scale=1.0,
+                start_with_full_scene=False,
+            )[0]
+            glimpse = sample_at_viewpoint(
+                spatial=images,
+                viewpoint=vp,
+                glimpse_size_px=cfg.glimpse_size_px,
+            ).to(dtype=canvit_dtype)
+            out = model(
+                glimpse=glimpse,
+                state=state,
+                viewpoint=vp,
+            )
+            state = out.state
+        final_ce, _ = _segmentation_metrics(
+            model=model, probe=probe, state=state, masks=masks, cfg=cfg, acc=acc
+        )
+    return initial_ce, final_ce
 
-    def __init__(self, *, capacity: int, max_history: int) -> None:
+
+def _eval_egc2f_batch(
+    *,
+    model,
+    probe: torch.nn.Module,
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    canvit_dtype: torch.dtype,
+    acc: mIoUAccumulator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate canvit-eval entropy-guided coarse-to-fine on the same horizon."""
+    try:
+        from canvit_eval.episode import run_episode
+        from canvit_eval.policies import make_policy
+    except ImportError as exc:
+        raise RuntimeError(
+            "EG-C2F evaluation requires canvit-eval import support. "
+            "Place CanViT-eval next to this repo or install it."
+        ) from exc
+    if args.t + 1 > 21:
+        raise ValueError("EG-C2F has 21 built-in timesteps; require --t <= 20.")
+    batch_size = images.shape[0]
+    policy = make_policy(
+        "entropy_coarse_to_fine",
+        batch_size=batch_size,
+        device=images.device,
+        n_viewpoints=args.t + 1,
+        canvas_grid=cfg.canvas_grid_size,
+        probe=probe,
+        get_spatial_fn=model.get_spatial,
+    )
+    with torch.inference_mode():
+        steps = run_episode(
+            model=model,
+            images=images.to(dtype=canvit_dtype),
+            policy=policy,
+            n_timesteps=args.t + 1,
+            canvas_grid=cfg.canvas_grid_size,
+            glimpse_px=cfg.glimpse_size_px,
+        )
+        initial_ce, _ = _segmentation_metrics(
+            model=model, probe=probe, state=steps[0].state, masks=masks, cfg=cfg
+        )
+        final_ce, _ = _segmentation_metrics(
+            model=model,
+            probe=probe,
+            state=steps[-1].state,
+            masks=masks,
+            cfg=cfg,
+            acc=acc,
+        )
+    return initial_ce, final_ce
+
+
+def _make_comet_experiment(args: argparse.Namespace):
+    """Create a Comet experiment unless disabled for local dry runs."""
+    if args.no_comet:
+        return None
+    if Experiment is None:
+        raise RuntimeError(
+            "Comet logging is enabled by default, but comet_ml is not installed. "
+            "Install comet-ml or run with --no-comet."
+        )
+    kwargs = dict(
+        project_name=args.comet_project,
+        auto_param_logging=True,
+        auto_metric_logging=True,
+    )
+    if args.comet_workspace:
+        kwargs["workspace"] = args.comet_workspace
+    experiment = Experiment(**kwargs)
+    experiment.set_name(args.experiment_name or "canvas-state-sac")
+    if args.comet_tags:
+        experiment.add_tags(
+            [tag.strip() for tag in args.comet_tags.split(",") if tag.strip()]
+        )
+    experiment.log_parameters(vars(args))
+    return experiment
+
+
+class CanvasReplayBuffer:
+    """Replay buffer for image-dependent current-canvas SAC transitions."""
+
+    def __init__(
+        self,
+        *,
+        capacity: int,
+        max_history: int,
+        canvas_feature_dim: int,
+        canvas_grid_size: int,
+    ) -> None:
         self.capacity = capacity
-        self.max_history = max_history
+        self.canvas = np.zeros(
+            (capacity, canvas_feature_dim, canvas_grid_size, canvas_grid_size),
+            dtype=np.float32,
+        )
+        self.next_canvas = np.zeros_like(self.canvas)
         self.coords = np.zeros((capacity, max_history, 3), dtype=np.float32)
-        self.next_coords = np.zeros((capacity, max_history, 3), dtype=np.float32)
+        self.next_coords = np.zeros_like(self.coords)
         self.lengths = np.zeros(capacity, dtype=np.int64)
         self.next_lengths = np.zeros(capacity, dtype=np.int64)
         self.actions = np.zeros((capacity, 3), dtype=np.float32)
@@ -256,57 +447,67 @@ class HistoryReplayBuffer:
     def add_batch(
         self,
         *,
+        canvas: torch.Tensor,
         coords: torch.Tensor,
         lengths: torch.Tensor,
         actions: torch.Tensor,
         rewards: torch.Tensor,
+        next_canvas: torch.Tensor,
         next_coords: torch.Tensor,
         next_lengths: torch.Tensor,
         dones: torch.Tensor,
     ) -> None:
-        batch_size = coords.shape[0]
-        coords_np = coords.detach().cpu().numpy().astype(np.float32)
-        next_coords_np = next_coords.detach().cpu().numpy().astype(np.float32)
-        lengths_np = lengths.detach().cpu().numpy().astype(np.int64)
-        next_lengths_np = next_lengths.detach().cpu().numpy().astype(np.int64)
-        actions_np = actions.detach().cpu().numpy().astype(np.float32)
-        rewards_np = rewards.detach().cpu().numpy().astype(np.float32)
-        dones_np = dones.detach().cpu().numpy().astype(np.float32)
+        batch_size = canvas.shape[0]
+        arrays = {
+            "canvas": canvas.detach().cpu().numpy().astype(np.float32),
+            "coords": coords.detach().cpu().numpy().astype(np.float32),
+            "lengths": lengths.detach().cpu().numpy().astype(np.int64),
+            "actions": actions.detach().cpu().numpy().astype(np.float32),
+            "rewards": rewards.detach().cpu().numpy().astype(np.float32),
+            "next_canvas": next_canvas.detach().cpu().numpy().astype(np.float32),
+            "next_coords": next_coords.detach().cpu().numpy().astype(np.float32),
+            "next_lengths": next_lengths.detach().cpu().numpy().astype(np.int64),
+            "dones": dones.detach().cpu().numpy().astype(np.float32),
+        }
         for idx in range(batch_size):
-            self.coords[self.pos] = coords_np[idx]
-            self.next_coords[self.pos] = next_coords_np[idx]
-            self.lengths[self.pos] = lengths_np[idx]
-            self.next_lengths[self.pos] = next_lengths_np[idx]
-            self.actions[self.pos] = actions_np[idx]
-            self.rewards[self.pos] = rewards_np[idx]
-            self.dones[self.pos] = dones_np[idx]
+            self.canvas[self.pos] = arrays["canvas"][idx]
+            self.coords[self.pos] = arrays["coords"][idx]
+            self.lengths[self.pos] = arrays["lengths"][idx]
+            self.actions[self.pos] = arrays["actions"][idx]
+            self.rewards[self.pos] = arrays["rewards"][idx]
+            self.next_canvas[self.pos] = arrays["next_canvas"][idx]
+            self.next_coords[self.pos] = arrays["next_coords"][idx]
+            self.next_lengths[self.pos] = arrays["next_lengths"][idx]
+            self.dones[self.pos] = arrays["dones"][idx]
             self.pos = (self.pos + 1) % self.capacity
             self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
         idx = np.random.randint(0, self.size, size=batch_size)
         return {
+            "canvas": torch.as_tensor(self.canvas[idx], device=device),
             "coords": torch.as_tensor(self.coords[idx], device=device),
             "lengths": torch.as_tensor(self.lengths[idx], device=device),
             "actions": torch.as_tensor(self.actions[idx], device=device),
             "rewards": torch.as_tensor(self.rewards[idx], device=device),
+            "next_canvas": torch.as_tensor(self.next_canvas[idx], device=device),
             "next_coords": torch.as_tensor(self.next_coords[idx], device=device),
             "next_lengths": torch.as_tensor(self.next_lengths[idx], device=device),
             "dones": torch.as_tensor(self.dones[idx], device=device),
         }
 
 
-class ViewpointSAC:
-    """Continuous SAC for the image-independent viewpoint actor/critic."""
+class CanvasSAC:
+    """Continuous SAC for current-canvas actor and critic networks."""
 
     def __init__(
         self,
         *,
-        actor: ViewpointGaussianActor,
-        q1: ViewpointHistoryCritic,
-        q2: ViewpointHistoryCritic,
-        target_q1: ViewpointHistoryCritic,
-        target_q2: ViewpointHistoryCritic,
+        actor: CanvasStateActor,
+        q1: CanvasStateCritic,
+        q2: CanvasStateCritic,
+        target_q1: CanvasStateCritic,
+        target_q2: CanvasStateCritic,
         actor_lr: float,
         critic_lr: float,
         alpha_lr: float,
@@ -325,9 +526,9 @@ class ViewpointSAC:
             list(q1.parameters()) + list(q2.parameters()),
             lr=critic_lr,
         )
-        alpha_device = next(actor.parameters()).device
+        device = next(actor.parameters()).device
         self.log_alpha = torch.nn.Parameter(
-            torch.log(torch.tensor(init_alpha, device=alpha_device))
+            torch.log(torch.tensor(init_alpha, device=device))
         )
         self.alpha_opt = torch.optim.AdamW([self.log_alpha], lr=alpha_lr)
         self.gamma = gamma
@@ -339,8 +540,13 @@ class ViewpointSAC:
         return self.log_alpha.exp()
 
     def update(self, sample: dict[str, torch.Tensor]) -> dict[str, float]:
-        obs = {"coords": sample["coords"], "lengths": sample["lengths"]}
+        obs = {
+            "canvas": sample["canvas"],
+            "coords": sample["coords"],
+            "lengths": sample["lengths"],
+        }
         next_obs = {
+            "canvas": sample["next_canvas"],
             "coords": sample["next_coords"],
             "lengths": sample["next_lengths"],
         }
@@ -408,162 +614,49 @@ class ViewpointSAC:
 
 
 def _build_networks(
+    *,
     args: argparse.Namespace,
+    canvas_feature_dim: int,
     device: torch.device,
 ) -> tuple[
-    ViewpointGaussianActor,
-    ViewpointHistoryCritic,
-    ViewpointHistoryCritic,
-    ViewpointHistoryCritic,
-    ViewpointHistoryCritic,
+    CanvasStateActor,
+    CanvasStateCritic,
+    CanvasStateCritic,
+    CanvasStateCritic,
+    CanvasStateCritic,
 ]:
-    """Construct actor, twin critics, and target critics."""
-    actor = ViewpointGaussianActor(
+    """Construct current-canvas actor, twin critics, and target critics."""
+    kwargs = dict(
+        canvas_feature_dim=canvas_feature_dim,
         d_model=args.d_model,
-        max_steps=args.max_history,
-        rff_dim=args.rff_dim,
-        rff_seed=args.rff_seed,
-    ).to(device)
-    critic_kwargs = dict(
-        d_model=args.d_model,
-        max_steps=args.max_history,
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
     )
-    q1 = ViewpointHistoryCritic(**critic_kwargs).to(device)
-    q2 = ViewpointHistoryCritic(**critic_kwargs).to(device)
+    actor = CanvasStateActor(**kwargs).to(device)
+    q1 = CanvasStateCritic(**kwargs).to(device)
+    q2 = CanvasStateCritic(**kwargs).to(device)
     target_q1 = copy.deepcopy(q1).to(device)
     target_q2 = copy.deepcopy(q2).to(device)
     return actor, q1, q2, target_q1, target_q2
 
 
-def _load_state_dict_flexible(
-    module: torch.nn.Module,
-    payload: Any,
-    key: str,
-    path: Path,
-) -> None:
-    """Load either a plain state_dict or a checkpoint dict containing key."""
-    state = payload.get(key) if isinstance(payload, dict) and key in payload else payload
-    if not isinstance(state, dict):
-        raise ValueError(f"Checkpoint does not contain a usable {key} state: {path}")
-    try:
-        module.load_state_dict(state)
-    except RuntimeError as exc:
-        raise ValueError(
-            f"Could not load {key} checkpoint: {path}\n"
-            "This usually means the SAC architecture args do not match the "
-            "pretraining run. Check --d-model, --rff-dim, --rff-seed, "
-            "--max-history, and --min-scale. If you are loading actor_final.pt, "
-            "keep the sibling latest.pt beside it so SAC can auto-read those args."
-        ) from exc
-
-
-def _adopt_pretrained_arch_args(args: argparse.Namespace) -> None:
-    """Adopt actor/critic architecture args from initialization checkpoints."""
-    candidate_paths: list[Path] = []
-    if args.actor_checkpoint is not None:
-        candidate_paths.extend([args.actor_checkpoint, args.actor_checkpoint.with_name("latest.pt")])
-    if args.critic_checkpoint is not None:
-        candidate_paths.append(args.critic_checkpoint)
-
-    for path in candidate_paths:
-        if not path.exists():
-            continue
-        try:
-            payload = torch.load(path, map_location="cpu", weights_only=False)
-        except Exception:
-            continue
-        if not isinstance(payload, dict) or not isinstance(payload.get("args"), dict):
-            continue
-        saved_args = payload["args"]
-        for name in ("d_model", "rff_dim", "rff_seed", "max_history", "min_scale"):
-            if name in saved_args:
-                old_value = getattr(args, name)
-                new_value = saved_args[name]
-                if old_value != new_value:
-                    # Fixed by Codex on 2026-06-18
-                    # Problem: Passing BC actor_final.pt loses architecture
-                    # metadata, so SAC defaulted to max_history=16 while BC
-                    # checkpoints often use max_history=t+1, e.g. 2.
-                    # Solution: Read architecture args from sibling latest.pt
-                    # or critic checkpoints before constructing networks.
-                    # Result: Pretrained actor/critic checkpoints initialize
-                    # SAC with matching History -> VPE -> head dimensions.
-                    print(f"Adopting --{name.replace('_', '-')}={new_value} from {path}")
-                    setattr(args, name, new_value)
-        return
-
-
-def _load_initialization(
-    *,
-    args: argparse.Namespace,
-    actor: ViewpointGaussianActor,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
-    target_q1: ViewpointHistoryCritic,
-    target_q2: ViewpointHistoryCritic,
-    agent: ViewpointSAC,
-) -> tuple[int, int, float]:
-    """Load resume/pretrained checkpoints while keeping all networks trainable."""
-    start_batch = 1
-    update_count = 0
-    best_ce_gain = float("-inf")
-    if args.resume is not None:
-        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        actor.load_state_dict(checkpoint["actor"])
-        q1.load_state_dict(checkpoint["q1"])
-        q2.load_state_dict(checkpoint["q2"])
-        target_q1.load_state_dict(checkpoint.get("target_q1", q1.state_dict()))
-        target_q2.load_state_dict(checkpoint.get("target_q2", q2.state_dict()))
-        if "actor_opt" in checkpoint:
-            agent.actor_opt.load_state_dict(checkpoint["actor_opt"])
-        if "q_opt" in checkpoint:
-            agent.q_opt.load_state_dict(checkpoint["q_opt"])
-        if "alpha_opt" in checkpoint:
-            agent.alpha_opt.load_state_dict(checkpoint["alpha_opt"])
-        if "log_alpha" in checkpoint:
-            agent.log_alpha.data.copy_(checkpoint["log_alpha"])
-        start_batch = int(checkpoint.get("batch", 0)) + 1
-        update_count = int(checkpoint.get("updates", 0))
-        best_ce_gain = float(checkpoint.get("best_ce_gain", best_ce_gain))
-        return start_batch, update_count, best_ce_gain
-
-    if args.actor_checkpoint is not None:
-        payload = torch.load(args.actor_checkpoint, map_location="cpu", weights_only=False)
-        _load_state_dict_flexible(
-            actor,
-            payload,
-            "actor",
-            args.actor_checkpoint,
-        )
-    if args.critic_checkpoint is not None:
-        payload = torch.load(args.critic_checkpoint, map_location="cpu", weights_only=False)
-        if not isinstance(payload, dict) or "q1" not in payload:
-            raise ValueError(f"Expected q1/q2 critic checkpoint: {args.critic_checkpoint}")
-        q1.load_state_dict(payload["q1"])
-        q2.load_state_dict(payload.get("q2", payload["q1"]))
-        target_q1.load_state_dict(q1.state_dict())
-        target_q2.load_state_dict(q2.state_dict())
-    return start_batch, update_count, best_ce_gain
-
-
 def _save_checkpoint(
     *,
     path: Path,
-    actor: ViewpointGaussianActor,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
-    target_q1: ViewpointHistoryCritic,
-    target_q2: ViewpointHistoryCritic,
-    agent: ViewpointSAC,
+    actor: CanvasStateActor,
+    q1: CanvasStateCritic,
+    q2: CanvasStateCritic,
+    target_q1: CanvasStateCritic,
+    target_q2: CanvasStateCritic,
+    agent: CanvasSAC,
     args: argparse.Namespace,
+    canvas_feature_dim: int,
     batch: int,
     updates: int,
     best_ce_gain: float,
     eval_metrics: dict[str, float] | None,
 ) -> None:
-    """Save SAC state; best selection is by eval/ce_gain."""
+    """Save canvas SAC state; best selection is by eval/ce_gain."""
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -577,98 +670,86 @@ def _save_checkpoint(
             "alpha_opt": agent.alpha_opt.state_dict(),
             "log_alpha": agent.log_alpha.detach().cpu(),
             "args": vars(args),
+            "canvas_feature_dim": canvas_feature_dim,
             "batch": batch,
             "updates": updates,
             "best_ce_gain": best_ce_gain,
             "selection_metric": "eval/ce_gain",
             "eval_metrics": eval_metrics or {},
-            "state_representation": "viewpoint_history",
+            "state_representation": "current_canvas_layernorm_with_viewpoint_history",
         },
         path,
     )
 
 
-def _eval_random_batch(
+def _load_resume(
     *,
+    args: argparse.Namespace,
+    actor: CanvasStateActor,
+    q1: CanvasStateCritic,
+    q2: CanvasStateCritic,
+    target_q1: CanvasStateCritic,
+    target_q2: CanvasStateCritic,
+    agent: CanvasSAC,
+) -> tuple[int, int, float]:
+    """Resume a canvas SAC checkpoint while keeping every network trainable."""
+    if args.resume is None:
+        return 1, 0, float("-inf")
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+    actor.load_state_dict(checkpoint["actor"])
+    q1.load_state_dict(checkpoint["q1"])
+    q2.load_state_dict(checkpoint["q2"])
+    target_q1.load_state_dict(checkpoint.get("target_q1", q1.state_dict()))
+    target_q2.load_state_dict(checkpoint.get("target_q2", q2.state_dict()))
+    if "actor_opt" in checkpoint:
+        agent.actor_opt.load_state_dict(checkpoint["actor_opt"])
+    if "q_opt" in checkpoint:
+        agent.q_opt.load_state_dict(checkpoint["q_opt"])
+    if "alpha_opt" in checkpoint:
+        agent.alpha_opt.load_state_dict(checkpoint["alpha_opt"])
+    if "log_alpha" in checkpoint:
+        agent.log_alpha.data.copy_(checkpoint["log_alpha"])
+    return (
+        int(checkpoint.get("batch", 0)) + 1,
+        int(checkpoint.get("updates", 0)),
+        float(checkpoint.get("best_ce_gain", float("-inf"))),
+    )
+
+
+def _eval_canvas_sac_batch(
+    *,
+    actor: CanvasStateActor,
     model,
     probe: torch.nn.Module,
     images: torch.Tensor,
     masks: torch.Tensor,
     cfg: CanViTEnvConfig,
     args: argparse.Namespace,
-    acc: mIoUAccumulator,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Roll out random learned viewpoints after a full-scene warm-up."""
-    device = images.device
-    state = model.init_state(batch_size=images.shape[0], canvas_grid_size=cfg.canvas_grid_size)
-    full_vp = Viewpoint.full_scene(batch_size=images.shape[0], device=device)
-    with torch.inference_mode():
-        full_out = model(
-            glimpse=sample_at_viewpoint(
-                spatial=images,
-                viewpoint=full_vp,
-                glimpse_size_px=cfg.glimpse_size_px,
-            ),
-            state=state,
-            viewpoint=full_vp,
-        )
-        state = full_out.state
-        initial_ce, _ = _segmentation_metrics(
-            model=model, probe=probe, state=state, masks=masks, cfg=cfg
-        )
-        for _ in range(args.t):
-            vp = random_viewpoints(
-                batch_size=images.shape[0],
-                device=device,
-                n_viewpoints=1,
-                min_scale=args.min_scale,
-                max_scale=1.0,
-                start_with_full_scene=False,
-            )[0]
-            out = model(
-                glimpse=sample_at_viewpoint(
-                    spatial=images,
-                    viewpoint=vp,
-                    glimpse_size_px=cfg.glimpse_size_px,
-                ),
-                state=state,
-                viewpoint=vp,
-            )
-            state = out.state
-        final_ce, _ = _segmentation_metrics(
-            model=model, probe=probe, state=state, masks=masks, cfg=cfg, acc=acc
-        )
-    return initial_ce, final_ce
-
-
-def _eval_sac_batch(
-    *,
-    actor: ViewpointGaussianActor,
-    model,
-    probe: torch.nn.Module,
-    images: torch.Tensor,
-    masks: torch.Tensor,
-    cfg: CanViTEnvConfig,
-    args: argparse.Namespace,
+    canvas_feature_dim: int,
+    canvit_dtype: torch.dtype,
     acc: mIoUAccumulator,
     scale_sums: list[float],
     scale_counts: list[int],
     entropy_points: list[np.ndarray],
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Roll out deterministic SAC over a validation batch."""
+    """Roll out deterministic image-dependent SAC over a validation batch."""
     device = images.device
     batch_size = images.shape[0]
     state = model.init_state(batch_size=batch_size, canvas_grid_size=cfg.canvas_grid_size)
-    coords = torch.zeros(batch_size, args.max_history, 3, device=device)
-    lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+    coords, lengths = empty_viewpoint_history(
+        batch_size=batch_size,
+        max_steps=args.max_history,
+        device=device,
+    )
     full_vp = Viewpoint.full_scene(batch_size=batch_size, device=device)
     with torch.inference_mode():
+        full_glimpse = sample_at_viewpoint(
+            spatial=images,
+            viewpoint=full_vp,
+            glimpse_size_px=cfg.glimpse_size_px,
+        ).to(dtype=canvit_dtype)
         full_out = model(
-            glimpse=sample_at_viewpoint(
-                spatial=images,
-                viewpoint=full_vp,
-                glimpse_size_px=cfg.glimpse_size_px,
-            ),
+            glimpse=full_glimpse,
             state=state,
             viewpoint=full_vp,
         )
@@ -676,10 +757,21 @@ def _eval_sac_batch(
         initial_ce, _ = _segmentation_metrics(
             model=model, probe=probe, state=state, masks=masks, cfg=cfg
         )
-    coords, lengths = _append_history(coords=coords, lengths=lengths, viewpoint=full_vp, step=0)
+        canvas_summary = canvas_layernorm_spatial(
+            model=model,
+            state=state,
+            canvas_grid_size=cfg.canvas_grid_size,
+        )
+    coords, lengths = append_viewpoint_history(
+        coords=coords,
+        lengths=lengths,
+        viewpoint=full_vp,
+        step=0,
+    )
     for step_idx in range(args.t):
+        obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
         with torch.no_grad():
-            action = actor.deterministic_action({"coords": coords, "lengths": lengths})
+            action = actor.deterministic_action(obs)
         vp = action_to_viewpoint(action, min_scale=args.min_scale)
         entropy_points.append(
             torch.cat([vp.centers, vp.scales[:, None]], dim=1).detach().cpu().numpy()
@@ -687,17 +779,23 @@ def _eval_sac_batch(
         scale_sums[step_idx] += float(vp.scales.detach().sum().item())
         scale_counts[step_idx] += batch_size
         with torch.inference_mode():
+            glimpse = sample_at_viewpoint(
+                spatial=images,
+                viewpoint=vp,
+                glimpse_size_px=cfg.glimpse_size_px,
+            ).to(dtype=canvit_dtype)
             out = model(
-                glimpse=sample_at_viewpoint(
-                    spatial=images,
-                    viewpoint=vp,
-                    glimpse_size_px=cfg.glimpse_size_px,
-                ),
+                glimpse=glimpse,
                 state=state,
                 viewpoint=vp,
             )
             state = out.state
-        coords, lengths = _append_history(
+            canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+        coords, lengths = append_viewpoint_history(
             coords=coords,
             lengths=lengths,
             viewpoint=vp,
@@ -710,68 +808,19 @@ def _eval_sac_batch(
     return initial_ce, final_ce
 
 
-def _eval_egc2f_batch(
-    *,
-    model,
-    probe: torch.nn.Module,
-    images: torch.Tensor,
-    masks: torch.Tensor,
-    cfg: CanViTEnvConfig,
-    args: argparse.Namespace,
-    acc: mIoUAccumulator,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Evaluate canvit-eval entropy-guided coarse-to-fine on the same horizon."""
-    if run_episode is None or make_policy is None:
-        raise RuntimeError(
-            "EG-C2F evaluation requires canvit-eval import support. "
-            "Place CanViT-eval next to this repo or install it."
-        )
-    if args.t + 1 > 21:
-        raise ValueError("EG-C2F has 21 built-in timesteps; require --t <= 20.")
-    batch_size = images.shape[0]
-    policy = make_policy(
-        "entropy_coarse_to_fine",
-        batch_size=batch_size,
-        device=images.device,
-        n_viewpoints=args.t + 1,
-        canvas_grid=cfg.canvas_grid_size,
-        probe=probe,
-        get_spatial_fn=model.get_spatial,
-    )
-    with torch.inference_mode():
-        steps = run_episode(
-            model=model,
-            images=images,
-            policy=policy,
-            n_timesteps=args.t + 1,
-            canvas_grid=cfg.canvas_grid_size,
-            glimpse_px=cfg.glimpse_size_px,
-        )
-        initial_ce, _ = _segmentation_metrics(
-            model=model, probe=probe, state=steps[0].state, masks=masks, cfg=cfg
-        )
-        final_ce, _ = _segmentation_metrics(
-            model=model,
-            probe=probe,
-            state=steps[-1].state,
-            masks=masks,
-            cfg=cfg,
-            acc=acc,
-        )
-    return initial_ce, final_ce
-
-
 def evaluate(
     *,
-    actor: ViewpointGaussianActor,
+    actor: CanvasStateActor,
     eval_loader: DataLoader,
     model,
     probe: torch.nn.Module,
     cfg: CanViTEnvConfig,
     args: argparse.Namespace,
+    canvas_feature_dim: int,
+    canvit_dtype: torch.dtype,
     device: torch.device,
 ) -> dict[str, float]:
-    """Evaluate Random, EG-C2F, and SAC on a fixed validation subset."""
+    """Evaluate Random, EG-C2F, and canvas SAC on a fixed validation subset."""
     random_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
     egc2f_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
     sac_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
@@ -781,7 +830,7 @@ def evaluate(
     sac_scale_counts = [0 for _ in range(args.t)]
     sac_entropy_points: list[np.ndarray] = []
 
-    for images, masks in tqdm(eval_loader, desc="Evaluating SAC", leave=False):
+    for images, masks in tqdm(eval_loader, desc="Evaluating canvas SAC", leave=False):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         batch_size = images.shape[0]
@@ -794,6 +843,7 @@ def evaluate(
             masks=masks,
             cfg=cfg,
             args=args,
+            canvit_dtype=canvit_dtype,
             acc=random_acc,
         )
         eg_initial, eg_final = _eval_egc2f_batch(
@@ -803,9 +853,10 @@ def evaluate(
             masks=masks,
             cfg=cfg,
             args=args,
+            canvit_dtype=canvit_dtype,
             acc=egc2f_acc,
         )
-        sac_initial, sac_final = _eval_sac_batch(
+        sac_initial, sac_final = _eval_canvas_sac_batch(
             actor=actor,
             model=model,
             probe=probe,
@@ -813,6 +864,8 @@ def evaluate(
             masks=masks,
             cfg=cfg,
             args=args,
+            canvas_feature_dim=canvas_feature_dim,
+            canvit_dtype=canvit_dtype,
             acc=sac_acc,
             scale_sums=sac_scale_sums,
             scale_counts=sac_scale_counts,
@@ -850,7 +903,7 @@ def evaluate(
         "eval/sac_viewpoint_entropy": _viewpoint_entropy(
             sac_entropy_points,
             bins=args.viewpoint_entropy_bins,
-        )
+        ),
     }
     metrics.update(
         {
@@ -872,9 +925,9 @@ def evaluate(
 
 def _maybe_visualize_reward_maps(
     *,
-    actor: ViewpointGaussianActor,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
+    actor: CanvasStateActor,
+    q1: CanvasStateCritic,
+    q2: CanvasStateCritic,
     eval_dataset,
     model,
     probe: torch.nn.Module,
@@ -884,16 +937,16 @@ def _maybe_visualize_reward_maps(
     update_count: int,
     comet_exp,
 ) -> None:
-    """Optionally save live reward/Q maps after a validation pass."""
+    """Optionally save live canvas SAC reward/Q maps after validation."""
     if args.reward_map_images <= 0:
         return
-    # Fixed by Codex on 2026-06-19
-    # Problem: Reward maps were only available as a separate offline script, so
-    # Q-landscape sanity checks could drift from the current validation policy.
-    # Solution: Reuse the plotting module inside the SAC validation loop with
-    # live actor/q1/q2 weights and a fixed prefix of the validation subset.
-    # Result: Each enabled validation pass can emit true-vs-predicted reward
-    # maps for the same current networks used to compute eval metrics.
+    # Fixed by Codex on 2026-06-23
+    # Problem: Canvas SAC validation logged scalar metrics but could not show
+    # whether the image-dependent critic's Q landscape matched true CE gains.
+    # Solution: reuse the reward-map renderer with live CanvasStateActor/Critic
+    # modules and explicitly select the canvas policy path.
+    # Result: Each enabled eval pass can save and optionally Comet-log reward
+    # maps for the same canvas-dependent networks being validated.
     indices = list(range(min(args.reward_map_images, len(eval_dataset))))
     paths = visualize_reward_maps_for_indices(
         actor=actor,
@@ -909,9 +962,11 @@ def _maybe_visualize_reward_maps(
         scales=_parse_scales(args.reward_map_scales),
         grid_size=args.reward_map_grid_size,
         chunk_size=args.reward_map_chunk_size,
-        output_dir=args.reward_map_output_dir,
+        output_dir=args.reward_map_output_dir / f"update_{update_count:06d}",
         split_label=args.eval_split,
-        title_prefix=f"SAC validation reward map update={update_count}",
+        title_prefix=f"Canvas SAC validation reward map update={update_count}",
+        policy_kind="canvas",
+        max_history=args.max_history,
     )
     if comet_exp is not None:
         for path in paths:
@@ -919,8 +974,7 @@ def _maybe_visualize_reward_maps(
 
 
 def train_once(args: argparse.Namespace) -> float:
-    """Run full viewpoint-history SAC and return best eval CE gain."""
-    _adopt_pretrained_arch_args(args)
+    """Run full current-canvas SAC and return best eval CE gain."""
     if args.t < 0:
         raise ValueError("--t must be non-negative.")
     if args.max_history < args.t + 1:
@@ -941,18 +995,20 @@ def train_once(args: argparse.Namespace) -> float:
     device = get_device()
     cfg = CanViTEnvConfig()
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
-    train_dataset = ADE20kDataset(
-        root=Path(args.dataset),
+    train_dataset = _build_segmentation_dataset(
+        args=args,
+        cfg=cfg,
         split=args.split,
-        img_transform=img_tf,
-        mask_transform=mask_tf,
+        img_tf=img_tf,
+        mask_tf=mask_tf,
     )
     train_dataset = _limit_dataset(train_dataset, args.max_samples)
-    eval_dataset = ADE20kDataset(
-        root=Path(args.dataset),
+    eval_dataset = _build_segmentation_dataset(
+        args=args,
+        cfg=cfg,
         split=args.eval_split,
-        img_transform=img_tf,
-        mask_transform=mask_tf,
+        img_tf=img_tf,
+        mask_tf=mask_tf,
     )
     eval_dataset = _limit_dataset(eval_dataset, args.eval_images)
     if len(train_dataset) == 0 or len(eval_dataset) == 0:
@@ -986,13 +1042,25 @@ def train_once(args: argparse.Namespace) -> float:
     )
     model = seg.canvit
     probe = seg.head
+    canvit_dtype = configure_frozen_canvit_precision(
+        model=model,
+        probe=probe,
+        requested=args.canvit_dtype,
+        device=device,
+    )
+    print(f"CanViT inference dtype: {canvit_dtype}")
     for param in model.parameters():
         param.requires_grad_(False)
     for param in probe.parameters():
         param.requires_grad_(False)
 
-    actor, q1, q2, target_q1, target_q2 = _build_networks(args, device)
-    agent = ViewpointSAC(
+    canvas_feature_dim = int(model.canvas_dim)
+    actor, q1, q2, target_q1, target_q2 = _build_networks(
+        args=args,
+        canvas_feature_dim=canvas_feature_dim,
+        device=device,
+    )
+    agent = CanvasSAC(
         actor=actor,
         q1=q1,
         q2=q2,
@@ -1006,7 +1074,7 @@ def train_once(args: argparse.Namespace) -> float:
         init_alpha=args.init_alpha,
         target_entropy=args.target_entropy,
     )
-    start_batch, update_count, best_ce_gain = _load_initialization(
+    start_batch, update_count, best_ce_gain = _load_resume(
         args=args,
         actor=actor,
         q1=q1,
@@ -1015,7 +1083,12 @@ def train_once(args: argparse.Namespace) -> float:
         target_q2=target_q2,
         agent=agent,
     )
-    replay = HistoryReplayBuffer(capacity=args.buffer_size, max_history=args.max_history)
+    replay = CanvasReplayBuffer(
+        capacity=args.buffer_size,
+        max_history=args.max_history,
+        canvas_feature_dim=canvas_feature_dim,
+        canvas_grid_size=cfg.canvas_grid_size,
+    )
     comet_exp = _make_comet_experiment(args)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1025,12 +1098,12 @@ def train_once(args: argparse.Namespace) -> float:
     entropy_points: list[np.ndarray] = []
     scale_sums = [0.0 for _ in range(args.t)]
     scale_counts = [0 for _ in range(args.t)]
-    next_eval_update = max(args.eval_interval, 1)
     latest_metrics: dict[str, float] | None = None
+    next_eval_update = max(args.eval_interval, 1)
     elapsed_seconds = 0.0
     committed_glimpses = 0
 
-    pbar = tqdm(range(start_batch, args.batches + 1), desc="Training viewpoint SAC")
+    pbar = tqdm(range(start_batch, args.batches + 1), desc="Training canvas SAC")
     for batch_idx in pbar:
         _sync_for_timing(device)
         batch_start = time.perf_counter()
@@ -1044,16 +1117,20 @@ def train_once(args: argparse.Namespace) -> float:
         batch_size = images.shape[0]
 
         state = model.init_state(batch_size=batch_size, canvas_grid_size=cfg.canvas_grid_size)
-        coords = torch.zeros(batch_size, args.max_history, 3, device=device)
-        lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+        coords, lengths = empty_viewpoint_history(
+            batch_size=batch_size,
+            max_steps=args.max_history,
+            device=device,
+        )
         full_vp = Viewpoint.full_scene(batch_size=batch_size, device=device)
         with torch.inference_mode():
+            full_glimpse = sample_at_viewpoint(
+                spatial=images,
+                viewpoint=full_vp,
+                glimpse_size_px=cfg.glimpse_size_px,
+            ).to(dtype=canvit_dtype)
             full_out = model(
-                glimpse=sample_at_viewpoint(
-                    spatial=images,
-                    viewpoint=full_vp,
-                    glimpse_size_px=cfg.glimpse_size_px,
-                ),
+                glimpse=full_glimpse,
                 state=state,
                 viewpoint=full_vp,
             )
@@ -1061,10 +1138,20 @@ def train_once(args: argparse.Namespace) -> float:
             current_ce, _ = _segmentation_metrics(
                 model=model, probe=probe, state=state, masks=masks, cfg=cfg
             )
-        coords, lengths = _append_history(coords=coords, lengths=lengths, viewpoint=full_vp, step=0)
+            canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+        coords, lengths = append_viewpoint_history(
+            coords=coords,
+            lengths=lengths,
+            viewpoint=full_vp,
+            step=0,
+        )
 
         for step_idx in range(args.t):
-            obs = {"coords": coords, "lengths": lengths}
+            obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
             if replay.size < args.learning_starts:
                 action = torch.empty(batch_size, 3, device=device).uniform_(-1.0, 1.0)
             else:
@@ -1081,23 +1168,30 @@ def train_once(args: argparse.Namespace) -> float:
             )
             scale_sums[step_idx] += float(vp.scales.detach().sum().item())
             scale_counts[step_idx] += batch_size
+            prev_canvas = canvas_summary.clone()
             prev_coords = coords.clone()
             prev_lengths = lengths.clone()
             with torch.inference_mode():
+                glimpse = sample_at_viewpoint(
+                    spatial=images,
+                    viewpoint=vp,
+                    glimpse_size_px=cfg.glimpse_size_px,
+                ).to(dtype=canvit_dtype)
                 out = model(
-                    glimpse=sample_at_viewpoint(
-                        spatial=images,
-                        viewpoint=vp,
-                        glimpse_size_px=cfg.glimpse_size_px,
-                    ),
+                    glimpse=glimpse,
                     state=state,
                     viewpoint=vp,
                 )
                 next_ce, _ = _segmentation_metrics(
                     model=model, probe=probe, state=out.state, masks=masks, cfg=cfg
                 )
-            reward = current_ce - next_ce
-            coords, lengths = _append_history(
+                next_canvas_summary = canvas_layernorm_spatial(
+                    model=model,
+                    state=out.state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                )
+            reward = relative_ce_reduction(current_ce, next_ce)
+            coords, lengths = append_viewpoint_history(
                 coords=coords,
                 lengths=lengths,
                 viewpoint=vp,
@@ -1109,10 +1203,12 @@ def train_once(args: argparse.Namespace) -> float:
                 device=device,
             )
             replay.add_batch(
+                canvas=prev_canvas,
                 coords=prev_coords,
                 lengths=prev_lengths,
                 actions=action.detach().clone(),
                 rewards=reward.detach().clone(),
+                next_canvas=next_canvas_summary,
                 next_coords=coords,
                 next_lengths=lengths,
                 dones=done,
@@ -1120,6 +1216,7 @@ def train_once(args: argparse.Namespace) -> float:
             reward_window.extend(reward.detach().cpu().numpy().astype(float).tolist())
             state = out.state
             current_ce = next_ce
+            canvas_summary = next_canvas_summary
 
         _sync_for_timing(device)
         elapsed_seconds += time.perf_counter() - batch_start
@@ -1153,12 +1250,7 @@ def train_once(args: argparse.Namespace) -> float:
                     train_metrics["train/updates"] = float(update_count)
                     train_metrics["train/replay_size"] = float(replay.size)
                     train_metrics["throughput/glimpses_per_sec"] = glimpses_per_sec
-                    train_metrics["throughput/committed_glimpses_per_sec"] = (
-                        glimpses_per_sec
-                    )
-                    train_metrics["throughput/committed_glimpses"] = float(
-                        committed_glimpses
-                    )
+                    train_metrics["throughput/committed_glimpses_per_sec"] = glimpses_per_sec
                     train_metrics["train/viewpoint_entropy"] = _viewpoint_entropy(
                         entropy_points,
                         bins=args.viewpoint_entropy_bins,
@@ -1183,6 +1275,8 @@ def train_once(args: argparse.Namespace) -> float:
                         probe=probe,
                         cfg=cfg,
                         args=args,
+                        canvas_feature_dim=canvas_feature_dim,
+                        canvit_dtype=canvit_dtype,
                         device=device,
                     )
                     latest_metrics = eval_metrics
@@ -1211,6 +1305,7 @@ def train_once(args: argparse.Namespace) -> float:
                         target_q2=target_q2,
                         agent=agent,
                         args=args,
+                        canvas_feature_dim=canvas_feature_dim,
                         batch=batch_idx,
                         updates=update_count,
                         best_ce_gain=best_ce_gain,
@@ -1227,6 +1322,7 @@ def train_once(args: argparse.Namespace) -> float:
                             target_q2=target_q2,
                             agent=agent,
                             args=args,
+                            canvas_feature_dim=canvas_feature_dim,
                             batch=batch_idx,
                             updates=update_count,
                             best_ce_gain=best_ce_gain,
@@ -1235,9 +1331,7 @@ def train_once(args: argparse.Namespace) -> float:
                     print(
                         f"update={update_count} batch={batch_idx} "
                         f"ce_gain={current_ce_gain:+.4f} "
-                        f"sac_miou={eval_metrics['eval/sac_miou']:.4f} "
-                        f"vs_random={eval_metrics['eval/sac_vs_random']:+.4f} "
-                        f"vs_egc2f={eval_metrics['eval/sac_vs_egc2f']:+.4f}"
+                        f"sac_miou={eval_metrics['eval/sac_miou']:.4f}"
                     )
                     next_eval_update += args.eval_interval
 
@@ -1260,6 +1354,8 @@ def train_once(args: argparse.Namespace) -> float:
             probe=probe,
             cfg=cfg,
             args=args,
+            canvas_feature_dim=canvas_feature_dim,
+            canvit_dtype=canvit_dtype,
             device=device,
         )
         best_ce_gain = max(best_ce_gain, latest_metrics["eval/ce_gain"])
@@ -1290,6 +1386,7 @@ def train_once(args: argparse.Namespace) -> float:
             target_q2=target_q2,
             agent=agent,
             args=args,
+            canvas_feature_dim=canvas_feature_dim,
             batch=args.batches,
             updates=update_count,
             best_ce_gain=best_ce_gain,
@@ -1304,6 +1401,7 @@ def train_once(args: argparse.Namespace) -> float:
         target_q2=target_q2,
         agent=agent,
         args=args,
+        canvas_feature_dim=canvas_feature_dim,
         batch=args.batches,
         updates=update_count,
         best_ce_gain=best_ce_gain,
@@ -1314,18 +1412,39 @@ def train_once(args: argparse.Namespace) -> float:
         comet_exp.log_metric("final/ce_gain", latest_metrics["eval/ce_gain"], step=update_count)
         comet_exp.log_metric("final/miou", latest_metrics["eval/sac_miou"], step=update_count)
         comet_exp.end()
-    print(f"Saved SAC latest checkpoint to {args.checkpoint_dir / 'latest.pt'}")
+    print(f"Saved canvas SAC latest checkpoint to {args.checkpoint_dir / 'latest.pt'}")
     print(f"Best eval/ce_gain: {best_ce_gain:+.4f}")
     return best_ce_gain
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batches", type=int, default=1000)
+    parser.add_argument("--batches", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--replay-batch-size", type=int, default=256)
     parser.add_argument("--t", type=int, default=1)
     parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "ade20k", "synthetic"],
+        default="auto",
+        help=(
+            "auto detects folder data with images/ and masks/ subdirectories; "
+            "use ade20k or synthetic to force a format."
+        ),
+    )
+    parser.add_argument(
+        "--synthetic-image-dir",
+        type=str,
+        default=None,
+        help="Optional image directory for --dataset-format synthetic.",
+    )
+    parser.add_argument(
+        "--synthetic-mask-dir",
+        type=str,
+        default=None,
+        help="Optional mask directory for --dataset-format synthetic.",
+    )
     parser.add_argument("--split", choices=["training", "validation"], default="training")
     parser.add_argument("--eval-split", choices=["training", "validation"], default="validation")
     parser.add_argument("--max-samples", type=int, default=None)
@@ -1333,6 +1452,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--probe-repo", type=str, default=None)
+    parser.add_argument(
+        "--canvit-dtype",
+        choices=["bfloat16", "float32"],
+        default="bfloat16",
+        help="Inference dtype for frozen CanViT only; RL networks/probe stay fp32.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--rff-dim", type=int, default=128)
@@ -1342,15 +1467,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0)
+    parser.add_argument("--gamma", type=float, default=0.0)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--init-alpha", type=float, default=0.1)
     parser.add_argument("--target-entropy", type=float, default=-3.0)
-    parser.add_argument("--buffer-size", type=int, default=100)
-    parser.add_argument("--learning-starts", type=int, default=10)
+    parser.add_argument("--buffer-size", type=int, default=1000)
+    parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
-    parser.add_argument("--eval-interval", type=int, default=100)
-    parser.add_argument("--comet-log-interval", type=int, default=10)
+    parser.add_argument("--eval-interval", type=int, default=25)
+    parser.add_argument("--comet-log-interval", type=int, default=25)
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument(
         "--reward-map-images",
@@ -1367,21 +1492,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-map-output-dir",
         type=Path,
-        default=Path("results/sac_reward_maps"),
+        default=Path("results/sac_canvas_reward_maps"),
     )
-    parser.add_argument("--actor-checkpoint", type=Path, default=None)
-    parser.add_argument("--critic-checkpoint", type=Path, default=None)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
-        default=Path("checkpoints/viewpoint_sac"),
+        default=Path("checkpoints/canvas_sac"),
     )
     parser.add_argument("--no-comet", action="store_true")
     parser.add_argument("--comet-workspace", type=str, default=None)
-    parser.add_argument("--comet-project", type=str, default="viewpoint-sac")
+    parser.add_argument("--comet-project", type=str, default="canvas-sac")
     parser.add_argument("--experiment-name", type=str, default=None)
-    parser.add_argument("--comet-tags", type=str, default="viewpoint-sac")
+    parser.add_argument("--comet-tags", type=str, default="canvas-sac")
     return parser.parse_args()
 
 
