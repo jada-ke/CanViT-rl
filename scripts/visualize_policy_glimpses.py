@@ -29,11 +29,12 @@ Usage:
 
   uv run python scripts/visualize_policy_glimpses.py \
         --policy canvas-sac  \
-        --policy-checkpoint checkpoints/canvas_sac/synthetic-im1-t1_2000/best.pt \
-        --dataset synthetic_segmentation \
+        --policy-checkpoint checkpoints/canvas_sac/synthetic-im7-t1_1000/best.pt \
+        --dataset synthetic_segmentation  --split training\
         --t 1 \
-        --image-index 0  \
-        --output-dir results/canvas_policy_glimpses/synthetic-im1-t1_2000
+        --image-index 0  --image-index 1 --image-index 2 --image-index 3 --image-index 4 \
+        --image-index 5 --image-index 6\
+        --output-dir results/canvas_policy_glimpses/synthetic-im7-t1_1000
 """
 
 from __future__ import annotations

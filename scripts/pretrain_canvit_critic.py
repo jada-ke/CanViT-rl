@@ -1,11 +1,30 @@
 """
-Train continuous SAC critics from k-candidate CE-improvement oracle labels.
+Train continuous SAC critics from k-candidate relative CE-gain oracle labels.
 
 Usage:
     uv run python scripts/pretrain_canvit_critic.py --batches 100 --max-samples 1 --batch-size 1 --t 1 --k 16 \
         --test-images 8 --checkpoint-dir checkpoints/canvit_critic --experiment-name critic-im1-k16-t1 \
         --comet-log-interval 10 --max-history 2
     uv run python scripts/pretrain_canvit_critic.py --optuna-trials 20 --batches 50
+
+    uv run python scripts/pretrain_canvit_critic.py \
+        --state-mode canvas \
+        --dataset synthetic_segmentation \
+        --dataset-format synthetic \
+        --comet-log-interval 50 \
+        --split training \
+        --eval-split training \
+        --max-samples 7 \
+        --eval-samples 7 \
+        --test-images 7 \
+        --batches 2000 \
+        --batch-size 4 \
+        --t 1 \
+        --k 32 \
+        --min-scale 0.25 \
+        --rollout-policy best \
+        --checkpoint-dir checkpoints/canvit_critic/canvas_synthetic_im7_t1_k32 \
+        --experiment-name canvas-critic-synthetic-im7-t1-k32
 """
 
 from __future__ import annotations
@@ -37,9 +56,12 @@ from canvit_specialize.datasets.ade20k import (
     IGNORE_LABEL,
     make_val_transforms,
 )
+from PIL import Image
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
+from canvit_rl.ade_labels import remap_ade_mask_labels
+from canvit_rl.canvas_state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import (
     _index_state_batch,
@@ -47,7 +69,7 @@ from canvit_rl.greedy import (
     _repeat_state_chunks,
     _segmentation_cross_entropy_losses,
 )
-from canvit_rl.sac_models import ViewpointHistoryCritic
+from canvit_rl.sac_models import CanvasStateCritic, ViewpointHistoryCritic
 
 
 def _sync_for_timing(device: torch.device) -> None:
@@ -174,6 +196,113 @@ def _limit_dataset(dataset, max_samples: int | None, *, offset: int = 0):
     return torch.utils.data.Subset(dataset, range(start, stop))
 
 
+class SyntheticSegmentationDataset(torch.utils.data.Dataset):
+    """Split-aware folder dataset for ADE-embedded synthetic segmentation."""
+
+    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        split: str,
+        scene_size_px: int,
+        img_transform,
+    ) -> None:
+        split_image_dir = root / "images" / split
+        split_mask_dir = root / "masks" / split
+        image_dir = split_image_dir if split_image_dir.is_dir() else root / "images"
+        mask_dir = split_mask_dir if split_mask_dir.is_dir() else root / "masks"
+        if not image_dir.is_dir():
+            raise FileNotFoundError(f"Synthetic image directory not found: {image_dir}")
+        if not mask_dir.is_dir():
+            raise FileNotFoundError(f"Synthetic mask directory not found: {mask_dir}")
+        self.images = sorted(
+            path
+            for path in image_dir.iterdir()
+            if path.suffix.lower() in self.IMAGE_EXTENSIONS
+        )
+        if not self.images:
+            raise ValueError(f"No synthetic images found in {image_dir}")
+        mask_by_stem = {
+            path.stem: path
+            for path in mask_dir.iterdir()
+            if path.suffix.lower() in self.IMAGE_EXTENSIONS
+        }
+        missing = [path.name for path in self.images if path.stem not in mask_by_stem]
+        if missing:
+            raise ValueError(
+                "Missing synthetic masks with matching stems for: "
+                + ", ".join(missing[:10])
+            )
+        self.masks = [mask_by_stem[path.stem] for path in self.images]
+        self.scene_size_px = scene_size_px
+        self.img_transform = img_transform
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        image = Image.open(self.images[index]).convert("RGB")
+        mask = Image.open(self.masks[index]).convert("L")
+        image_tensor = self.img_transform(image)
+        resample_nearest = getattr(Image, "Resampling", Image).NEAREST
+        mask = mask.resize(
+            (self.scene_size_px, self.scene_size_px),
+            resample=resample_nearest,
+        )
+        # Fixed by Codex on 2026-06-25
+        # Problem: Critic pretraining needed to consume the same ADE-embedded
+        # synthetic split layout as Canvas SAC without treating 255 padding as
+        # a real class.
+        # Solution: read images/<split> and masks/<split> when present, and
+        # keep zero-based ADE labels plus IGNORE_LABEL=255.
+        # Result: Image-dependent and image-independent critic pretraining can
+        # share the synthetic dataset root.
+        mask_tensor = torch.from_numpy(
+            remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
+        )
+        return image_tensor, mask_tensor
+
+
+def _build_segmentation_dataset(
+    *,
+    args: argparse.Namespace,
+    cfg: CanViTEnvConfig,
+    split: str,
+    img_tf,
+    mask_tf,
+):
+    """Build ADE20K or split-aware synthetic segmentation data."""
+    dataset_root = Path(args.dataset)
+    split_image_dir = dataset_root / "images" / split
+    split_mask_dir = dataset_root / "masks" / split
+    inferred_synthetic = (
+        (split_image_dir.is_dir() and split_mask_dir.is_dir())
+        or ((dataset_root / "images").is_dir() and (dataset_root / "masks").is_dir())
+    )
+    dataset_format = (
+        "synthetic"
+        if args.dataset_format == "auto" and inferred_synthetic
+        else "ade20k"
+        if args.dataset_format == "auto"
+        else args.dataset_format
+    )
+    if dataset_format == "synthetic":
+        return SyntheticSegmentationDataset(
+            root=dataset_root,
+            split=split,
+            scene_size_px=cfg.scene_size_px,
+            img_transform=img_tf,
+        )
+    return ADE20kDataset(
+        root=dataset_root,
+        split=split,
+        img_transform=img_tf,
+        mask_transform=mask_tf,
+    )
+
+
 def _checkpoint_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     """Return latest/best checkpoint paths inside the configured directory."""
     return args.checkpoint_dir / "latest.pt", args.checkpoint_dir / "best.pt"
@@ -182,8 +311,8 @@ def _checkpoint_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 def _save_checkpoint(
     *,
     path: Path,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
+    q1: torch.nn.Module,
+    q2: torch.nn.Module,
     opt: torch.optim.Optimizer,
     args: argparse.Namespace,
     batch: int,
@@ -194,6 +323,11 @@ def _save_checkpoint(
 ) -> None:
     """Save critic training state for resume/eval."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    state_representation = (
+        "current_canvas_layernorm_with_viewpoint_history"
+        if args.state_mode == "canvas"
+        else "viewpoint_history"
+    )
     torch.save(
         {
             "q1": q1.state_dict(),
@@ -205,15 +339,20 @@ def _save_checkpoint(
             "n_labels": n_labels,
             "metric": metric,
             "selection_metric": "critic/top1_match",
+            "state_mode": args.state_mode,
+            "state_representation": state_representation,
+            "canvas_feature_dim": getattr(args, "_canvas_feature_dim", None),
             "metadata": {
                 "probe_repo": probe_repo,
                 "model_repo": cfg.checkpoint,
                 "canvas_grid_size": cfg.canvas_grid_size,
                 "glimpse_size_px": cfg.glimpse_size_px,
                 "n_labels": n_labels,
-                "target": "gamma0_ce_reduction",
+                "target": "relative_ce_reduction",
                 "gamma": 0.0,
-                "state_representation": "viewpoint_history",
+                "state_mode": args.state_mode,
+                "state_representation": state_representation,
+                "canvas_feature_dim": getattr(args, "_canvas_feature_dim", None),
             },
         },
         path,
@@ -223,8 +362,8 @@ def _save_checkpoint(
 def _load_resume_checkpoint(
     *,
     path: Path,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
+    q1: torch.nn.Module,
+    q2: torch.nn.Module,
     opt: torch.optim.Optimizer,
 ) -> tuple[int, int]:
     """Load critic training state and return next batch plus label count."""
@@ -243,8 +382,18 @@ def _load_resume_checkpoint(
 def _build_critics(
     args: argparse.Namespace,
     device: torch.device,
-) -> tuple[ViewpointHistoryCritic, ViewpointHistoryCritic]:
-    """Construct twin Q(history, action) critics for global-prior validation."""
+) -> tuple[torch.nn.Module, torch.nn.Module]:
+    """Construct twin critics for image-independent or canvas-state labels."""
+    if args.state_mode == "canvas":
+        kwargs = dict(
+            canvas_feature_dim=args._canvas_feature_dim,
+            d_model=args.d_model,
+            rff_dim=args.rff_dim,
+            rff_seed=args.rff_seed,
+        )
+        q1 = CanvasStateCritic(**kwargs).to(device)
+        q2 = CanvasStateCritic(**kwargs).to(device)
+        return q1, q2
     kwargs = dict(
         d_model=args.d_model,
         max_steps=args.max_history,
@@ -258,8 +407,8 @@ def _build_critics(
 
 def _collect_state_metrics(
     *,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
+    q1: torch.nn.Module,
+    q2: torch.nn.Module,
     batch: dict[str, torch.Tensor],
     action_batch: torch.Tensor,
     reward_batch: torch.Tensor,
@@ -319,7 +468,7 @@ def _sample_candidates(
     current_ce: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[float, Viewpoint, Any, float]]]:
-    """Generate K actions and CE-reduction labels from the same current state."""
+    """Generate K actions and relative CE-gain labels from one current state."""
     candidates = random_viewpoints(
         batch_size=1,
         device=device,
@@ -353,7 +502,19 @@ def _sample_candidates(
             mask=candidate_masks,
             batch_size=args.k,
         )
-        rewards = torch.as_tensor(current_ce, device=device) - ce_after
+        current_ce_tensor = torch.as_tensor(
+            current_ce,
+            device=device,
+            dtype=ce_after.dtype,
+        )
+        # Fixed by Codex on 2026-06-25
+        # Problem: Canvas SAC trains on normalized relative CE reduction, but
+        # critic pretraining used raw CE deltas.
+        # Solution: make the supervised critic target match SAC exactly:
+        # (CE_before - CE_after) / CE_before.
+        # Result: Pretrained critics are calibrated to the same reward scale
+        # used by train_canvas_sac.py.
+        rewards = (current_ce_tensor - ce_after) / current_ce_tensor.clamp_min(1e-6)
         actions = _viewpoint_to_action(candidate_vp, min_scale=args.min_scale)
 
         records = []
@@ -392,7 +553,7 @@ def _sample_candidate_batch(
     list[list[tuple[float, Viewpoint, int, float]]],
     Any,
 ]:
-    """Generate B*K CE-reduction labels with one batched CanViT forward."""
+    """Generate B*K relative CE-gain labels with one batched CanViT forward."""
     batch_size = int(images.shape[0])
     candidates = random_viewpoints(
         batch_size=batch_size,
@@ -427,7 +588,10 @@ def _sample_candidate_batch(
             mask=candidate_masks,
             batch_size=batch_size * args.k,
         ).view(args.k, batch_size)
-        rewards_by_candidate = current_ce.to(dtype=ce_after.dtype)[None, :] - ce_after
+        current_ce_expanded = current_ce.to(dtype=ce_after.dtype)[None, :]
+        rewards_by_candidate = (
+            current_ce_expanded - ce_after
+        ) / current_ce_expanded.clamp_min(1e-6)
         candidate_actions = _viewpoint_to_action(
             candidate_vp,
             min_scale=args.min_scale,
@@ -486,8 +650,8 @@ def _sample_candidate_batch(
 
 def _evaluate_once(
     *,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
+    q1: torch.nn.Module,
+    q2: torch.nn.Module,
     eval_iter,
     eval_loader: DataLoader,
     model,
@@ -496,7 +660,7 @@ def _evaluate_once(
     args: argparse.Namespace,
     device: torch.device,
 ) -> tuple[dict[str, float], Any]:
-    """Sample one held-out image and evaluate ranking on CE-improvement labels."""
+    """Sample one held-out image and evaluate ranking on relative CE-gain labels."""
     try:
         image, mask = next(eval_iter)
     except StopIteration:
@@ -530,6 +694,12 @@ def _evaluate_once(
             .cpu()
             .item()
         )
+        if args.state_mode == "canvas":
+            canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
     coords, lengths = _append_history(
         coords=coords,
         lengths=lengths,
@@ -537,6 +707,8 @@ def _evaluate_once(
         step=0,
     )
     batch = {"coords": coords, "lengths": lengths}
+    if args.state_mode == "canvas":
+        batch["canvas"] = canvas_summary
     actions, rewards, _ = _sample_candidates(
         image=image,
         mask=mask,
@@ -568,8 +740,8 @@ def _evaluate_once(
 
 def _evaluate_many(
     *,
-    q1: ViewpointHistoryCritic,
-    q2: ViewpointHistoryCritic,
+    q1: torch.nn.Module,
+    q2: torch.nn.Module,
     eval_iter,
     eval_loader: DataLoader,
     model,
@@ -627,24 +799,24 @@ def train_once(
     device = get_device()
     cfg = CanViTEnvConfig()
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
-    train_dataset = ADE20kDataset(
-        root=Path(args.dataset),
+    train_dataset = _build_segmentation_dataset(
+        args=args,
+        cfg=cfg,
         split=args.split,
-        img_transform=img_tf,
-        mask_transform=mask_tf,
+        img_tf=img_tf,
+        mask_tf=mask_tf,
     )
     train_dataset = _limit_dataset(train_dataset, args.max_samples)
-    eval_dataset = ADE20kDataset(
-        root=Path(args.dataset),
+    eval_dataset = _build_segmentation_dataset(
+        args=args,
+        cfg=cfg,
         split=args.eval_split,
-        img_transform=img_tf,
-        mask_transform=mask_tf,
+        img_tf=img_tf,
+        mask_tf=mask_tf,
     )
-    eval_offset = args.max_samples if args.eval_split == args.split else 0
     eval_dataset = _limit_dataset(
         eval_dataset,
         args.eval_samples,
-        offset=eval_offset,
     )
     if len(train_dataset) == 0 or len(eval_dataset) == 0:
         raise ValueError("Train and eval datasets must each contain at least one image.")
@@ -682,6 +854,19 @@ def train_once(
     for param in probe.parameters():
         param.requires_grad_(False)
 
+    if args.state_mode == "canvas":
+        with torch.inference_mode():
+            dummy_state = model.init_state(
+                batch_size=1,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+            args._canvas_feature_dim = canvas_layernorm_spatial(
+                model=model,
+                state=dummy_state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            ).shape[1]
+    else:
+        args._canvas_feature_dim = None
     q1, q2 = _build_critics(args, device)
     latest_path, best_path = _checkpoint_paths(args)
     opt = torch.optim.AdamW(
@@ -757,6 +942,12 @@ def train_once(
                 mask=masks,
                 batch_size=actual_batch_size,
             )
+            if args.state_mode == "canvas":
+                canvas_summary = canvas_layernorm_spatial(
+                    model=model,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                ).clone().detach()
         coords, lengths = _append_history(
             coords=coords,
             lengths=lengths,
@@ -768,6 +959,8 @@ def train_once(
         batch_loss = 0.0
         for step_idx in range(args.t):
             history_batch = {"coords": coords, "lengths": lengths}
+            if args.state_mode == "canvas":
+                history_batch["canvas"] = canvas_summary
             action_batch, reward_batch, step_records, candidate_state = (
                 _sample_candidate_batch(
                     images=images,
@@ -822,6 +1015,8 @@ def train_once(
                     "coords": coords[sample_idx : sample_idx + 1],
                     "lengths": lengths[sample_idx : sample_idx + 1],
                 }
+                if args.state_mode == "canvas":
+                    state_batch["canvas"] = canvas_summary[sample_idx : sample_idx + 1]
                 state_metrics = _collect_state_metrics(
                     q1=q1,
                     q2=q2,
@@ -854,6 +1049,12 @@ def train_once(
 
             next_index_tensor = torch.as_tensor(next_indices, device=device)
             state = _index_state_batch(candidate_state, next_index_tensor)
+            if args.state_mode == "canvas":
+                canvas_summary = canvas_layernorm_spatial(
+                    model=model,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                ).clone().detach()
             next_vp = _make_viewpoint_like(
                 next_vps[0],
                 centers=torch.cat([vp.centers for vp in next_vps], dim=0),
@@ -1052,7 +1253,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t", type=int, default=5)
     parser.add_argument("--k", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="datasets/ADE20k",
+        help=(
+            "ADE20K root, or synthetic root containing images/<split> and "
+            "masks/<split> folders."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-format",
+        choices=["auto", "ade20k", "synthetic"],
+        default="auto",
+        help=(
+            "auto detects images/<split>/masks/<split> or flat images/ and "
+            "masks/ synthetic roots."
+        ),
+    )
     parser.add_argument(
         "--max-samples",
         type=int,
@@ -1083,6 +1301,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--probe-repo", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--state-mode",
+        choices=["viewpoint", "canvas"],
+        default="viewpoint",
+        help=(
+            "viewpoint trains the original image-independent history critic; "
+            "canvas trains the image-dependent CanvasStateCritic used by "
+            "train_canvas_sac.py."
+        ),
+    )
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument(
         "--rff-dim",
@@ -1130,7 +1358,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--no-comet", action="store_true")
-    parser.add_argument("--comet-project", type=str, default="sac-critic-ce")
+    parser.add_argument("--comet-project", type=str, default="canvas-critic")
     parser.add_argument("--comet-workspace", type=str, default=None)
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--comet-tags", type=str, default="critic-ce-greedy")

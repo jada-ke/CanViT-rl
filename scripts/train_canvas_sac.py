@@ -10,11 +10,11 @@ This is the canvas-state analogue of scripts/train_viewpoint_sac.py:
 Example:
     python scripts/train_canvas_sac.py \
     --dataset synthetic_segmentation \
-    --batches 2000 --batch-size 1 --max-samples 1 --t 1 \
-    --eval-images 1 --eval-batch-size 1 --eval-split training\
+    --batches 1000 --batch-size 7 --max-samples 7 --t 1 \
+    --eval-images 3 --eval-batch-size 3 --eval-split validation\
     --replay-batch-size 4 \
-    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1_2000 \
-    --experiment-name synthetic-im1-t1_2000
+    --checkpoint-dir checkpoints/canvas_sac/synthetic-im7-t1_1000 \
+    --experiment-name synthetic-im7-t1_1000
 
     uv run python scripts/train_canvas_sac.py \
         --dataset synthetic_segmentation \
@@ -23,6 +23,15 @@ Example:
         --replay-batch-size 8 \
         --checkpoint-dir checkpoints/canvas_sac/synthetic-ade-im1-t1 \
         --experiment-name synthetic-ade-im1-t2
+
+    python scripts/train_canvas_sac.py \
+        --dataset synthetic_segmentation \
+        --batches 3000 --batch-size 4 --max-samples 50 --t 1 \
+        --eval-images 10 --eval-batch-size 2 --eval-split validation \
+        --replay-batch-size 32 \
+        --updates-per-batch 4 \
+        --checkpoint-dir checkpoints/canvas_sac/synthetic-im50-t1 \
+        --experiment-name synthetic-im50-t1
 """
 
 from __future__ import annotations
@@ -1507,8 +1516,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-size", type=int, default=1000)
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
-    parser.add_argument("--eval-interval", type=int, default=25)
-    parser.add_argument("--comet-log-interval", type=int, default=25)
+    parser.add_argument("--eval-interval", type=int, default=200)
+    parser.add_argument("--comet-log-interval", type=int, default=200)
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument(
         "--reward-map-images",

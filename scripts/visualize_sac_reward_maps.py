@@ -25,15 +25,16 @@ Example:
         --output-dir results/sac_canvas_reward_maps
 
     uv run python scripts/visualize_sac_reward_maps.py \
-        --checkpoint checkpoints/canvas_sac/synthetic-im1-t1_2000/best.pt \
+        --checkpoint checkpoints/canvas_sac/synthetic-im7-t1_1000/best.pt \
         --dataset synthetic_segmentation \
         --split training \
-        --image-index 0 \
+        --image-index 0 --image-index 1 --image-index 2 --image-index 3 --image-index 4\
+        --image-index 5 --image-index 6 \
         --state-steps 0 \
         --grid-size 21 \
         --scales 0.25,0.50 \
         --chunk-size 16 \
-        --output-dir results/sac_canvas_reward_maps/synthetic-im1-t1_2000
+        --output-dir results/sac_canvas_reward_maps/synthetic-im7-t1_1000
 """
 
 from __future__ import annotations
