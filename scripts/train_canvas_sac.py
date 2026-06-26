@@ -32,6 +32,15 @@ Example:
         --updates-per-batch 4 \
         --checkpoint-dir checkpoints/canvas_sac/synthetic-im50-t1 \
         --experiment-name synthetic-im50-t1
+
+    uv run python scripts/train_canvas_sac.py \
+        --dataset synthetic_segmentation \
+        --batches 100 \
+        --batch-size 1 \
+        --eval-images 3 \
+        --eval-batch-size 1 \
+        --optuna-trials 5 \
+        --no-comet
 """
 
 from __future__ import annotations
@@ -93,6 +102,13 @@ try:
     from visualize_sac_reward_maps import visualize_reward_maps_for_indices
 except ImportError:
     from scripts.visualize_sac_reward_maps import visualize_reward_maps_for_indices
+try:
+    from canvas_sac_optuna import add_canvas_sac_optuna_args, run_canvas_sac_optuna
+except ImportError:
+    from scripts.canvas_sac_optuna import (
+        add_canvas_sac_optuna_args,
+        run_canvas_sac_optuna,
+    )
 
 EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
@@ -749,6 +765,97 @@ def _load_resume(
     )
 
 
+def _checkpoint_module_state(
+    checkpoint: object,
+    key: str,
+    *,
+    path: Path,
+) -> dict[str, torch.Tensor]:
+    """Extract either a named module state dict or a bare state dict."""
+    if isinstance(checkpoint, dict) and key in checkpoint:
+        state = checkpoint[key]
+    else:
+        state = checkpoint
+    if not isinstance(state, dict):
+        raise ValueError(f"Expected a state dict for {key} in {path}.")
+    return state
+
+
+def _load_pretrained_initializers(
+    *,
+    args: argparse.Namespace,
+    actor: CanvasStateActor,
+    q1: CanvasStateCritic,
+    q2: CanvasStateCritic,
+    target_q1: CanvasStateCritic,
+    target_q2: CanvasStateCritic,
+) -> None:
+    """Initialize SAC modules from pretrained actor/critic checkpoints.
+
+    This deliberately avoids optimizer, alpha, replay, and batch counters so
+    pretrained BC/critic weights can seed a fresh SAC run without pretending to
+    be a full training resume.
+    """
+    if args.resume is not None:
+        if (
+            args.init_actor_checkpoint is not None
+            or args.init_critic_checkpoint is not None
+        ):
+            raise ValueError(
+                "--resume cannot be combined with --init-actor-checkpoint or "
+                "--init-critic-checkpoint; resume already restores all SAC state."
+            )
+        return
+
+    if args.init_actor_checkpoint is not None:
+        checkpoint = torch.load(
+            args.init_actor_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        # Fixed by Codex on 2026-06-26
+        # Problem: Canvas SAC could only resume full SAC checkpoints, so a
+        # behavior-cloned CanvasStateActor could not seed a fresh RL run.
+        # Solution: load just the actor module state, accepting either latest.pt
+        # payloads with an "actor" key or bare actor_final.pt state dicts.
+        # Result: Actor BC pretraining can initialize SAC while critics,
+        # optimizers, alpha, and replay start clean.
+        actor.load_state_dict(
+            _checkpoint_module_state(
+                checkpoint,
+                "actor",
+                path=args.init_actor_checkpoint,
+            )
+        )
+        print(f"Initialized canvas SAC actor from {args.init_actor_checkpoint}")
+
+    if args.init_critic_checkpoint is not None:
+        checkpoint = torch.load(
+            args.init_critic_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                "--init-critic-checkpoint expects a dict checkpoint with q1/q2 keys."
+            )
+        if "q1" not in checkpoint:
+            raise ValueError(
+                f"Expected q1 in critic checkpoint: {args.init_critic_checkpoint}"
+            )
+        q1.load_state_dict(checkpoint["q1"])
+        q2.load_state_dict(checkpoint.get("q2", checkpoint["q1"]))
+        # Fixed by Codex on 2026-06-26
+        # Problem: Loading pretrained online critics without syncing target
+        # critics would make the first SAC targets come from stale random
+        # networks.
+        # Solution: copy the initialized q1/q2 weights into target_q1/target_q2.
+        # Result: Fresh SAC runs start with coherent online and target critics.
+        target_q1.load_state_dict(q1.state_dict())
+        target_q2.load_state_dict(q2.state_dict())
+        print(f"Initialized canvas SAC critics from {args.init_critic_checkpoint}")
+
+
 def _eval_canvas_sac_batch(
     *,
     actor: CanvasStateActor,
@@ -918,6 +1025,15 @@ def evaluate(
     egc2f_ce = ce_sums["egc2f_final"] / max(n_images, 1)
     sac_initial_ce = ce_sums["sac_initial"] / max(n_images, 1)
     sac_ce = ce_sums["sac_final"] / max(n_images, 1)
+    ce_gain = sac_initial_ce - sac_ce
+    # Problem: SAC trains on relative CE reduction, but validation only exposed
+    # absolute CE-point improvement, making it hard to compare eval against the
+    # training reward scale.
+    # Solution: keep the existing raw CE gain for compatibility and add a
+    # denominator-safe normalized counterpart.
+    # Result: Comet/Optuna consumers can inspect both absolute and reward-scale
+    # validation progress without changing existing checkpoint selection.
+    relative_ce_gain = ce_gain / max(sac_initial_ce, 1e-12)
     metrics = {
         "eval/random_miou": random_miou,
         "eval/egc2f_miou": egc2f_miou,
@@ -928,7 +1044,8 @@ def evaluate(
         "eval/final_miou": sac_miou,
         "eval/final_ce": sac_ce,
         "eval/miou_gain": sac_miou - random_miou,
-        "eval/ce_gain": sac_initial_ce - sac_ce,
+        "eval/ce_gain": ce_gain,
+        "eval/relative_ce_gain": relative_ce_gain,
         "eval/random_ce_gain": ce_sums["random_initial"] / max(n_images, 1) - random_ce,
         "eval/egc2f_ce_gain": ce_sums["egc2f_initial"] / max(n_images, 1) - egc2f_ce,
         "eval/sac_vs_random": sac_miou - random_miou,
@@ -944,6 +1061,7 @@ def evaluate(
             "final_ce": metrics["eval/final_ce"],
             "miou_gain": metrics["eval/miou_gain"],
             "ce_gain": metrics["eval/ce_gain"],
+            "relative_ce_gain": metrics["eval/relative_ce_gain"],
             "sac_vs_random": metrics["eval/sac_vs_random"],
             "sac_vs_egc2f": metrics["eval/sac_vs_egc2f"],
             "viewpoint_entropy": metrics["eval/sac_viewpoint_entropy"],
@@ -1115,6 +1233,14 @@ def train_once(args: argparse.Namespace) -> float:
         target_q1=target_q1,
         target_q2=target_q2,
         agent=agent,
+    )
+    _load_pretrained_initializers(
+        args=args,
+        actor=actor,
+        q1=q1,
+        q2=q2,
+        target_q1=target_q1,
+        target_q2=target_q2,
     )
     replay = CanvasReplayBuffer(
         capacity=args.buffer_size,
@@ -1516,8 +1642,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--buffer-size", type=int, default=1000)
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
-    parser.add_argument("--eval-interval", type=int, default=200)
-    parser.add_argument("--comet-log-interval", type=int, default=200)
+    parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument("--comet-log-interval", type=int, default=20)
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument(
         "--reward-map-images",
@@ -1529,14 +1655,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--reward-map-grid-size", type=int, default=11)
-    parser.add_argument("--reward-map-scales", type=str, default="0.10,0.25,0.50")
-    parser.add_argument("--reward-map-chunk-size", type=int, default=32)
+    parser.add_argument("--reward-map-scales", type=str, default="0.25,0.50")
+    parser.add_argument("--reward-map-chunk-size", type=int, default=16)
     parser.add_argument(
         "--reward-map-output-dir",
         type=Path,
         default=Path("results/sac_canvas_reward_maps"),
     )
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--init-actor-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional pretrained CanvasStateActor checkpoint for a fresh SAC "
+            "run. Accepts a latest.pt payload with an actor key or a bare "
+            "actor_final.pt state dict."
+        ),
+    )
+    parser.add_argument(
+        "--init-critic-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional pretrained CanvasStateCritic checkpoint for a fresh SAC "
+            "run. Expects q1 and optional q2 keys; target critics are synced."
+        ),
+    )
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
@@ -1547,11 +1692,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comet-project", type=str, default="canvas-sac")
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--comet-tags", type=str, default="canvas-sac")
-    return parser.parse_args()
+    # Problem: Canvas SAC previously required handwritten repeated commands to
+    # sweep SAC/model hyperparameters.
+    # Solution: register Optuna control flags from scripts/canvas_sac_optuna.py
+    # while this parser keeps owning all normal trainer setup.
+    # Result: the same CLI can run one training job or an isolated study.
+    add_canvas_sac_optuna_args(parser)
+    args = parser.parse_args()
+    if args.resume is not None:
+        if (
+            args.init_actor_checkpoint is not None
+            or args.init_critic_checkpoint is not None
+        ):
+            raise ValueError(
+                "--resume cannot be combined with --init-actor-checkpoint or "
+                "--init-critic-checkpoint."
+            )
+    return args
 
 
 def main() -> None:
-    train_once(parse_args())
+    args = parse_args()
+    if args.optuna_trials:
+        run_canvas_sac_optuna(args, train_once)
+        return
+    train_once(args)
 
 
 if __name__ == "__main__":

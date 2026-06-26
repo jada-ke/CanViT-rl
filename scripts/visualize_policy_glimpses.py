@@ -27,7 +27,7 @@ Usage:
         --split training \
         --output-dir results/canvas_policy_glimpses
 
-  uv run python scripts/visualize_policy_glimpses.py \
+    uv run python scripts/visualize_policy_glimpses.py \
         --policy canvas-sac  \
         --policy-checkpoint checkpoints/canvas_sac/synthetic-im7-t1_1000/best.pt \
         --dataset synthetic_segmentation  --split training\
@@ -35,6 +35,15 @@ Usage:
         --image-index 0  --image-index 1 --image-index 2 --image-index 3 --image-index 4 \
         --image-index 5 --image-index 6\
         --output-dir results/canvas_policy_glimpses/synthetic-im7-t1_1000
+    
+    uv run python scripts/visualize_policy_glimpses.py \
+        --policy canvas-bc \
+        --policy-checkpoint checkpoints/canvas_bc/synthetic_im7_t1_k32_5000/latest.pt \
+        --dataset synthetic_segmentation \
+        --split validation \
+        --t 1 \
+        --image-index 0,1,2 \
+        --output-dir results/canvas_bc/synthetic_im7_t1_k32_5000
 """
 
 from __future__ import annotations
@@ -585,28 +594,48 @@ def _build_learned_actor_from_checkpoint(
         if isinstance(payload, dict)
         else "viewpoint_history"
     )
-    if state_representation == "current_canvas_layernorm_with_viewpoint_history":
+    canvas_state_representations = {
+        "current_canvas",
+        "current_canvas_layernorm_with_viewpoint_history",
+    }
+    if state_representation in canvas_state_representations:
         if not isinstance(payload, dict) or "actor" not in payload:
-            raise ValueError(f"Expected canvas SAC checkpoint with actor: {checkpoint}")
+            raise ValueError(f"Expected canvas actor checkpoint with actor: {checkpoint}")
         # Fixed by Codex on 2026-06-23
+        # Fixed by Codex on 2026-06-26
         # Problem: policy-glimpse visualization only loaded image-independent
-        # viewpoint actors, so canvas SAC checkpoints could not be rolled out.
-        # Solution: detect train_canvas_sac.py checkpoint metadata and rebuild
-        # CanvasStateActor with the saved canvas feature dimension.
-        # Result: Image-dependent SAC policies can be visualized with the same
-        # command-line tool as greedy, EG-C2F, and viewpoint-history policies.
+        # viewpoint actors, and later only recognized Canvas SAC metadata, so
+        # current_canvas BC checkpoints still fell through to the wrong actor.
+        # Solution: detect both Canvas SAC and canvas-state BC metadata strings
+        # and rebuild CanvasStateActor from top-level or saved-args feature dim.
+        # Result: Image-dependent SAC and BC policies share the canvas rollout
+        # path in the glimpse visualizer.
         d_model = int(_checkpoint_arg(checkpoint_args, "d-model", args.d_model))
         rff_dim = int(_checkpoint_arg(checkpoint_args, "rff-dim", args.rff_dim))
         rff_seed = int(_checkpoint_arg(checkpoint_args, "rff-seed", args.rff_seed))
         max_history = int(_checkpoint_arg(checkpoint_args, "max-history", args.t + 1))
+        canvas_feature_dim = payload.get(
+            "canvas_feature_dim",
+            checkpoint_args.get("canvas_feature_dim"),
+        )
+        if canvas_feature_dim is None:
+            raise ValueError(
+                "Canvas actor checkpoint is missing canvas_feature_dim; use "
+                "latest.pt from train_viewpoint_bc.py/train_canvas_sac.py rather "
+                "than a bare actor_final.pt."
+            )
         actor = CanvasStateActor(
-            canvas_feature_dim=int(payload["canvas_feature_dim"]),
+            canvas_feature_dim=int(canvas_feature_dim),
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
         ).to(device).eval()
         actor.load_state_dict(payload["actor"])
-        policy_kind = "canvas-sac"
+        policy_kind = (
+            "canvas-sac"
+            if state_representation == "current_canvas_layernorm_with_viewpoint_history"
+            else "canvas-bc"
+        )
     else:
         actor, checkpoint_args = _build_viewpoint_actor_from_checkpoint(
             checkpoint=checkpoint,
@@ -847,11 +876,36 @@ def _run_canvas_sac_episode(
     }
 
 
+def _parse_image_indices(values: list[str] | None) -> list[int] | None:
+    """Parse repeated and comma-separated --image-index values."""
+    if values is None:
+        return None
+    indices: list[int] = []
+    for value in values:
+        # Fixed by Codex on 2026-06-26
+        # Problem: policy glimpse commands needed one --image-index flag per
+        # image, making synthetic train-set visual sweeps unnecessarily noisy.
+        # Solution: accept comma-separated values while preserving repeated
+        # flag compatibility.
+        # Result: commands can use --image-index 0,1,2 or repeated flags.
+        indices.extend(int(item) for item in value.split(",") if item.strip())
+    if not indices:
+        raise ValueError("--image-index must include at least one integer.")
+    return indices
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--policy",
-        choices=["k-greedy", "eg-c2f", "viewpoint-bc", "viewpoint-sac", "canvas-sac"],
+        choices=[
+            "k-greedy",
+            "eg-c2f",
+            "viewpoint-bc",
+            "viewpoint-sac",
+            "canvas-bc",
+            "canvas-sac",
+        ],
         default="k-greedy",
         help="Policy rollout to visualize.",
     )
@@ -860,13 +914,23 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Checkpoint for --policy viewpoint-bc, viewpoint-sac, or canvas-sac."
+            "Checkpoint for learned policies: viewpoint-bc, viewpoint-sac, "
+            "canvas-bc, or canvas-sac."
         ),
     )
     parser.add_argument("--t", type=int, default=5, help="Timesteps per episode")
     parser.add_argument("--k", type=int, default=50, help="Candidates per greedy step")
     parser.add_argument("--episodes", type=int, default=3)
-    parser.add_argument("--image-index", type=int, action="append", default=None)
+    parser.add_argument(
+        "--image-index",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Image index to visualize. May be repeated, or passed as a "
+            "comma-separated list such as 0,1,2,3."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--dataset",
@@ -910,7 +974,7 @@ def main() -> None:
     if args.policy != "k-greedy" and args.no_full_scene_start:
         raise ValueError("--no-full-scene-start only applies to --policy k-greedy.")
     if (
-        args.policy in {"viewpoint-bc", "viewpoint-sac", "canvas-sac"}
+        args.policy in {"viewpoint-bc", "viewpoint-sac", "canvas-bc", "canvas-sac"}
         and args.policy_checkpoint is None
     ):
         raise ValueError(
@@ -933,8 +997,9 @@ def main() -> None:
         img_tf=img_tf,
         mask_tf=mask_tf,
     )
-    if args.image_index is not None:
-        indices = args.image_index
+    parsed_indices = _parse_image_indices(args.image_index)
+    if parsed_indices is not None:
+        indices = parsed_indices
     else:
         indices = random.sample(range(len(dataset)), min(args.episodes, len(dataset)))
     print(f"Dataset: {len(dataset)} {args.split} images, visualizing {len(indices)}")
@@ -962,7 +1027,7 @@ def main() -> None:
     ckpt_min_scale = args.min_scale
     loaded_policy_kind = args.policy
     actor_max_history = args.t + 1
-    if args.policy in {"viewpoint-bc", "viewpoint-sac", "canvas-sac"}:
+    if args.policy in {"viewpoint-bc", "viewpoint-sac", "canvas-bc", "canvas-sac"}:
         assert args.policy_checkpoint is not None
         actor, checkpoint_args, loaded_policy_kind, actor_max_history = (
             _build_learned_actor_from_checkpoint(
@@ -971,20 +1036,26 @@ def main() -> None:
                 device=device,
             )
         )
+        canvas_policy_kinds = {"canvas-bc", "canvas-sac"}
         if args.policy == "canvas-sac" and loaded_policy_kind != "canvas-sac":
             raise ValueError(
                 "--policy canvas-sac requires a canvas SAC checkpoint from "
                 "scripts/train_canvas_sac.py."
             )
+        if args.policy == "canvas-bc" and loaded_policy_kind != "canvas-bc":
+            raise ValueError(
+                "--policy canvas-bc requires a current_canvas BC checkpoint from "
+                "scripts/train_viewpoint_bc.py."
+            )
         if (
             args.policy in {"viewpoint-bc", "viewpoint-sac"}
-            and loaded_policy_kind == "canvas-sac"
+            and loaded_policy_kind in canvas_policy_kinds
         ):
             raise ValueError(
-                f"--policy {args.policy} received a canvas SAC checkpoint; "
-                "use --policy canvas-sac."
+                f"--policy {args.policy} received a canvas checkpoint; "
+                "use --policy canvas-bc or --policy canvas-sac."
             )
-        if loaded_policy_kind != "canvas-sac":
+        if loaded_policy_kind not in canvas_policy_kinds:
             loaded_policy_kind = args.policy
         ckpt_t = int(_checkpoint_arg(checkpoint_args, "t", args.t))
         ckpt_min_scale = float(
@@ -1040,7 +1111,7 @@ def main() -> None:
                 title = f"EG-C2F idx={idx}"
             else:
                 assert actor is not None
-                if loaded_policy_kind == "canvas-sac":
+                if loaded_policy_kind in {"canvas-bc", "canvas-sac"}:
                     result = _run_canvas_sac_episode(
                         actor=actor,
                         model=model,
