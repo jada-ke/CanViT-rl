@@ -28,13 +28,22 @@ Example:
         --checkpoint checkpoints/canvas_sac/synthetic-im7-t1_1000/best.pt \
         --dataset synthetic_segmentation \
         --split training \
-        --image-index 0 --image-index 1 --image-index 2 --image-index 3 --image-index 4\
-        --image-index 5 --image-index 6 \
+        --image-index 0,1,2,3,4,5,6 \
         --state-steps 0 \
         --grid-size 21 \
         --scales 0.25,0.50 \
         --chunk-size 16 \
         --output-dir results/sac_canvas_reward_maps/synthetic-im7-t1_1000
+
+    uv run python scripts/visualize_sac_reward_maps.py \
+        --checkpoint checkpoints/canvas_critic/canvas_synthetic_im7_t1_k32_5000/best.pt \
+        --dataset synthetic_segmentation \
+        --split validation \
+        --image-index 0,1,2 \
+        --grid-size 21 \
+        --scales 0.25,0.50 \
+        --state-step 0 \
+        --output-dir results/canvas_critic_reward_maps
 """
 
 from __future__ import annotations
@@ -246,22 +255,31 @@ def _build_actor_and_critics(
     checkpoint: Path,
     device: torch.device,
 ) -> tuple[
-    torch.nn.Module,
+    torch.nn.Module | None,
     torch.nn.Module,
     torch.nn.Module,
     dict,
     str,
+    str,
 ]:
-    """Load actor and critics from a full SAC checkpoint."""
+    """Load actor and critics from a full SAC or critic-only checkpoint."""
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or "actor" not in payload or "q1" not in payload:
-        raise ValueError(f"Expected full SAC checkpoint with actor/q1/q2: {checkpoint}")
+    if not isinstance(payload, dict) or "q1" not in payload:
+        raise ValueError(f"Expected checkpoint with q1/q2 critic keys: {checkpoint}")
     saved_args = dict(payload.get("args", {}))
     d_model = int(saved_args.get("d_model", 256))
     max_history = int(saved_args.get("max_history", 16))
     rff_dim = int(saved_args.get("rff_dim", 128))
     rff_seed = int(saved_args.get("rff_seed", 42))
-    state_representation = str(payload.get("state_representation", "viewpoint_history"))
+    state_representation = str(
+        payload.get(
+            "state_representation",
+            payload.get("metadata", {}).get("state_representation", "viewpoint_history"),
+        )
+    )
+    target = str(
+        payload.get("target", payload.get("metadata", {}).get("target", "raw_ce_gain"))
+    )
     # Fixed by Codex on 2026-06-23
     # Problem: Canvas SAC checkpoints store CanvasStateActor/Critic weights,
     # but this visualizer always rebuilt viewpoint-history networks.
@@ -271,24 +289,33 @@ def _build_actor_and_critics(
     # Result: The same reward-map command can inspect both image-independent
     # viewpoint-history SAC and image-dependent canvas SAC checkpoints.
     if state_representation == "current_canvas_layernorm_with_viewpoint_history":
-        canvas_feature_dim = int(payload["canvas_feature_dim"])
+        canvas_feature_dim = int(
+            payload.get(
+                "canvas_feature_dim",
+                payload.get("metadata", {}).get("canvas_feature_dim"),
+            )
+        )
         kwargs = dict(
             canvas_feature_dim=canvas_feature_dim,
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
         )
-        actor = CanvasStateActor(**kwargs).to(device).eval()
+        actor = CanvasStateActor(**kwargs).to(device).eval() if "actor" in payload else None
         q1 = CanvasStateCritic(**kwargs).to(device).eval()
         q2 = CanvasStateCritic(**kwargs).to(device).eval()
         policy_kind = "canvas"
     else:
-        actor = ViewpointGaussianActor(
-            d_model=d_model,
-            max_steps=max_history,
-            rff_dim=rff_dim,
-            rff_seed=rff_seed,
-        ).to(device).eval()
+        actor = (
+            ViewpointGaussianActor(
+                d_model=d_model,
+                max_steps=max_history,
+                rff_dim=rff_dim,
+                rff_seed=rff_seed,
+            ).to(device).eval()
+            if "actor" in payload
+            else None
+        )
         critic_kwargs = dict(
             d_model=d_model,
             max_steps=max_history,
@@ -298,13 +325,14 @@ def _build_actor_and_critics(
         q1 = ViewpointHistoryCritic(**critic_kwargs).to(device).eval()
         q2 = ViewpointHistoryCritic(**critic_kwargs).to(device).eval()
         policy_kind = "viewpoint_history"
-    actor.load_state_dict(payload["actor"])
+    if actor is not None:
+        actor.load_state_dict(payload["actor"])
     q1.load_state_dict(payload["q1"])
     q2.load_state_dict(payload.get("q2", payload["q1"]))
-    for module in (actor, q1, q2):
+    for module in (q1, q2) if actor is None else (actor, q1, q2):
         for param in module.parameters():
             param.requires_grad_(False)
-    return actor, q1, q2, saved_args, policy_kind
+    return actor, q1, q2, saved_args, policy_kind, target
 
 
 def _candidate_grid(*, scale: float, grid_size: int, device: torch.device) -> Viewpoint:
@@ -326,6 +354,7 @@ def _evaluate_grid(
     lengths: torch.Tensor,
     canvas_summary: torch.Tensor | None,
     current_ce: torch.Tensor,
+    reward_target: str,
     q1: torch.nn.Module,
     q2: torch.nn.Module,
     model,
@@ -369,7 +398,18 @@ def _evaluate_grid(
                 mask=candidate_masks,
                 cfg=cfg,
             )
-            reward = current_ce.expand_as(ce_after) - ce_after
+            raw_gain = current_ce.expand_as(ce_after) - ce_after
+            if reward_target == "relative_ce_reduction":
+                # Fixed by Codex on 2026-06-25
+                # Problem: Critic pretraining now targets normalized CE gain,
+                # but reward-map plots compared Q against raw CE deltas.
+                # Solution: use the checkpoint's target metadata to plot the
+                # same true reward scale the critic was trained on.
+                # Result: Critic-only Q maps can be visually compared against
+                # matching relative CE-gain targets.
+                reward = raw_gain / current_ce.expand_as(ce_after).clamp_min(1e-6)
+            else:
+                reward = raw_gain
             history_batch = {
                 "coords": coords.repeat(repeats, 1, 1),
                 "lengths": lengths.repeat(repeats),
@@ -440,8 +480,17 @@ def _save_combined_reward_maps(
 
     for row_idx, row_data in enumerate(rows):
         image_np = _image_for_plot(row_data["image"])
-        actor_center = row_data["actor_vp"].centers[0].detach().cpu().numpy()
-        actor_scale = float(row_data["actor_vp"].scales[0].detach().cpu().item())
+        actor_vp = row_data.get("actor_vp")
+        actor_center = (
+            actor_vp.centers[0].detach().cpu().numpy()
+            if actor_vp is not None
+            else None
+        )
+        actor_scale = (
+            float(actor_vp.scales[0].detach().cpu().item())
+            if actor_vp is not None
+            else None
+        )
         _show_image_background(axes[row_idx, 0], image_np)
         axes[row_idx, 0].imshow(
             row_data["seg_rgb"],
@@ -469,7 +518,7 @@ def _save_combined_reward_maps(
                 alpha=0.58,
             )
             reward_ax.set_title(
-                f"scale={scale:.2f} true CE gain\nmax={np.nanmax(reward_map):+.4f}"
+                f"scale={scale:.2f} true reward\nmax={np.nanmax(reward_map):+.4f}"
             )
             reward_ax.set_xlabel("x center")
             reward_ax.set_ylabel("y center")
@@ -490,7 +539,7 @@ def _save_combined_reward_maps(
             q_ax.set_ylabel("y center")
             fig.colorbar(q_im, ax=q_ax, fraction=0.046, pad=0.04)
 
-            if abs(actor_scale - scale) <= 0.5 * max(scale, 1e-6):
+            if actor_scale is not None and abs(actor_scale - scale) <= 0.5 * max(scale, 1e-6):
                 for ax in (reward_ax, q_ax):
                     ax.scatter(
                         [actor_center[1]],
@@ -522,7 +571,7 @@ def _dataset_stem(dataset, index: int) -> str:
 
 def visualize_reward_maps_for_indices(
     *,
-    actor: torch.nn.Module,
+    actor: torch.nn.Module | None,
     q1: torch.nn.Module,
     q2: torch.nn.Module,
     dataset,
@@ -539,6 +588,7 @@ def visualize_reward_maps_for_indices(
     split_label: str,
     title_prefix: str,
     policy_kind: str = "viewpoint_history",
+    reward_target: str = "raw_ce_gain",
     max_history: int | None = None,
     state_step: int = 0,
     state_steps: list[int] | None = None,
@@ -546,8 +596,14 @@ def visualize_reward_maps_for_indices(
     """Generate reward/Q landscape figures using live SAC networks."""
     rows: list[dict] = []
     if max_history is None:
+        if actor is None:
+            raise ValueError("max_history is required when visualizing a critic-only checkpoint.")
         max_history = actor.max_steps
     state_steps = [state_step] if state_steps is None else state_steps
+    if actor is None and any(step != 0 for step in state_steps):
+        raise ValueError(
+            "Critic-only checkpoints have no actor to roll out; use --state-step 0."
+        )
     for step in state_steps:
         if step < 0:
             raise ValueError("--state-step/--state-steps must be non-negative.")
@@ -594,6 +650,8 @@ def visualize_reward_maps_for_indices(
                     cfg=cfg,
                 )
                 for rollout_step in range(1, current_state_step + 1):
+                    if actor is None:
+                        raise RuntimeError("Cannot roll out state steps without an actor.")
                     canvas_summary = None
                     actor_batch = {"coords": coords, "lengths": lengths}
                     if policy_kind == "canvas":
@@ -638,6 +696,7 @@ def visualize_reward_maps_for_indices(
                     cfg=cfg,
                 )
                 canvas_summary = None
+                actor_vp = None
                 actor_batch = {"coords": coords, "lengths": lengths}
                 if policy_kind == "canvas":
                     canvas_summary = canvas_layernorm_spatial(
@@ -646,8 +705,9 @@ def visualize_reward_maps_for_indices(
                         canvas_grid_size=cfg.canvas_grid_size,
                     )
                     actor_batch["canvas"] = canvas_summary
-                actor_action = actor.deterministic_action(actor_batch)
-                actor_vp = action_to_viewpoint(actor_action, min_scale=min_scale)
+                if actor is not None:
+                    actor_action = actor.deterministic_action(actor_batch)
+                    actor_vp = action_to_viewpoint(actor_action, min_scale=min_scale)
                 seg_rgb = _segmentation_for_plot(
                     model=model,
                     probe=probe,
@@ -670,6 +730,7 @@ def visualize_reward_maps_for_indices(
                         lengths=lengths,
                         canvas_summary=canvas_summary,
                         current_ce=current_ce,
+                        reward_target=reward_target,
                         q1=q1,
                         q2=q2,
                         model=model,
@@ -700,7 +761,7 @@ def visualize_reward_maps_for_indices(
         if len(state_steps) == 1
         else "t" + "-".join(str(step) for step in state_steps)
     )
-    output = output_dir / f"{split_label}_reward_maps_{state_suffix}.png"
+    output = output_dir / f"{split_label}_reward_maps_{state_suffix}_5000.png"
     _save_combined_reward_maps(
         rows=rows,
         output=output,
@@ -722,7 +783,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--split", choices=["training", "validation"], default="validation")
-    parser.add_argument("--image-index", type=int, action="append", default=None)
+    parser.add_argument(
+        "--image-index",
+        type=str,
+        action="append",
+        default=None,
+        help=(
+            "Image index to visualize. May be repeated, or passed as a "
+            "comma-separated list such as 0,1,2,3."
+        ),
+    )
     parser.add_argument("--episodes", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--probe-repo", type=str, default=None)
@@ -764,6 +834,18 @@ def _parse_state_steps(value: str | None, *, saved_t: int, max_history: int) -> 
     return steps
 
 
+def _parse_image_indices(values: list[str] | None) -> list[int] | None:
+    """Parse repeated and comma-separated --image-index values."""
+    if values is None:
+        return None
+    indices: list[int] = []
+    for value in values:
+        indices.extend(int(item) for item in value.split(",") if item.strip())
+    if not indices:
+        raise ValueError("--image-index must include at least one integer.")
+    return indices
+
+
 def main() -> None:
     args = parse_args()
     if args.grid_size < 2:
@@ -780,7 +862,7 @@ def main() -> None:
 
     device = get_device()
     cfg = CanViTEnvConfig()
-    actor, q1, q2, ckpt_args, policy_kind = _build_actor_and_critics(
+    actor, q1, q2, ckpt_args, policy_kind, reward_target = _build_actor_and_critics(
         checkpoint=args.checkpoint,
         device=device,
     )
@@ -792,7 +874,11 @@ def main() -> None:
         saved_t=saved_t,
         max_history=max_history,
     )
-    print(f"Loaded {policy_kind} SAC checkpoint: {args.checkpoint}")
+    checkpoint_kind = "SAC" if actor is not None else "critic-only"
+    print(
+        f"Loaded {policy_kind} {checkpoint_kind} checkpoint "
+        f"(target={reward_target}): {args.checkpoint}"
+    )
     print(f"Reward-map grid: {args.grid_size}x{args.grid_size} scales={scales}")
 
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
@@ -803,8 +889,9 @@ def main() -> None:
         img_tf=img_tf,
         mask_tf=mask_tf,
     )
-    if args.image_index:
-        indices = args.image_index
+    parsed_indices = _parse_image_indices(args.image_index)
+    if parsed_indices is not None:
+        indices = parsed_indices
     else:
         indices = random.sample(range(len(dataset)), min(args.episodes, len(dataset)))
 
@@ -848,6 +935,7 @@ def main() -> None:
             f"checkpoint={args.checkpoint.name}"
         ),
         policy_kind=policy_kind,
+        reward_target=reward_target,
         max_history=max_history,
         state_step=args.state_step,
         state_steps=state_steps,
