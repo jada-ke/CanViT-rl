@@ -27,6 +27,24 @@ def _trial_checkpoint_dir(base_dir: Path, trial_number: int) -> Path:
     return base_dir / f"trial_{trial_number}"
 
 
+def _ensure_optuna_output_dirs(args: argparse.Namespace) -> None:
+    """Create checkpoint and local SQLite storage parents before Optuna opens them."""
+    # Problem: Optuna opens SQLite storage before the first trial calls
+    # train_once(), so train_canvas_sac.py never gets a chance to create the
+    # checkpoint directory that commonly holds optuna.db.
+    # Solution: create the base checkpoint directory here, and when storage is
+    # a local sqlite:/// path, create the database file's parent directory too.
+    # Result: cluster runs no longer need a separate mkdir -p before launching
+    # --optuna-storage sqlite:///.../optuna.db.
+    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if not args.optuna_storage or not args.optuna_storage.startswith("sqlite:///"):
+        return
+    db_path = args.optuna_storage.removeprefix("sqlite:///")
+    if db_path in {"", ":memory:"}:
+        return
+    Path(db_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
 def build_canvas_sac_trial_args(
     args: argparse.Namespace,
     trial: Any,
@@ -93,6 +111,7 @@ def run_canvas_sac_optuna(
 
     if args.resume is not None:
         raise ValueError("--resume cannot be used with --optuna-trials.")
+    _ensure_optuna_output_dirs(args)
 
     def objective(trial: Any) -> float:
         trial_args = build_canvas_sac_trial_args(args, trial)
