@@ -82,20 +82,20 @@ def build_canvas_sac_trial_args(
     trial_args.target_entropy = trial.suggest_float("target_entropy", -6.0, -1.0)
     trial_args.tau = trial.suggest_float("tau", 0.001, 0.03, log=True)
     # trial_args.gamma = trial.suggest_categorical("gamma", [0.0, 0.25, 0.5, 0.9])
-    trial_args.d_model = trial.suggest_categorical("d_model", [128, 256, 384])
+    # trial_args.d_model = trial.suggest_categorical("d_model", [])
     # trial_args.rff_dim = trial.suggest_categorical("rff_dim", [64, 128, 256])
     trial_args.replay_batch_size = trial.suggest_categorical(
         "replay_batch_size",
-        [16, 32, 64, 128, 256],
+        [8, 16],
     )
     trial_args.learning_starts = trial.suggest_categorical(
         "learning_starts",
-        [1, 8, 16, 32],
+        [64, 128, 256, 512],
     )
-    trial_args.updates_per_batch = trial.suggest_categorical(
-        "updates_per_batch",
-        [1, 2, 4],
-    )
+    # trial_args.updates_per_batch = trial.suggest_categorical(
+    #     "updates_per_batch",
+    #     [1, 2],
+    # )
     return trial_args
 
 

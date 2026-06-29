@@ -24,15 +24,6 @@ Example:
         --checkpoint-dir checkpoints/canvas_sac/synthetic-ade-im1-t1 \
         --experiment-name synthetic-ade-im1-t2
 
-    python scripts/train_canvas_sac.py \
-        --dataset synthetic_segmentation \
-        --batches 3000 --batch-size 4 --max-samples 50 --t 1 \
-        --eval-images 10 --eval-batch-size 2 --eval-split validation \
-        --replay-batch-size 32 \
-        --updates-per-batch 4 \
-        --checkpoint-dir checkpoints/canvas_sac/synthetic-im50-t1 \
-        --experiment-name synthetic-im50-t1
-
     uv run python scripts/train_canvas_sac.py \
         --dataset synthetic_segmentation \
         --batches 100 \
@@ -54,12 +45,6 @@ from collections import defaultdict
 from pathlib import Path
 
 try:
-    # Fixed by Codex on 2026-06-23
-    # Problem: Importing Comet after torch triggers Comet's auto-logging
-    # warning and can miss framework hooks.
-    # Solution: import Comet before torch while keeping it optional for
-    # --no-comet runs and environments without comet_ml installed.
-    # Result: Comet can attach torch logging hooks without breaking dry runs.
     from comet_ml import Experiment
 except ImportError:
     Experiment = None
@@ -113,6 +98,14 @@ except ImportError:
 EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
     sys.path.insert(0, str(EVAL_REPO))
+
+
+REPLAY_STORAGE_DTYPE = torch.float16
+REPLAY_STORAGE_DTYPE_BYTES = 2
+REPLAY_GPU_FRACTION = 0.35
+MAX_CPU_REPLAY_BYTES = 8 * 1024**3
+DATALOADER_PREFETCH_FACTOR = 4
+
 
 def _sync_for_timing(device: torch.device) -> None:
     """Synchronize CUDA kernels before reading throughput timings."""
@@ -238,13 +231,6 @@ def _build_segmentation_dataset(
         mask_dir = split_mask_dir
     else:
         mask_dir = dataset_root / "masks"
-    # Fixed by Codex on 2026-06-24
-    # Problem: Synthetic data now has real training/validation splits, but the
-    # trainer previously read only flat images/ and masks/ directories.
-    # Solution: prefer images/<split> and masks/<split> when present, while
-    # retaining explicit directory overrides and old flat-root compatibility.
-    # Result: Canvas SAC can train and evaluate against separate synthetic
-    # splits using only --dataset synthetic_segmentation.
     return SyntheticSegmentationDataset(
         image_dir=image_dir,
         mask_dir=mask_dir,
@@ -320,13 +306,68 @@ def _parse_scales(value: str) -> list[float]:
     return scales
 
 
-def _grad_norm(parameters) -> float:
-    """Compute total L2 gradient norm for a parameter group."""
-    total = 0.0
-    for param in parameters:
-        if param.grad is not None:
-            total += float(param.grad.detach().norm(2).item() ** 2)
-    return total ** 0.5
+def _replay_canvas_bytes(
+    *,
+    capacity: int,
+    canvas_feature_dim: int,
+    canvas_grid_size: int,
+) -> int:
+    """Return bytes for current + next canvas replay tensors."""
+    return (
+        2
+        * capacity
+        * canvas_feature_dim
+        * canvas_grid_size
+        * canvas_grid_size
+        * REPLAY_STORAGE_DTYPE_BYTES
+    )
+
+
+def _resolve_replay_device(
+    *,
+    train_device: torch.device,
+    replay_bytes: int,
+) -> torch.device:
+    """Pick replay storage placement without surprising CPU or VRAM OOMs."""
+    if train_device.type != "cuda":
+        return torch.device("cpu")
+
+    free_bytes, _ = torch.cuda.mem_get_info(train_device)
+    if replay_bytes <= int(free_bytes * REPLAY_GPU_FRACTION):
+        return train_device
+    return torch.device("cpu")
+
+
+def _validate_replay_memory(
+    *,
+    storage_device: torch.device,
+    replay_bytes: int,
+) -> None:
+    """Fail early when replay would exceed the configured CPU RAM budget."""
+    if storage_device.type != "cpu":
+        return
+    if replay_bytes <= MAX_CPU_REPLAY_BYTES:
+        return
+    actual_gb = replay_bytes / 1024**3
+    max_gb = MAX_CPU_REPLAY_BYTES / 1024**3
+    raise ValueError(
+        "Canvas replay would allocate "
+        f"{actual_gb:.2f} GiB on CPU, exceeding the {max_gb:.2f} GiB safety "
+        "limit. Reduce --buffer-size or use a GPU with enough free VRAM for "
+        "auto CUDA replay."
+    )
+
+
+def _dataloader_kwargs(args: argparse.Namespace, device: torch.device) -> dict[str, object]:
+    """Build DataLoader settings that overlap input loading with CUDA work."""
+    kwargs: dict[str, object] = {
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = DATALOADER_PREFETCH_FACTOR
+    return kwargs
 
 
 def _eval_random_batch(
@@ -476,22 +517,68 @@ class CanvasReplayBuffer:
         max_history: int,
         canvas_feature_dim: int,
         canvas_grid_size: int,
+        storage_device: torch.device,
     ) -> None:
         self.capacity = capacity
-        self.canvas = np.zeros(
+        self.storage_device = storage_device
+        alloc_kwargs = {"device": storage_device}
+        self.canvas = torch.zeros(
             (capacity, canvas_feature_dim, canvas_grid_size, canvas_grid_size),
-            dtype=np.float32,
+            dtype=REPLAY_STORAGE_DTYPE,
+            **alloc_kwargs,
         )
-        self.next_canvas = np.zeros_like(self.canvas)
-        self.coords = np.zeros((capacity, max_history, 3), dtype=np.float32)
-        self.next_coords = np.zeros_like(self.coords)
-        self.lengths = np.zeros(capacity, dtype=np.int64)
-        self.next_lengths = np.zeros(capacity, dtype=np.int64)
-        self.actions = np.zeros((capacity, 3), dtype=np.float32)
-        self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.dones = np.zeros(capacity, dtype=np.float32)
+        self.next_canvas = torch.zeros_like(self.canvas)
+        self.coords = torch.zeros(
+            (capacity, max_history, 3),
+            dtype=torch.float32,
+            **alloc_kwargs,
+        )
+        self.next_coords = torch.zeros_like(self.coords)
+        self.lengths = torch.zeros(capacity, dtype=torch.long, **alloc_kwargs)
+        self.next_lengths = torch.zeros_like(self.lengths)
+        self.actions = torch.zeros(
+            (capacity, 3),
+            dtype=torch.float32,
+            **alloc_kwargs,
+        )
+        self.rewards = torch.zeros(
+            capacity,
+            dtype=torch.float32,
+            **alloc_kwargs,
+        )
+        self.dones = torch.zeros_like(self.rewards)
         self.pos = 0
         self.size = 0
+
+    def _copy_rows(self, tensor: torch.Tensor, values: torch.Tensor) -> None:
+        """Copy a batch into circular replay slots without host NumPy staging."""
+        batch_size = values.shape[0]
+        end = self.pos + batch_size
+        values = values.detach().to(
+            device=self.storage_device,
+            dtype=tensor.dtype,
+            non_blocking=self.storage_device.type == "cuda",
+        )
+        # Problem: The old replay path converted CUDA tensors to NumPy and
+        # looped row-by-row, inflating RAM and synchronizing every transition.
+        # Solution: write each contiguous circular segment with tensor copies.
+        # Result: adds stay in torch, support CUDA-resident replay, and perform
+        # at most two copies when a batch wraps around the ring buffer.
+        if end <= self.capacity:
+            tensor[self.pos:end].copy_(
+                values,
+                non_blocking=self.storage_device.type == "cuda",
+            )
+            return
+        first = self.capacity - self.pos
+        tensor[self.pos:].copy_(
+            values[:first],
+            non_blocking=self.storage_device.type == "cuda",
+        )
+        tensor[: end - self.capacity].copy_(
+            values[first:],
+            non_blocking=self.storage_device.type == "cuda",
+        )
 
     def add_batch(
         self,
@@ -507,42 +594,43 @@ class CanvasReplayBuffer:
         dones: torch.Tensor,
     ) -> None:
         batch_size = canvas.shape[0]
-        arrays = {
-            "canvas": canvas.detach().cpu().numpy().astype(np.float32),
-            "coords": coords.detach().cpu().numpy().astype(np.float32),
-            "lengths": lengths.detach().cpu().numpy().astype(np.int64),
-            "actions": actions.detach().cpu().numpy().astype(np.float32),
-            "rewards": rewards.detach().cpu().numpy().astype(np.float32),
-            "next_canvas": next_canvas.detach().cpu().numpy().astype(np.float32),
-            "next_coords": next_coords.detach().cpu().numpy().astype(np.float32),
-            "next_lengths": next_lengths.detach().cpu().numpy().astype(np.int64),
-            "dones": dones.detach().cpu().numpy().astype(np.float32),
-        }
-        for idx in range(batch_size):
-            self.canvas[self.pos] = arrays["canvas"][idx]
-            self.coords[self.pos] = arrays["coords"][idx]
-            self.lengths[self.pos] = arrays["lengths"][idx]
-            self.actions[self.pos] = arrays["actions"][idx]
-            self.rewards[self.pos] = arrays["rewards"][idx]
-            self.next_canvas[self.pos] = arrays["next_canvas"][idx]
-            self.next_coords[self.pos] = arrays["next_coords"][idx]
-            self.next_lengths[self.pos] = arrays["next_lengths"][idx]
-            self.dones[self.pos] = arrays["dones"][idx]
-            self.pos = (self.pos + 1) % self.capacity
-            self.size = min(self.size + 1, self.capacity)
+        if batch_size > self.capacity:
+            raise ValueError(
+                f"Replay batch_size={batch_size} exceeds capacity={self.capacity}; "
+                "increase --buffer-size or reduce --batch-size."
+            )
+        self._copy_rows(self.canvas, canvas)
+        self._copy_rows(self.coords, coords)
+        self._copy_rows(self.lengths, lengths)
+        self._copy_rows(self.actions, actions)
+        self._copy_rows(self.rewards, rewards)
+        self._copy_rows(self.next_canvas, next_canvas)
+        self._copy_rows(self.next_coords, next_coords)
+        self._copy_rows(self.next_lengths, next_lengths)
+        self._copy_rows(self.dones, dones)
+        self.pos = (self.pos + batch_size) % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
 
     def sample(self, batch_size: int, device: torch.device) -> dict[str, torch.Tensor]:
-        idx = np.random.randint(0, self.size, size=batch_size)
+        idx = torch.randint(0, self.size, (batch_size,), device=self.storage_device)
+
+        def move(values: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+            return values.index_select(0, idx).to(
+                device=device,
+                dtype=dtype or values.dtype,
+                non_blocking=self.storage_device.type == device.type,
+            )
+
         return {
-            "canvas": torch.as_tensor(self.canvas[idx], device=device),
-            "coords": torch.as_tensor(self.coords[idx], device=device),
-            "lengths": torch.as_tensor(self.lengths[idx], device=device),
-            "actions": torch.as_tensor(self.actions[idx], device=device),
-            "rewards": torch.as_tensor(self.rewards[idx], device=device),
-            "next_canvas": torch.as_tensor(self.next_canvas[idx], device=device),
-            "next_coords": torch.as_tensor(self.next_coords[idx], device=device),
-            "next_lengths": torch.as_tensor(self.next_lengths[idx], device=device),
-            "dones": torch.as_tensor(self.dones[idx], device=device),
+            "canvas": move(self.canvas, dtype=torch.float32),
+            "coords": move(self.coords),
+            "lengths": move(self.lengths),
+            "actions": move(self.actions),
+            "rewards": move(self.rewards),
+            "next_canvas": move(self.next_canvas, dtype=torch.float32),
+            "next_coords": move(self.next_coords),
+            "next_lengths": move(self.next_lengths),
+            "dones": move(self.dones),
         }
 
 
@@ -613,22 +701,19 @@ class CanvasSAC:
         q2_pred = self.q2(obs, sample["actions"])
         q1_loss = F.mse_loss(q1_pred, target_q)
         q2_loss = F.mse_loss(q2_pred, target_q)
-        self.q_opt.zero_grad()
+        self.q_opt.zero_grad(set_to_none=True)
         (q1_loss + q2_loss).backward()
-        grad_q1 = _grad_norm(self.q1.parameters())
-        grad_q2 = _grad_norm(self.q2.parameters())
         self.q_opt.step()
 
         action, log_prob = self.actor.sample(obs)
         q_min = torch.minimum(self.q1(obs, action), self.q2(obs, action))
         actor_loss = (self.alpha.detach() * log_prob - q_min).mean()
-        self.actor_opt.zero_grad()
+        self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        grad_actor = _grad_norm(self.actor.parameters())
         self.actor_opt.step()
 
         alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
-        self.alpha_opt.zero_grad()
+        self.alpha_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.alpha_opt.step()
 
@@ -645,10 +730,6 @@ class CanvasSAC:
             "critic/target_q": float(target_q.detach().mean().item()),
             "critic/q_mean": float(q_min.detach().mean().item()),
             "critic/q_std": float(q_min.detach().std(unbiased=False).item()),
-            "grad/actor_norm": grad_actor,
-            "grad/q1_norm": grad_q1,
-            "grad/q2_norm": grad_q2,
-            "grad/critic_norm": float((grad_q1**2 + grad_q2**2) ** 0.5),
             "sac/alpha": float(self.alpha.detach().item()),
             "sac/entropy": float(entropy.mean().item()),
             "sac/target_entropy_gap": float(
@@ -658,8 +739,9 @@ class CanvasSAC:
         }
 
     def _soft_update(self, source: torch.nn.Module, target: torch.nn.Module) -> None:
-        for src_param, tgt_param in zip(source.parameters(), target.parameters()):
-            tgt_param.data.mul_(1.0 - self.tau).add_(self.tau * src_param.data)
+        with torch.no_grad():
+            for src_param, tgt_param in zip(source.parameters(), target.parameters()):
+                tgt_param.mul_(1.0 - self.tau).add_(src_param, alpha=self.tau)
 
 
 def _build_networks(
@@ -813,13 +895,6 @@ def _load_pretrained_initializers(
             map_location="cpu",
             weights_only=False,
         )
-        # Fixed by Codex on 2026-06-26
-        # Problem: Canvas SAC could only resume full SAC checkpoints, so a
-        # behavior-cloned CanvasStateActor could not seed a fresh RL run.
-        # Solution: load just the actor module state, accepting either latest.pt
-        # payloads with an "actor" key or bare actor_final.pt state dicts.
-        # Result: Actor BC pretraining can initialize SAC while critics,
-        # optimizers, alpha, and replay start clean.
         actor.load_state_dict(
             _checkpoint_module_state(
                 checkpoint,
@@ -845,12 +920,6 @@ def _load_pretrained_initializers(
             )
         q1.load_state_dict(checkpoint["q1"])
         q2.load_state_dict(checkpoint.get("q2", checkpoint["q1"]))
-        # Fixed by Codex on 2026-06-26
-        # Problem: Loading pretrained online critics without syncing target
-        # critics would make the first SAC targets come from stale random
-        # networks.
-        # Solution: copy the initialized q1/q2 weights into target_q1/target_q2.
-        # Result: Fresh SAC runs start with coherent online and target critics.
         target_q1.load_state_dict(q1.state_dict())
         target_q2.load_state_dict(q2.state_dict())
         print(f"Initialized canvas SAC critics from {args.init_critic_checkpoint}")
@@ -1026,13 +1095,6 @@ def evaluate(
     sac_initial_ce = ce_sums["sac_initial"] / max(n_images, 1)
     sac_ce = ce_sums["sac_final"] / max(n_images, 1)
     ce_gain = sac_initial_ce - sac_ce
-    # Problem: SAC trains on relative CE reduction, but validation only exposed
-    # absolute CE-point improvement, making it hard to compare eval against the
-    # training reward scale.
-    # Solution: keep the existing raw CE gain for compatibility and add a
-    # denominator-safe normalized counterpart.
-    # Result: Comet/Optuna consumers can inspect both absolute and reward-scale
-    # validation progress without changing existing checkpoint selection.
     relative_ce_gain = ce_gain / max(sac_initial_ce, 1e-12)
     metrics = {
         "eval/random_miou": random_miou,
@@ -1164,19 +1226,18 @@ def train_once(args: argparse.Namespace) -> float:
     eval_dataset = _limit_dataset(eval_dataset, args.eval_images)
     if len(train_dataset) == 0 or len(eval_dataset) == 0:
         raise ValueError("Train and validation datasets must be non-empty.")
+    loader_kwargs = _dataloader_kwargs(args, device)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         sampler=RandomSampler(train_dataset, replacement=True),
-        num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=args.eval_batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        **loader_kwargs,
     )
 
     probe_repo = args.probe_repo or resolve_canvit_repo(
@@ -1242,11 +1303,30 @@ def train_once(args: argparse.Namespace) -> float:
         target_q1=target_q1,
         target_q2=target_q2,
     )
+    replay_canvas_bytes = _replay_canvas_bytes(
+        capacity=args.buffer_size,
+        canvas_feature_dim=canvas_feature_dim,
+        canvas_grid_size=cfg.canvas_grid_size,
+    )
+    replay_device = _resolve_replay_device(
+        train_device=device,
+        replay_bytes=replay_canvas_bytes,
+    )
+    _validate_replay_memory(
+        storage_device=replay_device,
+        replay_bytes=replay_canvas_bytes,
+    )
+    print(
+        "Replay storage: "
+        f"device={replay_device}, dtype={REPLAY_STORAGE_DTYPE}, "
+        f"canvas_bytes={replay_canvas_bytes / 1024**3:.2f} GiB"
+    )
     replay = CanvasReplayBuffer(
         capacity=args.buffer_size,
         max_history=args.max_history,
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=cfg.canvas_grid_size,
+        storage_device=replay_device,
     )
     comet_exp = _make_comet_experiment(args)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1580,7 +1660,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batches", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--replay-batch-size", type=int, default=256)
+    parser.add_argument("--replay-batch-size", type=int, default=8)
     parser.add_argument("--t", type=int, default=1)
     parser.add_argument(
         "--dataset",
@@ -1618,7 +1698,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--eval-images", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--probe-repo", type=str, default=None)
     parser.add_argument(
         "--canvit-dtype",
@@ -1639,7 +1719,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--init-alpha", type=float, default=0.1)
     parser.add_argument("--target-entropy", type=float, default=-3.0)
-    parser.add_argument("--buffer-size", type=int, default=1000)
+    parser.add_argument("--buffer-size", type=int, default=256)
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--eval-interval", type=int, default=20)
@@ -1692,11 +1772,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--comet-project", type=str, default="canvas-sac")
     parser.add_argument("--experiment-name", type=str, default=None)
     parser.add_argument("--comet-tags", type=str, default="canvas-sac")
-    # Problem: Canvas SAC previously required handwritten repeated commands to
-    # sweep SAC/model hyperparameters.
-    # Solution: register Optuna control flags from scripts/canvas_sac_optuna.py
-    # while this parser keeps owning all normal trainer setup.
-    # Result: the same CLI can run one training job or an isolated study.
     add_canvas_sac_optuna_args(parser)
     args = parser.parse_args()
     if args.resume is not None:
