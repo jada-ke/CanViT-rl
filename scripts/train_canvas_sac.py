@@ -805,7 +805,7 @@ def _save_checkpoint(
             "batch": batch,
             "updates": updates,
             "best_relative_ce_gain": best_relative_ce_gain,
-            "selection_metric": "eval/relative_ce_gain",
+            "selection_metric": "eval/reward",
             "eval_metrics": eval_metrics or {},
             "state_representation": "current_canvas_layernorm_with_viewpoint_history",
         },
@@ -1104,7 +1104,7 @@ def evaluate(
     sac_initial_ce = ce_sums["sac_initial"] / max(n_images, 1)
     sac_ce = ce_sums["sac_final"] / max(n_images, 1)
     ce_gain = sac_initial_ce - sac_ce
-    relative_ce_gain = ce_gain / max(sac_initial_ce, 1e-12)
+    eval_reward = ce_gain / max(sac_initial_ce, 1e-12)
     metrics = {
         "eval/random_miou": random_miou,
         "eval/egc2f_miou": egc2f_miou,
@@ -1116,7 +1116,13 @@ def evaluate(
         "eval/final_ce": sac_ce,
         "eval/miou_gain": sac_miou - random_miou,
         "eval/ce_gain": ce_gain,
-        "eval/relative_ce_gain": relative_ce_gain,
+        # Problem: validation used the same relative CE reduction as the SAC
+        # reward but logged it under a metric-specific CE name. Solution: make
+        # eval/reward the primary validation counterpart to reward/mean while
+        # keeping eval/relative_ce_gain as a compatibility alias. Result: train
+        # and validation reward curves are easier to compare in Comet/console.
+        "eval/reward": eval_reward,
+        "eval/relative_ce_gain": eval_reward,
         "eval/random_ce_gain": ce_sums["random_initial"] / max(n_images, 1) - random_ce,
         "eval/egc2f_ce_gain": ce_sums["egc2f_initial"] / max(n_images, 1) - egc2f_ce,
         "eval/sac_vs_random": sac_miou - random_miou,
@@ -1132,6 +1138,7 @@ def evaluate(
             "final_ce": metrics["eval/final_ce"],
             "miou_gain": metrics["eval/miou_gain"],
             "ce_gain": metrics["eval/ce_gain"],
+            "reward": metrics["eval/reward"],
             "relative_ce_gain": metrics["eval/relative_ce_gain"],
             "sac_vs_random": metrics["eval/sac_vs_random"],
             "sac_vs_egc2f": metrics["eval/sac_vs_egc2f"],
@@ -1143,6 +1150,36 @@ def evaluate(
             sac_scale_sums[step_idx] / max(sac_scale_counts[step_idx], 1)
         )
     return metrics
+
+
+def _split_eval_metrics(metrics: dict[str, float], split: str) -> dict[str, float]:
+    """Return explicit split-prefixed aliases for eval metrics."""
+    prefix = f"eval/{split}/"
+    return {
+        f"{prefix}{name.removeprefix('eval/')}": value
+        for name, value in metrics.items()
+        if name.startswith("eval/")
+    }
+
+
+def _combine_eval_metrics(
+    *,
+    selected_metrics: dict[str, float],
+    train_metrics: dict[str, float],
+    selected_split: str,
+    train_split: str,
+) -> dict[str, float]:
+    """Combine eval metrics with clear split names while preserving old aliases."""
+    combined = dict(selected_metrics)
+    # Problem: train/validation overfitting checks previously required separate
+    # runs or comparing online reward to deterministic eval reward. Solution:
+    # log deterministic eval for both splits with explicit split prefixes while
+    # retaining flat eval/* aliases for the checkpoint-selected split. Result:
+    # Comet charts can compare eval/training/reward and eval/validation/reward
+    # directly without breaking older eval/reward-based analysis.
+    combined.update(_split_eval_metrics(selected_metrics, selected_split))
+    combined.update(_split_eval_metrics(train_metrics, train_split))
+    return combined
 
 
 def _maybe_visualize_reward_maps(
@@ -1184,11 +1221,12 @@ def _maybe_visualize_reward_maps(
         scales=_parse_scales(args.reward_map_scales),
         grid_size=args.reward_map_grid_size,
         chunk_size=args.reward_map_chunk_size,
-        output_dir=args.reward_map_output_dir / f"update_{update_count:06d}",
+        output_dir=args.reward_map_output_dir,
         split_label=args.eval_split,
         title_prefix=f"Canvas SAC validation reward map update={update_count}",
         policy_kind="canvas",
         max_history=args.max_history,
+        output_name_suffix=f"update_{update_count:06d}",
     )
     if comet_exp is not None:
         for path in paths:
@@ -1227,6 +1265,7 @@ def train_once(args: argparse.Namespace) -> float:
         mask_tf=mask_tf,
     )
     train_dataset = _limit_dataset(train_dataset, args.max_samples)
+    train_eval_dataset = _limit_dataset(train_dataset, args.eval_images)
     eval_dataset = _build_segmentation_dataset(
         args=args,
         cfg=cfg,
@@ -1235,7 +1274,7 @@ def train_once(args: argparse.Namespace) -> float:
         mask_tf=mask_tf,
     )
     eval_dataset = _limit_dataset(eval_dataset, args.eval_images)
-    if len(train_dataset) == 0 or len(eval_dataset) == 0:
+    if len(train_dataset) == 0 or len(train_eval_dataset) == 0 or len(eval_dataset) == 0:
         raise ValueError("Train and validation datasets must be non-empty.")
     loader_kwargs = _dataloader_kwargs(args, device)
     train_loader = DataLoader(
@@ -1246,6 +1285,12 @@ def train_once(args: argparse.Namespace) -> float:
     )
     eval_loader = DataLoader(
         eval_dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        **loader_kwargs,
+    )
+    train_eval_loader = DataLoader(
+        train_eval_dataset,
         batch_size=args.eval_batch_size,
         shuffle=False,
         **loader_kwargs,
@@ -1493,10 +1538,25 @@ def train_once(args: argparse.Namespace) -> float:
                         rewards_np = np.asarray(reward_window, dtype=np.float64)
                         train_metrics.update(
                             {
-                                "reward/mean": float(np.mean(rewards_np)),
-                                "reward/std": float(np.std(rewards_np)),
-                                "reward/max": float(np.max(rewards_np)),
-                                "reward/min": float(np.min(rewards_np)),
+                                # Problem: reward/mean looked comparable to
+                                # deterministic validation reward even though
+                                # it is the stochastic online training signal.
+                                # Solution: prefix it as online train reward.
+                                # Result: overfitting checks can use
+                                # eval/training/reward vs eval/validation/reward
+                                # without confusing those with replay samples.
+                                "train/online_reward/mean": float(
+                                    np.mean(rewards_np)
+                                ),
+                                "train/online_reward/std": float(
+                                    np.std(rewards_np)
+                                ),
+                                "train/online_reward/max": float(
+                                    np.max(rewards_np)
+                                ),
+                                "train/online_reward/min": float(
+                                    np.min(rewards_np)
+                                ),
                             }
                         )
                     train_metrics["train/batch"] = float(batch_idx)
@@ -1521,9 +1581,9 @@ def train_once(args: argparse.Namespace) -> float:
                     scale_counts = [0 for _ in range(args.t)]
 
                 if update_count >= next_eval_update:
-                    eval_metrics = evaluate(
+                    train_eval_metrics = evaluate(
                         actor=actor,
-                        eval_loader=eval_loader,
+                        eval_loader=train_eval_loader,
                         model=model,
                         probe=probe,
                         cfg=cfg,
@@ -1532,10 +1592,34 @@ def train_once(args: argparse.Namespace) -> float:
                         canvit_dtype=canvit_dtype,
                         device=device,
                     )
+                    if args.eval_split == args.split:
+                        selected_eval_metrics = train_eval_metrics
+                    else:
+                        selected_eval_metrics = evaluate(
+                            actor=actor,
+                            eval_loader=eval_loader,
+                            model=model,
+                            probe=probe,
+                            cfg=cfg,
+                            args=args,
+                            canvas_feature_dim=canvas_feature_dim,
+                            canvit_dtype=canvit_dtype,
+                            device=device,
+                        )
+                    eval_metrics = _combine_eval_metrics(
+                        selected_metrics=selected_eval_metrics,
+                        train_metrics=train_eval_metrics,
+                        selected_split=args.eval_split,
+                        train_split=args.split,
+                    )
                     latest_metrics = eval_metrics
                     if comet_exp is not None:
                         comet_exp.log_metrics(eval_metrics, step=update_count)
-                    current_relative_ce_gain = eval_metrics["eval/relative_ce_gain"]
+                    current_eval_reward = eval_metrics["eval/reward"]
+                    current_train_reward = eval_metrics[f"eval/{args.split}/reward"]
+                    current_selected_reward = eval_metrics[
+                        f"eval/{args.eval_split}/reward"
+                    ]
                     _save_checkpoint(
                         path=args.checkpoint_dir / "latest.pt",
                         actor=actor,
@@ -1551,8 +1635,8 @@ def train_once(args: argparse.Namespace) -> float:
                         best_relative_ce_gain=best_relative_ce_gain,
                         eval_metrics=eval_metrics,
                     )
-                    if current_relative_ce_gain > best_relative_ce_gain:
-                        best_relative_ce_gain = current_relative_ce_gain
+                    if current_eval_reward > best_relative_ce_gain:
+                        best_relative_ce_gain = current_eval_reward
                         _save_checkpoint(
                             path=args.checkpoint_dir / "best.pt",
                             actor=actor,
@@ -1570,7 +1654,8 @@ def train_once(args: argparse.Namespace) -> float:
                         )
                     print(
                         f"update={update_count} batch={batch_idx} "
-                        f"relative_ce_gain={current_relative_ce_gain:+.4f} "
+                        f"{args.split}_reward={current_train_reward:+.4f} "
+                        f"{args.eval_split}_reward={current_selected_reward:+.4f} "
                         f"ce_gain={eval_metrics['eval/ce_gain']:+.4f} "
                         f"sac_miou={eval_metrics['eval/sac_miou']:.4f}"
                     )
@@ -1602,16 +1687,16 @@ def train_once(args: argparse.Namespace) -> float:
                 "updates": update_count,
                 "replay": replay.size,
                 "glimpses/s": f"{glimpses_per_sec:.1f}",
-                "best_rel_ce": f"{best_relative_ce_gain:+.4f}"
+                "best_reward": f"{best_relative_ce_gain:+.4f}"
                 if best_relative_ce_gain != float("-inf")
                 else "nan",
             }
         )
 
     if latest_metrics is None:
-        latest_metrics = evaluate(
+        train_eval_metrics = evaluate(
             actor=actor,
-            eval_loader=eval_loader,
+            eval_loader=train_eval_loader,
             model=model,
             probe=probe,
             cfg=cfg,
@@ -1620,9 +1705,29 @@ def train_once(args: argparse.Namespace) -> float:
             canvit_dtype=canvit_dtype,
             device=device,
         )
+        if args.eval_split == args.split:
+            selected_eval_metrics = train_eval_metrics
+        else:
+            selected_eval_metrics = evaluate(
+                actor=actor,
+                eval_loader=eval_loader,
+                model=model,
+                probe=probe,
+                cfg=cfg,
+                args=args,
+                canvas_feature_dim=canvas_feature_dim,
+                canvit_dtype=canvit_dtype,
+                device=device,
+            )
+        latest_metrics = _combine_eval_metrics(
+            selected_metrics=selected_eval_metrics,
+            train_metrics=train_eval_metrics,
+            selected_split=args.eval_split,
+            train_split=args.split,
+        )
         best_relative_ce_gain = max(
             best_relative_ce_gain,
-            latest_metrics["eval/relative_ce_gain"],
+            latest_metrics["eval/reward"],
         )
         if comet_exp is not None:
             comet_exp.log_metrics(latest_metrics, step=update_count)
@@ -1640,7 +1745,7 @@ def train_once(args: argparse.Namespace) -> float:
                 update_count=update_count,
                 comet_exp=comet_exp,
             )
-    final_relative_ce_gain = latest_metrics["eval/relative_ce_gain"]
+    final_relative_ce_gain = latest_metrics["eval/reward"]
     if final_relative_ce_gain >= best_relative_ce_gain:
         best_relative_ce_gain = final_relative_ce_gain
         _save_checkpoint(
@@ -1675,11 +1780,12 @@ def train_once(args: argparse.Namespace) -> float:
     )
     torch.save(actor.state_dict(), args.checkpoint_dir / "actor_final.pt")
     if comet_exp is not None:
+        comet_exp.log_metric("final/reward", latest_metrics["eval/reward"], step=update_count)
         comet_exp.log_metric("final/ce_gain", latest_metrics["eval/ce_gain"], step=update_count)
         comet_exp.log_metric("final/miou", latest_metrics["eval/sac_miou"], step=update_count)
         comet_exp.end()
     print(f"Saved canvas SAC latest checkpoint to {args.checkpoint_dir / 'latest.pt'}")
-    print(f"Best eval/relative_ce_gain: {best_relative_ce_gain:+.4f}")
+    print(f"Best eval/reward: {best_relative_ce_gain:+.4f}")
     return best_relative_ce_gain
 
 

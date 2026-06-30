@@ -25,15 +25,15 @@ Example:
         --output-dir results/sac_canvas_reward_maps
 
     uv run python scripts/visualize_sac_reward_maps.py \
-        --checkpoint checkpoints/canvas_sac/synthetic-im7-t1-10_000-critlr_10/latest.pt \
+        --checkpoint checkpoints/canvas_sac/synthetic-im7-t1-10_000-critlr_3/best.pt \
         --dataset synthetic_segmentation \
-        --split validation \
-        --image-index 0,1,2 \
-        --state-steps 0 \
+        --split training \
+        --image-index 0,1,2,3,4,5,6 \
+        --state-steps 0,1 \
         --grid-size 21 \
         --scales 0.25,0.50 \
         --chunk-size 16 \
-        --output-dir results/synthetic-im7-t1-10_000-critlr_10
+        --output-dir results/synthetic-im7-t1-10_000-critlr_3
 
     uv run python scripts/visualize_sac_reward_maps.py \
         --checkpoint checkpoints/canvas_critic/canvas_synthetic_im7_t1_k32_5000/best.pt \
@@ -484,6 +484,17 @@ def _show_image_background(ax, image_np: np.ndarray) -> None:
     ax.set_ylim(1.0, -1.0)
 
 
+def _map_argmax_center(values: np.ndarray, *, bound: float) -> tuple[float, float] | None:
+    """Return (x, y) center coordinates for the finite max of a grid map."""
+    finite = np.isfinite(values)
+    if not finite.any():
+        return None
+    row, col = np.unravel_index(np.nanargmax(values), values.shape)
+    y_centers = np.linspace(-bound, bound, values.shape[0])
+    x_centers = np.linspace(-bound, bound, values.shape[1])
+    return float(x_centers[col]), float(y_centers[row])
+
+
 def _save_combined_reward_maps(
     *,
     rows: list[dict],
@@ -539,6 +550,8 @@ def _save_combined_reward_maps(
             extent = [-bound, bound, bound, -bound]
             reward_ax = axes[row_idx, 1 + 2 * scale_idx]
             q_ax = axes[row_idx, 2 + 2 * scale_idx]
+            reward_max_center = _map_argmax_center(reward_map, bound=bound)
+            q_max_center = _map_argmax_center(q_map, bound=bound)
 
             _show_image_background(reward_ax, image_np)
             reward_im = reward_ax.imshow(
@@ -554,6 +567,19 @@ def _save_combined_reward_maps(
             reward_ax.set_xlabel("x center")
             reward_ax.set_ylabel("y center")
             fig.colorbar(reward_im, ax=reward_ax, fraction=0.046, pad=0.04)
+            if reward_max_center is not None:
+                # Problem: large hollow peak markers obscured diffused maps.
+                # Solution: use a compact X at the argmax location while
+                # keeping reward/Q colors distinct. Result: peak alignment is
+                # visible without covering the local heatmap structure.
+                reward_ax.scatter(
+                    [reward_max_center[0]],
+                    [reward_max_center[1]],
+                    c="lime",
+                    s=34,
+                    marker="x",
+                    linewidths=1.6,
+                )
 
             _show_image_background(q_ax, image_np)
             q_im = q_ax.imshow(
@@ -569,6 +595,15 @@ def _save_combined_reward_maps(
             q_ax.set_xlabel("x center")
             q_ax.set_ylabel("y center")
             fig.colorbar(q_im, ax=q_ax, fraction=0.046, pad=0.04)
+            if q_max_center is not None:
+                q_ax.scatter(
+                    [q_max_center[0]],
+                    [q_max_center[1]],
+                    c="yellow",
+                    s=34,
+                    marker="x",
+                    linewidths=1.6,
+                )
 
             if actor_scale is not None and abs(actor_scale - scale) <= 0.5 * max(scale, 1e-6):
                 for ax in (reward_ax, q_ax):
@@ -623,6 +658,7 @@ def visualize_reward_maps_for_indices(
     max_history: int | None = None,
     state_step: int = 0,
     state_steps: list[int] | None = None,
+    output_name_suffix: str | None = None,
 ) -> list[Path]:
     """Generate reward/Q landscape figures using live SAC networks."""
     rows: list[dict] = []
@@ -796,7 +832,8 @@ def visualize_reward_maps_for_indices(
         if len(state_steps) == 1
         else "t" + "-".join(str(step) for step in state_steps)
     )
-    output = output_dir / f"{split_label}_reward_maps_{state_suffix}.png"
+    suffix = f"_{output_name_suffix}" if output_name_suffix else ""
+    output = output_dir / f"{split_label}_reward_maps_{state_suffix}{suffix}.png"
     _save_combined_reward_maps(
         rows=rows,
         output=output,
