@@ -25,15 +25,15 @@ Example:
         --output-dir results/sac_canvas_reward_maps
 
     uv run python scripts/visualize_sac_reward_maps.py \
-        --checkpoint checkpoints/canvas_sac/synthetic-im7-t1_1000/best.pt \
+        --checkpoint checkpoints/canvas_sac/synthetic-im7-t1-10_000-critlr_10/latest.pt \
         --dataset synthetic_segmentation \
-        --split training \
-        --image-index 0,1,2,3,4,5,6 \
+        --split validation \
+        --image-index 0,1,2 \
         --state-steps 0 \
         --grid-size 21 \
         --scales 0.25,0.50 \
         --chunk-size 16 \
-        --output-dir results/sac_canvas_reward_maps/synthetic-im7-t1_1000
+        --output-dir results/synthetic-im7-t1-10_000-critlr_10
 
     uv run python scripts/visualize_sac_reward_maps.py \
         --checkpoint checkpoints/canvas_critic/canvas_synthetic_im7_t1_k32_5000/best.pt \
@@ -237,6 +237,35 @@ def _segmentation_for_plot(
     return palette[pred.clamp_min(0)].numpy()
 
 
+def _canvit_glimpse_dtype(model) -> torch.dtype:
+    """Return the dtype expected by CanViT patch embedding inputs."""
+    try:
+        return next(model.backbone.patch_embed.parameters()).dtype
+    except (AttributeError, StopIteration):
+        return next(model.parameters()).dtype
+
+
+def _sample_canvit_glimpse(
+    *,
+    image: torch.Tensor,
+    viewpoint: Viewpoint,
+    cfg: CanViTEnvConfig,
+    canvit_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Sample one CanViT glimpse and match the frozen backbone precision."""
+    # Problem: live Canvas SAC training can cast frozen CanViT to bf16, but the
+    # reward-map visualizer sampled fp32 glimpses before calling model(...).
+    # Solution: infer the patch-embed dtype from the passed model and cast each
+    # sampled glimpse once at the model boundary.
+    # Result: standalone fp32 maps and live bf16 training maps both feed Conv2d
+    # the dtype its weights expect.
+    return sample_at_viewpoint(
+        spatial=image,
+        viewpoint=viewpoint,
+        glimpse_size_px=cfg.glimpse_size_px,
+    ).to(dtype=canvit_dtype)
+
+
 def _append_history(
     *,
     coords: torch.Tensor,
@@ -365,6 +394,7 @@ def _evaluate_grid(
     grid_size: int,
     chunk_size: int,
     device: torch.device,
+    canvit_dtype: torch.dtype,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return true reward and predicted Q maps for one candidate scale."""
     vp_all = _candidate_grid(scale=scale, grid_size=grid_size, device=device)
@@ -383,10 +413,11 @@ def _evaluate_grid(
             candidate_masks = mask.repeat((repeats,) + (1,) * (mask.ndim - 1))
             candidate_state = _repeat_state_chunks(state, repeats)
             out = model(
-                glimpse=sample_at_viewpoint(
-                    spatial=candidate_images,
+                glimpse=_sample_canvit_glimpse(
+                    image=candidate_images,
                     viewpoint=vp,
-                    glimpse_size_px=cfg.glimpse_size_px,
+                    cfg=cfg,
+                    canvit_dtype=canvit_dtype,
                 ),
                 state=candidate_state,
                 viewpoint=vp,
@@ -613,6 +644,7 @@ def visualize_reward_maps_for_indices(
                 f"with max_history={max_history}."
             )
     output_dir.mkdir(parents=True, exist_ok=True)
+    canvit_dtype = _canvit_glimpse_dtype(model)
     with torch.inference_mode():
         for idx in indices:
             for current_state_step in state_steps:
@@ -627,10 +659,11 @@ def visualize_reward_maps_for_indices(
                 lengths = torch.zeros(1, dtype=torch.long, device=device)
                 full_vp = Viewpoint.full_scene(batch_size=1, device=device)
                 full_out = model(
-                    glimpse=sample_at_viewpoint(
-                        spatial=image_dev,
+                    glimpse=_sample_canvit_glimpse(
+                        image=image_dev,
                         viewpoint=full_vp,
-                        glimpse_size_px=cfg.glimpse_size_px,
+                        cfg=cfg,
+                        canvit_dtype=canvit_dtype,
                     ),
                     state=state,
                     viewpoint=full_vp,
@@ -673,10 +706,11 @@ def visualize_reward_maps_for_indices(
                     action = actor.deterministic_action(actor_batch)
                     vp = action_to_viewpoint(action, min_scale=min_scale)
                     out = model(
-                        glimpse=sample_at_viewpoint(
-                            spatial=image_dev,
+                        glimpse=_sample_canvit_glimpse(
+                            image=image_dev,
                             viewpoint=vp,
-                            glimpse_size_px=cfg.glimpse_size_px,
+                            cfg=cfg,
+                            canvit_dtype=canvit_dtype,
                         ),
                         state=state,
                         viewpoint=vp,
@@ -741,6 +775,7 @@ def visualize_reward_maps_for_indices(
                         grid_size=grid_size,
                         chunk_size=chunk_size,
                         device=device,
+                        canvit_dtype=canvit_dtype,
                     )
                     maps.append((scale, reward_map, q_map))
 
@@ -761,7 +796,7 @@ def visualize_reward_maps_for_indices(
         if len(state_steps) == 1
         else "t" + "-".join(str(step) for step in state_steps)
     )
-    output = output_dir / f"{split_label}_reward_maps_{state_suffix}_5000.png"
+    output = output_dir / f"{split_label}_reward_maps_{state_suffix}.png"
     _save_combined_reward_maps(
         rows=rows,
         output=output,
