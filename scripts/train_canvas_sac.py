@@ -784,10 +784,10 @@ def _save_checkpoint(
     canvas_feature_dim: int,
     batch: int,
     updates: int,
-    best_ce_gain: float,
+    best_relative_ce_gain: float,
     eval_metrics: dict[str, float] | None,
 ) -> None:
-    """Save canvas SAC state; best selection is by eval/ce_gain."""
+    """Save canvas SAC state; best selection matches relative CE reward."""
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -804,8 +804,8 @@ def _save_checkpoint(
             "canvas_feature_dim": canvas_feature_dim,
             "batch": batch,
             "updates": updates,
-            "best_ce_gain": best_ce_gain,
-            "selection_metric": "eval/ce_gain",
+            "best_relative_ce_gain": best_relative_ce_gain,
+            "selection_metric": "eval/relative_ce_gain",
             "eval_metrics": eval_metrics or {},
             "state_representation": "current_canvas_layernorm_with_viewpoint_history",
         },
@@ -840,10 +840,19 @@ def _load_resume(
         agent.alpha_opt.load_state_dict(checkpoint["alpha_opt"])
     if "log_alpha" in checkpoint:
         agent.log_alpha.data.copy_(checkpoint["log_alpha"])
+    # Problem: older checkpoints stored the selection score under a raw CE-gain
+    # name. Solution: prefer the explicit relative key, but keep the fallback
+    # for resumes. Result: new runs match the reward scale without abandoning
+    # existing checkpoints.
     return (
         int(checkpoint.get("batch", 0)) + 1,
         int(checkpoint.get("updates", 0)),
-        float(checkpoint.get("best_ce_gain", float("-inf"))),
+        float(
+            checkpoint.get(
+                "best_relative_ce_gain",
+                checkpoint.get("best_ce_gain", float("-inf")),
+            )
+        ),
     )
 
 
@@ -1187,7 +1196,7 @@ def _maybe_visualize_reward_maps(
 
 
 def train_once(args: argparse.Namespace) -> float:
-    """Run full current-canvas SAC and return best eval CE gain."""
+    """Run full current-canvas SAC and return best relative eval CE gain."""
     if args.t < 0:
         raise ValueError("--t must be non-negative.")
     if args.max_history < args.t + 1:
@@ -1200,6 +1209,8 @@ def train_once(args: argparse.Namespace) -> float:
         raise ValueError("--reward-map-grid-size must be >= 2.")
     if args.reward_map_chunk_size < 1:
         raise ValueError("--reward-map-chunk-size must be positive.")
+    if args.reward_map_interval is not None and args.reward_map_interval < 1:
+        raise ValueError("--reward-map-interval must be positive.")
     _parse_scales(args.reward_map_scales)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1286,7 +1297,7 @@ def train_once(args: argparse.Namespace) -> float:
         init_alpha=args.init_alpha,
         target_entropy=args.target_entropy,
     )
-    start_batch, update_count, best_ce_gain = _load_resume(
+    start_batch, update_count, best_relative_ce_gain = _load_resume(
         args=args,
         actor=actor,
         q1=q1,
@@ -1339,6 +1350,9 @@ def train_once(args: argparse.Namespace) -> float:
     scale_counts = [0 for _ in range(args.t)]
     latest_metrics: dict[str, float] | None = None
     next_eval_update = max(args.eval_interval, 1)
+    reward_map_interval = max(args.reward_map_interval or args.eval_interval, 1)
+    next_reward_map_update = reward_map_interval
+    last_reward_map_update: int | None = None
     elapsed_seconds = 0.0
     committed_glimpses = 0
 
@@ -1521,6 +1535,51 @@ def train_once(args: argparse.Namespace) -> float:
                     latest_metrics = eval_metrics
                     if comet_exp is not None:
                         comet_exp.log_metrics(eval_metrics, step=update_count)
+                    current_relative_ce_gain = eval_metrics["eval/relative_ce_gain"]
+                    _save_checkpoint(
+                        path=args.checkpoint_dir / "latest.pt",
+                        actor=actor,
+                        q1=q1,
+                        q2=q2,
+                        target_q1=target_q1,
+                        target_q2=target_q2,
+                        agent=agent,
+                        args=args,
+                        canvas_feature_dim=canvas_feature_dim,
+                        batch=batch_idx,
+                        updates=update_count,
+                        best_relative_ce_gain=best_relative_ce_gain,
+                        eval_metrics=eval_metrics,
+                    )
+                    if current_relative_ce_gain > best_relative_ce_gain:
+                        best_relative_ce_gain = current_relative_ce_gain
+                        _save_checkpoint(
+                            path=args.checkpoint_dir / "best.pt",
+                            actor=actor,
+                            q1=q1,
+                            q2=q2,
+                            target_q1=target_q1,
+                            target_q2=target_q2,
+                            agent=agent,
+                            args=args,
+                            canvas_feature_dim=canvas_feature_dim,
+                            batch=batch_idx,
+                            updates=update_count,
+                            best_relative_ce_gain=best_relative_ce_gain,
+                            eval_metrics=eval_metrics,
+                        )
+                    print(
+                        f"update={update_count} batch={batch_idx} "
+                        f"relative_ce_gain={current_relative_ce_gain:+.4f} "
+                        f"ce_gain={eval_metrics['eval/ce_gain']:+.4f} "
+                        f"sac_miou={eval_metrics['eval/sac_miou']:.4f}"
+                    )
+                    next_eval_update += args.eval_interval
+
+                if (
+                    args.reward_map_images > 0
+                    and update_count >= next_reward_map_update
+                ):
                     _maybe_visualize_reward_maps(
                         actor=actor,
                         q1=q1,
@@ -1534,53 +1593,17 @@ def train_once(args: argparse.Namespace) -> float:
                         update_count=update_count,
                         comet_exp=comet_exp,
                     )
-                    current_ce_gain = eval_metrics["eval/ce_gain"]
-                    _save_checkpoint(
-                        path=args.checkpoint_dir / "latest.pt",
-                        actor=actor,
-                        q1=q1,
-                        q2=q2,
-                        target_q1=target_q1,
-                        target_q2=target_q2,
-                        agent=agent,
-                        args=args,
-                        canvas_feature_dim=canvas_feature_dim,
-                        batch=batch_idx,
-                        updates=update_count,
-                        best_ce_gain=best_ce_gain,
-                        eval_metrics=eval_metrics,
-                    )
-                    if current_ce_gain > best_ce_gain:
-                        best_ce_gain = current_ce_gain
-                        _save_checkpoint(
-                            path=args.checkpoint_dir / "best.pt",
-                            actor=actor,
-                            q1=q1,
-                            q2=q2,
-                            target_q1=target_q1,
-                            target_q2=target_q2,
-                            agent=agent,
-                            args=args,
-                            canvas_feature_dim=canvas_feature_dim,
-                            batch=batch_idx,
-                            updates=update_count,
-                            best_ce_gain=best_ce_gain,
-                            eval_metrics=eval_metrics,
-                        )
-                    print(
-                        f"update={update_count} batch={batch_idx} "
-                        f"ce_gain={current_ce_gain:+.4f} "
-                        f"sac_miou={eval_metrics['eval/sac_miou']:.4f}"
-                    )
-                    next_eval_update += args.eval_interval
+                    last_reward_map_update = update_count
+                    while next_reward_map_update <= update_count:
+                        next_reward_map_update += reward_map_interval
 
         pbar.set_postfix(
             {
                 "updates": update_count,
                 "replay": replay.size,
                 "glimpses/s": f"{glimpses_per_sec:.1f}",
-                "best_ce_gain": f"{best_ce_gain:+.4f}"
-                if best_ce_gain != float("-inf")
+                "best_rel_ce": f"{best_relative_ce_gain:+.4f}"
+                if best_relative_ce_gain != float("-inf")
                 else "nan",
             }
         )
@@ -1597,25 +1620,29 @@ def train_once(args: argparse.Namespace) -> float:
             canvit_dtype=canvit_dtype,
             device=device,
         )
-        best_ce_gain = max(best_ce_gain, latest_metrics["eval/ce_gain"])
+        best_relative_ce_gain = max(
+            best_relative_ce_gain,
+            latest_metrics["eval/relative_ce_gain"],
+        )
         if comet_exp is not None:
             comet_exp.log_metrics(latest_metrics, step=update_count)
-        _maybe_visualize_reward_maps(
-            actor=actor,
-            q1=q1,
-            q2=q2,
-            eval_dataset=eval_dataset,
-            model=model,
-            probe=probe,
-            cfg=cfg,
-            args=args,
-            device=device,
-            update_count=update_count,
-            comet_exp=comet_exp,
-        )
-    final_ce_gain = latest_metrics["eval/ce_gain"]
-    if final_ce_gain >= best_ce_gain:
-        best_ce_gain = final_ce_gain
+        if args.reward_map_images > 0 and last_reward_map_update != update_count:
+            _maybe_visualize_reward_maps(
+                actor=actor,
+                q1=q1,
+                q2=q2,
+                eval_dataset=eval_dataset,
+                model=model,
+                probe=probe,
+                cfg=cfg,
+                args=args,
+                device=device,
+                update_count=update_count,
+                comet_exp=comet_exp,
+            )
+    final_relative_ce_gain = latest_metrics["eval/relative_ce_gain"]
+    if final_relative_ce_gain >= best_relative_ce_gain:
+        best_relative_ce_gain = final_relative_ce_gain
         _save_checkpoint(
             path=args.checkpoint_dir / "best.pt",
             actor=actor,
@@ -1628,7 +1655,7 @@ def train_once(args: argparse.Namespace) -> float:
             canvas_feature_dim=canvas_feature_dim,
             batch=args.batches,
             updates=update_count,
-            best_ce_gain=best_ce_gain,
+            best_relative_ce_gain=best_relative_ce_gain,
             eval_metrics=latest_metrics,
         )
     _save_checkpoint(
@@ -1643,7 +1670,7 @@ def train_once(args: argparse.Namespace) -> float:
         canvas_feature_dim=canvas_feature_dim,
         batch=args.batches,
         updates=update_count,
-        best_ce_gain=best_ce_gain,
+        best_relative_ce_gain=best_relative_ce_gain,
         eval_metrics=latest_metrics,
     )
     torch.save(actor.state_dict(), args.checkpoint_dir / "actor_final.pt")
@@ -1652,8 +1679,8 @@ def train_once(args: argparse.Namespace) -> float:
         comet_exp.log_metric("final/miou", latest_metrics["eval/sac_miou"], step=update_count)
         comet_exp.end()
     print(f"Saved canvas SAC latest checkpoint to {args.checkpoint_dir / 'latest.pt'}")
-    print(f"Best eval/ce_gain: {best_ce_gain:+.4f}")
-    return best_ce_gain
+    print(f"Best eval/relative_ce_gain: {best_relative_ce_gain:+.4f}")
+    return best_relative_ce_gain
 
 
 def parse_args() -> argparse.Namespace:
@@ -1731,12 +1758,21 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help=(
             "If >0, save true-reward vs critic-Q maps for this many validation "
-            "images after each validation pass."
+            "images every --reward-map-interval SAC updates."
         ),
     )
     parser.add_argument("--reward-map-grid-size", type=int, default=11)
     parser.add_argument("--reward-map-scales", type=str, default="0.25,0.50")
     parser.add_argument("--reward-map-chunk-size", type=int, default=16)
+    parser.add_argument(
+        "--reward-map-interval",
+        type=int,
+        default=None,
+        help=(
+            "SAC update interval for live reward maps. Defaults to "
+            "--eval-interval when omitted."
+        ),
+    )
     parser.add_argument(
         "--reward-map-output-dir",
         type=Path,
