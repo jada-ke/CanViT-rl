@@ -89,6 +89,10 @@ try:
 except ImportError:
     from scripts.visualize_sac_reward_maps import visualize_reward_maps_for_indices
 try:
+    from visualize_policy_glimpses import visualize_canvas_policy_for_indices
+except ImportError:
+    from scripts.visualize_policy_glimpses import visualize_canvas_policy_for_indices
+try:
     from canvas_sac_optuna import add_canvas_sac_optuna_args, run_canvas_sac_optuna
 except ImportError:
     from scripts.canvas_sac_optuna import (
@@ -1203,6 +1207,7 @@ def _maybe_visualize_reward_maps(
     cfg: CanViTEnvConfig,
     args: argparse.Namespace,
     device: torch.device,
+    canvit_dtype: torch.dtype,
     update_count: int,
     comet_exp,
 ) -> None:
@@ -1237,6 +1242,29 @@ def _maybe_visualize_reward_maps(
         policy_kind="canvas",
         max_history=args.max_history,
         output_name_suffix=f"update_{update_count:06d}",
+    )
+    # Problem: reward/Q maps show critic landscapes but not the actual live
+    # actor rollout that will be checkpointed. Solution: save deterministic
+    # Canvas SAC policy glimpse plots for the same images and update cadence.
+    # Result: every reward-map interval has matching actor-behavior figures.
+    paths.extend(
+        visualize_canvas_policy_for_indices(
+            actor=actor,
+            dataset=eval_dataset,
+            indices=indices,
+            model=model,
+            probe=probe,
+            cfg=cfg,
+            device=device,
+            t=args.t,
+            max_history=args.max_history,
+            min_scale=args.min_scale,
+            output_dir=args.reward_map_output_dir,
+            split_label=args.eval_split,
+            title_prefix=f"Canvas SAC validation policy update={update_count}",
+            canvit_dtype=canvit_dtype,
+            output_name_suffix=f"update_{update_count:06d}",
+        )
     )
     if comet_exp is not None:
         for path in paths:
@@ -1685,6 +1713,7 @@ def train_once(args: argparse.Namespace) -> float:
                         cfg=cfg,
                         args=args,
                         device=device,
+                        canvit_dtype=canvit_dtype,
                         update_count=update_count,
                         comet_exp=comet_exp,
                     )
@@ -1752,6 +1781,7 @@ def train_once(args: argparse.Namespace) -> float:
                 cfg=cfg,
                 args=args,
                 device=device,
+                canvit_dtype=canvit_dtype,
                 update_count=update_count,
                 comet_exp=comet_exp,
             )

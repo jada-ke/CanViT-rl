@@ -29,12 +29,11 @@ Usage:
 
     uv run python scripts/visualize_policy_glimpses.py \
         --policy canvas-sac  \
-        --policy-checkpoint checkpoints/canvas_sac/synthetic-im7-t1_1000/best.pt \
-        --dataset synthetic_segmentation  --split training\
+        --policy-checkpoint checkpoints/canvas_sac/synthetic-im7-t1-10_000-critlr_3/best.pt \
+        --dataset synthetic_segmentation  --split validation\
         --t 1 \
-        --image-index 0  --image-index 1 --image-index 2 --image-index 3 --image-index 4 \
-        --image-index 5 --image-index 6\
-        --output-dir results/canvas_policy_glimpses/synthetic-im7-t1_1000
+        --image-index 0,1,2 \
+        --output-dir results/synthetic-im7-t1-10_000-critlr_3
     
     uv run python scripts/visualize_policy_glimpses.py \
         --policy canvas-bc \
@@ -789,6 +788,7 @@ def _run_canvas_sac_episode(
     min_scale: float,
     cfg: CanViTEnvConfig,
     device: torch.device,
+    canvit_dtype: torch.dtype | None = None,
 ) -> dict:
     """Roll out a loaded image-dependent canvas SAC actor."""
     batch_size = image.shape[0]
@@ -811,6 +811,8 @@ def _run_canvas_sac_episode(
         viewpoint=full_vp,
         glimpse_size_px=cfg.glimpse_size_px,
     )
+    if canvit_dtype is not None:
+        full_glimpse = full_glimpse.to(dtype=canvit_dtype)
     out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
     state = out.state
     coords, lengths = _append_viewpoint_history(coords, lengths, full_vp, step=0)
@@ -850,6 +852,8 @@ def _run_canvas_sac_episode(
             viewpoint=vp,
             glimpse_size_px=cfg.glimpse_size_px,
         )
+        if canvit_dtype is not None:
+            glimpse = glimpse.to(dtype=canvit_dtype)
         out = model(glimpse=glimpse, state=state, viewpoint=vp)
         state = out.state
         coords, lengths = _append_viewpoint_history(coords, lengths, vp, step=step)
@@ -874,6 +878,113 @@ def _run_canvas_sac_episode(
         "rewards": rewards,
         "mious": mious,
     }
+
+
+def _dataset_stem(dataset, index: int) -> str:
+    """Return a stable image stem for ADE, synthetic, and Subset-wrapped data."""
+    base = dataset
+    real_index = index
+    if isinstance(dataset, torch.utils.data.Subset):
+        base = dataset.dataset
+        real_index = int(dataset.indices[index])
+    if hasattr(base, "images"):
+        return Path(base.images[real_index]).stem
+    return f"image_{index:05d}"
+
+
+def visualize_canvas_policy_for_indices(
+    *,
+    actor: CanvasStateActor,
+    dataset,
+    indices: list[int],
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    device: torch.device,
+    t: int,
+    max_history: int,
+    min_scale: float,
+    output_dir: Path,
+    split_label: str,
+    title_prefix: str,
+    canvit_dtype: torch.dtype | None = None,
+    output_name_suffix: str | None = None,
+) -> list[Path]:
+    """Save deterministic live Canvas SAC policy glimpse visualizations."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    was_training = actor.training
+    actor.eval()
+    try:
+        with torch.inference_mode():
+            for idx in indices:
+                image, mask = dataset[idx]
+                image_dev = image.unsqueeze(0).to(device)
+                mask_dev = mask.unsqueeze(0).to(device)
+                result = _run_canvas_sac_episode(
+                    actor=actor,
+                    model=model,
+                    probe=probe,
+                    image=image_dev,
+                    mask=mask_dev,
+                    t=t,
+                    max_history=max_history,
+                    min_scale=min_scale,
+                    cfg=cfg,
+                    device=device,
+                    canvit_dtype=canvit_dtype,
+                )
+                rows.append(
+                    {
+                        "image": image,
+                        "mask": mask,
+                        "result": result,
+                        "idx": idx,
+                        "name": _dataset_stem(dataset, idx),
+                        "label": f"{split_label} {idx:05d}",
+                        "policy_label": "canvas-sac",
+                        "title": f"{title_prefix} idx={idx}",
+                    }
+                )
+    finally:
+        if was_training:
+            actor.train()
+
+    if not rows:
+        return []
+
+    suffix = f"_{output_name_suffix}" if output_name_suffix else ""
+    if len(rows) == 1:
+        row = rows[0]
+        output = (
+            output_dir
+            / f"{split_label}_{row['idx']:05d}_{row['name']}_canvas-sac{suffix}.png"
+        )
+        _save_visualization(
+            image=row["image"],
+            mask=row["mask"],
+            viewpoints=row["result"]["viewpoints"],
+            states=row["result"]["states"],
+            model=model,
+            probe=probe,
+            canvas_grid_size=cfg.canvas_grid_size,
+            scores=row["result"]["scores"],
+            loss_reductions=row["result"]["rewards"],
+            mious=row["result"]["mious"],
+            output=output,
+            title=row["title"],
+        )
+    else:
+        index_label = "-".join(f"{row['idx']:05d}" for row in rows)
+        output = output_dir / (
+            f"{split_label}_canvas-sac_policy_rows_{index_label}{suffix}.png"
+        )
+        _save_multi_image_visualization(
+            rows=rows,
+            output=output,
+            title=f"{title_prefix} {split_label} policy glimpses",
+        )
+    return [output]
 
 
 def _parse_image_indices(values: list[str] | None) -> list[int] | None:
