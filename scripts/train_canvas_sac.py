@@ -107,8 +107,8 @@ if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
 
 REPLAY_STORAGE_DTYPE = torch.float16
 REPLAY_STORAGE_DTYPE_BYTES = 2
-REPLAY_GPU_FRACTION = 0.35
-MAX_CPU_REPLAY_BYTES = 8 * 1024**3
+REPLAY_GPU_FRACTION = 0.55
+MAX_CPU_REPLAY_BYTES =96 * 1024**3
 DATALOADER_PREFETCH_FACTOR = 4
 
 
@@ -1122,11 +1122,6 @@ def evaluate(
         "eval/final_ce": sac_ce,
         "eval/miou_gain": sac_miou - random_miou,
         "eval/ce_gain": ce_gain,
-        # Problem: validation used the same relative CE reduction as the SAC
-        # reward but logged it under a metric-specific CE name. Solution: make
-        # eval/reward the primary validation counterpart to reward/mean while
-        # keeping eval/relative_ce_gain as a compatibility alias. Result: train
-        # and validation reward curves are easier to compare in Comet/console.
         "eval/reward": eval_reward,
         "eval/relative_ce_gain": eval_reward,
         "eval/random_ce_gain": (
@@ -1185,12 +1180,6 @@ def _combine_eval_metrics(
 ) -> dict[str, float]:
     """Combine eval metrics with clear split names while preserving old aliases."""
     combined = dict(selected_metrics)
-    # Problem: train/validation overfitting checks previously required separate
-    # runs or comparing online reward to deterministic eval reward. Solution:
-    # log deterministic eval for both splits with explicit split prefixes while
-    # retaining flat eval/* aliases for the checkpoint-selected split. Result:
-    # Comet charts can compare eval/training/reward and eval/validation/reward
-    # directly without breaking older eval/reward-based analysis.
     combined.update(_split_eval_metrics(selected_metrics, selected_split))
     combined.update(_split_eval_metrics(train_metrics, train_split))
     return combined
@@ -1243,10 +1232,6 @@ def _maybe_visualize_reward_maps(
         max_history=args.max_history,
         output_name_suffix=f"update_{update_count:06d}",
     )
-    # Problem: reward/Q maps show critic landscapes but not the actual live
-    # actor rollout that will be checkpointed. Solution: save deterministic
-    # Canvas SAC policy glimpse plots for the same images and update cadence.
-    # Result: every reward-map interval has matching actor-behavior figures.
     paths.extend(
         visualize_canvas_policy_for_indices(
             actor=actor,
@@ -1576,13 +1561,6 @@ def train_once(args: argparse.Namespace) -> float:
                         rewards_np = np.asarray(reward_window, dtype=np.float64)
                         train_metrics.update(
                             {
-                                # Problem: reward/mean looked comparable to
-                                # deterministic validation reward even though
-                                # it is the stochastic online training signal.
-                                # Solution: prefix it as online train reward.
-                                # Result: overfitting checks can use
-                                # eval/training/reward vs eval/validation/reward
-                                # without confusing those with replay samples.
                                 "train/online_reward/mean": float(
                                     np.mean(rewards_np)
                                 ),

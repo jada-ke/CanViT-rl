@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 from pathlib import Path
 from typing import Any, Callable
+
+import torch
 
 
 def add_canvas_sac_optuna_args(parser: argparse.ArgumentParser) -> None:
@@ -75,23 +78,21 @@ def build_canvas_sac_trial_args(
         if tag
     )
 
-    trial_args.actor_lr = trial.suggest_float("actor_lr", 1e-5, 3e-3, log=True)
-    trial_args.critic_lr = trial.suggest_float("critic_lr", 1e-5, 3e-3, log=True)
-    trial_args.alpha_lr = trial.suggest_float("alpha_lr", 1e-5, 3e-3, log=True)
-    trial_args.init_alpha = trial.suggest_float("init_alpha", 0.01, 0.5, log=True)
-    trial_args.target_entropy = trial.suggest_float("target_entropy", -6.0, -1.0)
-    trial_args.tau = trial.suggest_float("tau", 0.001, 0.03, log=True)
+    # Problem: the original sweep space was broad and tuned for short/synthetic
+    # runs, while ADE20K trials are expensive and memory-sensitive.
+    # Solution: search the narrower ADE20K-focused optimizer/entropy ranges and
+    # leave replay sizing to the launch command. Result: Optuna spends trials on
+    # learning dynamics rather than memory-dependent knobs.
+    trial_args.actor_lr = trial.suggest_float("actor_lr", 3e-4, 1.5e-3, log=True)
+    trial_args.critic_lr = trial.suggest_float("critic_lr", 1e-4, 8e-4, log=True)
+    trial_args.alpha_lr = trial.suggest_float("alpha_lr", 1e-4, 1e-3, log=True)
+    trial_args.init_alpha = trial.suggest_float("init_alpha", 0.005, 0.05, log=True)
+    trial_args.target_entropy = trial.suggest_float("target_entropy", -5.0, -2.0)
+    trial_args.tau = trial.suggest_float("tau", 0.002, 0.01, log=True)
     # trial_args.gamma = trial.suggest_categorical("gamma", [0.0, 0.25, 0.5, 0.9])
     # trial_args.d_model = trial.suggest_categorical("d_model", [])
     # trial_args.rff_dim = trial.suggest_categorical("rff_dim", [64, 128, 256])
-    trial_args.replay_batch_size = trial.suggest_categorical(
-        "replay_batch_size",
-        [8, 16],
-    )
-    trial_args.learning_starts = trial.suggest_categorical(
-        "learning_starts",
-        [64, 128, 256, 512],
-    )
+    # Keep replay_batch_size and learning_starts fixed from CLI for ADE20K.
     # trial_args.updates_per_batch = trial.suggest_categorical(
     #     "updates_per_batch",
     #     [1, 2],
@@ -115,7 +116,13 @@ def run_canvas_sac_optuna(
 
     def objective(trial: Any) -> float:
         trial_args = build_canvas_sac_trial_args(args, trial)
-        return train_once(trial_args)
+        try:
+            return train_once(trial_args)
+        finally:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
     study = optuna.create_study(
         direction="maximize",
