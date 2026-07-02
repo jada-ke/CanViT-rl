@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import math
 import random
 import sys
 import time
@@ -559,11 +560,6 @@ class CanvasReplayBuffer:
             dtype=tensor.dtype,
             non_blocking=self.storage_device.type == "cuda",
         )
-        # Problem: The old replay path converted CUDA tensors to NumPy and
-        # looped row-by-row, inflating RAM and synchronizing every transition.
-        # Solution: write each contiguous circular segment with tensor copies.
-        # Result: adds stay in torch, support CUDA-resident replay, and perform
-        # at most two copies when a batch wraps around the ring buffer.
         if end <= self.capacity:
             tensor[self.pos:end].copy_(
                 values,
@@ -840,10 +836,6 @@ def _load_resume(
         agent.alpha_opt.load_state_dict(checkpoint["alpha_opt"])
     if "log_alpha" in checkpoint:
         agent.log_alpha.data.copy_(checkpoint["log_alpha"])
-    # Problem: older checkpoints stored the selection score under a raw CE-gain
-    # name. Solution: prefer the explicit relative key, but keep the fallback
-    # for resumes. Result: new runs match the reward scale without abandoning
-    # existing checkpoints.
     return (
         int(checkpoint.get("batch", 0)) + 1,
         int(checkpoint.get("updates", 0)),
@@ -1039,8 +1031,14 @@ def evaluate(
     device: torch.device,
 ) -> dict[str, float]:
     """Evaluate Random, EG-C2F, and canvas SAC on a fixed validation subset."""
-    random_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
-    egc2f_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
+    eval_random = not args.skip_eval_random
+    eval_egc2f = not args.skip_eval_egc2f
+    random_acc = (
+        mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device) if eval_random else None
+    )
+    egc2f_acc = (
+        mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device) if eval_egc2f else None
+    )
     sac_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
     ce_sums = defaultdict(float)
     n_images = 0
@@ -1054,26 +1052,34 @@ def evaluate(
         batch_size = images.shape[0]
         n_images += batch_size
 
-        rand_initial, rand_final = _eval_random_batch(
-            model=model,
-            probe=probe,
-            images=images,
-            masks=masks,
-            cfg=cfg,
-            args=args,
-            canvit_dtype=canvit_dtype,
-            acc=random_acc,
-        )
-        eg_initial, eg_final = _eval_egc2f_batch(
-            model=model,
-            probe=probe,
-            images=images,
-            masks=masks,
-            cfg=cfg,
-            args=args,
-            canvit_dtype=canvit_dtype,
-            acc=egc2f_acc,
-        )
+        if eval_random:
+            assert random_acc is not None
+            rand_initial, rand_final = _eval_random_batch(
+                model=model,
+                probe=probe,
+                images=images,
+                masks=masks,
+                cfg=cfg,
+                args=args,
+                canvit_dtype=canvit_dtype,
+                acc=random_acc,
+            )
+            ce_sums["random_initial"] += float(rand_initial.sum().item())
+            ce_sums["random_final"] += float(rand_final.sum().item())
+        if eval_egc2f:
+            assert egc2f_acc is not None
+            eg_initial, eg_final = _eval_egc2f_batch(
+                model=model,
+                probe=probe,
+                images=images,
+                masks=masks,
+                cfg=cfg,
+                args=args,
+                canvit_dtype=canvit_dtype,
+                acc=egc2f_acc,
+            )
+            ce_sums["egc2f_initial"] += float(eg_initial.sum().item())
+            ce_sums["egc2f_final"] += float(eg_final.sum().item())
         sac_initial, sac_final = _eval_canvas_sac_batch(
             actor=actor,
             model=model,
@@ -1089,18 +1095,14 @@ def evaluate(
             scale_counts=sac_scale_counts,
             entropy_points=sac_entropy_points,
         )
-        ce_sums["random_initial"] += float(rand_initial.sum().item())
-        ce_sums["random_final"] += float(rand_final.sum().item())
-        ce_sums["egc2f_initial"] += float(eg_initial.sum().item())
-        ce_sums["egc2f_final"] += float(eg_final.sum().item())
         ce_sums["sac_initial"] += float(sac_initial.sum().item())
         ce_sums["sac_final"] += float(sac_final.sum().item())
 
-    random_miou = float(random_acc.compute())
-    egc2f_miou = float(egc2f_acc.compute())
+    random_miou = float(random_acc.compute()) if random_acc is not None else math.nan
+    egc2f_miou = float(egc2f_acc.compute()) if egc2f_acc is not None else math.nan
     sac_miou = float(sac_acc.compute())
-    random_ce = ce_sums["random_final"] / max(n_images, 1)
-    egc2f_ce = ce_sums["egc2f_final"] / max(n_images, 1)
+    random_ce = ce_sums["random_final"] / max(n_images, 1) if eval_random else math.nan
+    egc2f_ce = ce_sums["egc2f_final"] / max(n_images, 1) if eval_egc2f else math.nan
     sac_initial_ce = ce_sums["sac_initial"] / max(n_images, 1)
     sac_ce = ce_sums["sac_final"] / max(n_images, 1)
     ce_gain = sac_initial_ce - sac_ce
@@ -1123,8 +1125,16 @@ def evaluate(
         # and validation reward curves are easier to compare in Comet/console.
         "eval/reward": eval_reward,
         "eval/relative_ce_gain": eval_reward,
-        "eval/random_ce_gain": ce_sums["random_initial"] / max(n_images, 1) - random_ce,
-        "eval/egc2f_ce_gain": ce_sums["egc2f_initial"] / max(n_images, 1) - egc2f_ce,
+        "eval/random_ce_gain": (
+            ce_sums["random_initial"] / max(n_images, 1) - random_ce
+            if eval_random
+            else math.nan
+        ),
+        "eval/egc2f_ce_gain": (
+            ce_sums["egc2f_initial"] / max(n_images, 1) - egc2f_ce
+            if eval_egc2f
+            else math.nan
+        ),
         "eval/sac_vs_random": sac_miou - random_miou,
         "eval/sac_vs_egc2f": sac_miou - egc2f_miou,
         "eval/sac_viewpoint_entropy": _viewpoint_entropy(
@@ -1856,6 +1866,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument(
+        "--skip-eval-random",
+        action="store_true",
+        help="Skip random-policy baseline rollouts during eval.",
+    )
+    parser.add_argument(
+        "--skip-eval-egc2f",
+        action="store_true",
+        help="Skip entropy-guided coarse-to-fine baseline rollouts during eval.",
+    )
     parser.add_argument("--comet-log-interval", type=int, default=20)
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument(
