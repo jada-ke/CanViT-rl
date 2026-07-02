@@ -38,8 +38,17 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from canvit_rl.env import CanViTEnvConfig, get_device
+from canvit_rl.canvas_state import (
+    append_viewpoint_history,
+    canvas_layernorm_spatial,
+    empty_viewpoint_history,
+)
 from canvit_rl.greedy import miou_from_state
-from canvit_rl.sac_models import CanViTSequenceEncoder, GaussianActor
+from canvit_rl.sac_models import (
+    CanViTSequenceEncoder,
+    CanvasStateActor,
+    GaussianActor,
+)
 from canvit_rl.sac_state import (
     append_glimpse,
     batch_from_sequence,
@@ -68,13 +77,15 @@ def _update_miou(
     acc.update(logits.argmax(dim=1), masks)
 
 
-def _load_checkpoint(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+def _load_checkpoint(
+    path: Path,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
     """Load either latest.pt dict checkpoints or bare actor_final.pt weights."""
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(checkpoint, dict) and "actor" in checkpoint:
-        return checkpoint["actor"], dict(checkpoint.get("args", {}))
+        return checkpoint["actor"], dict(checkpoint.get("args", {})), checkpoint
     if isinstance(checkpoint, dict):
-        return checkpoint, {}
+        return checkpoint, {}, {}
     raise TypeError(f"Unsupported checkpoint format at {path}")
 
 
@@ -85,6 +96,17 @@ def _checkpoint_value(
 ) -> Any:
     """Read a training arg from checkpoint metadata with CLI fallback."""
     return checkpoint_args.get(key.replace("-", "_"), fallback)
+
+
+def _is_canvas_checkpoint(payload: dict[str, Any]) -> bool:
+    """Detect image-dependent Canvas SAC checkpoints from saved metadata."""
+    state_representation = str(
+        payload.get(
+            "state_representation",
+            payload.get("metadata", {}).get("state_representation", ""),
+        )
+    )
+    return state_representation == "current_canvas_layernorm_with_viewpoint_history"
 
 
 def _build_actor(
@@ -116,6 +138,39 @@ def _build_actor(
     return actor
 
 
+def _build_canvas_actor(
+    *,
+    actor_state: dict[str, torch.Tensor],
+    args: argparse.Namespace,
+    checkpoint_args: dict[str, Any],
+    payload: dict[str, Any],
+    device: torch.device,
+) -> CanvasStateActor:
+    """Reconstruct a current-canvas SAC actor and load checkpoint weights."""
+    d_model = int(_checkpoint_value(checkpoint_args, "d-model", args.d_model))
+    rff_dim = int(_checkpoint_value(checkpoint_args, "rff-dim", args.rff_dim))
+    rff_seed = int(_checkpoint_value(checkpoint_args, "rff-seed", args.rff_seed))
+    canvas_feature_dim = payload.get(
+        "canvas_feature_dim",
+        payload.get("metadata", {}).get("canvas_feature_dim", args.canvas_feature_dim),
+    )
+    if canvas_feature_dim is None:
+        raise ValueError(
+            "Canvas SAC checkpoint is missing canvas_feature_dim; pass "
+            "--canvas-feature-dim or use a train_canvas_sac.py checkpoint."
+        )
+    actor = CanvasStateActor(
+        canvas_feature_dim=int(canvas_feature_dim),
+        d_model=d_model,
+        rff_dim=rff_dim,
+        rff_seed=rff_seed,
+    ).to(device).eval()
+    actor.load_state_dict(actor_state)
+    for param in actor.parameters():
+        param.requires_grad_(False)
+    return actor
+
+
 def _deterministic_action(
     actor: GaussianActor,
     batch: dict[str, torch.Tensor],
@@ -123,6 +178,14 @@ def _deterministic_action(
     """Return tanh(mean) action for deterministic policy evaluation."""
     mean, _ = actor(batch)
     return torch.tanh(mean)
+
+
+def _deterministic_canvas_action(
+    actor: CanvasStateActor,
+    batch: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Return deterministic action for image-dependent Canvas SAC actors."""
+    return actor.deterministic_action(batch)
 
 
 def main() -> None:
@@ -152,6 +215,10 @@ def main() -> None:
     parser.add_argument("--n-layers", type=int, default=2)
     parser.add_argument("--n-patches", type=int, default=64)
     parser.add_argument("--patch-dim", type=int, default=768)
+    parser.add_argument("--rff-dim", type=int, default=128)
+    parser.add_argument("--rff-seed", type=int, default=42)
+    parser.add_argument("--max-history", type=int, default=6)
+    parser.add_argument("--canvas-feature-dim", type=int, default=None)
     parser.add_argument(
         "--miou-mode",
         choices=["accumulator", "mean"],
@@ -175,7 +242,8 @@ def main() -> None:
     device = get_device()
     print(f"Device: {device}")
 
-    actor_state, checkpoint_args = _load_checkpoint(args.checkpoint)
+    actor_state, checkpoint_args, checkpoint_payload = _load_checkpoint(args.checkpoint)
+    is_canvas_policy = _is_canvas_checkpoint(checkpoint_payload)
     checkpoint_t = int(_checkpoint_value(checkpoint_args, "t", args.t))
     if args.t != checkpoint_t:
         print(
@@ -185,13 +253,32 @@ def main() -> None:
     n_patches = int(_checkpoint_value(checkpoint_args, "n-patches", args.n_patches))
     patch_dim = int(_checkpoint_value(checkpoint_args, "patch-dim", args.patch_dim))
     min_scale = float(_checkpoint_value(checkpoint_args, "min-scale", args.min_scale))
+    max_history = int(_checkpoint_value(checkpoint_args, "max-history", args.max_history))
+    if is_canvas_policy and args.t + 1 > max_history:
+        raise ValueError(
+            f"Canvas SAC rollout needs max_history >= t+1, got "
+            f"max_history={max_history} and t={args.t}."
+        )
 
-    actor = _build_actor(
-        actor_state=actor_state,
-        args=args,
-        checkpoint_args=checkpoint_args,
-        device=device,
-    )
+    if is_canvas_policy:
+        actor = _build_canvas_actor(
+            actor_state=actor_state,
+            args=args,
+            checkpoint_args=checkpoint_args,
+            payload=checkpoint_payload,
+            device=device,
+        )
+        policy_name = "canvas_sac"
+        print("Policy: canvas-dependent SAC")
+    else:
+        actor = _build_actor(
+            actor_state=actor_state,
+            args=args,
+            checkpoint_args=checkpoint_args,
+            device=device,
+        )
+        policy_name = "canvit_sac"
+        print("Policy: viewpoint-history SAC")
 
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
     dataset = ADE20kDataset(
@@ -262,6 +349,11 @@ def main() -> None:
                 canvas_grid_size=cfg.canvas_grid_size,
             )
             seq = empty_sequence(n_patches=n_patches, patch_dim=patch_dim)
+            coords, lengths = empty_viewpoint_history(
+                batch_size=1,
+                max_steps=max_history,
+                device=device,
+            )
 
             full_vp = Viewpoint.full_scene(batch_size=1, device=device)
             full_glimpse = sample_at_viewpoint(
@@ -277,21 +369,43 @@ def main() -> None:
                 patches=patches,
                 viewpoint=full_vp,
             )
+            coords, lengths = append_viewpoint_history(
+                coords=coords,
+                lengths=lengths,
+                viewpoint=full_vp,
+                step=0,
+            )
+            canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
 
             step_states = [state]
             step_scales = [1.0]
-            for _ in range(args.t):
-                batch = batch_from_sequence(
-                    seq,
-                    max_steps=checkpoint_t,
-                    n_patches=n_patches,
-                    patch_dim=patch_dim,
-                    device=device,
-                )
-                if args.stochastic:
-                    action, _ = actor.sample(batch)
+            for step_idx in range(args.t):
+                if is_canvas_policy:
+                    batch = {
+                        "canvas": canvas_summary,
+                        "coords": coords,
+                        "lengths": lengths,
+                    }
+                    if args.stochastic:
+                        action, _ = actor.sample(batch)
+                    else:
+                        action = _deterministic_canvas_action(actor, batch)
                 else:
-                    action = _deterministic_action(actor, batch)
+                    batch = batch_from_sequence(
+                        seq,
+                        max_steps=checkpoint_t,
+                        n_patches=n_patches,
+                        patch_dim=patch_dim,
+                        device=device,
+                    )
+                    if args.stochastic:
+                        action, _ = actor.sample(batch)
+                    else:
+                        action = _deterministic_action(actor, batch)
                 vp = _action_to_viewpoint(action, min_scale=min_scale)
                 glimpse = sample_at_viewpoint(
                     spatial=image,
@@ -306,6 +420,18 @@ def main() -> None:
                     patches=patches,
                     viewpoint=vp,
                 )
+                coords, lengths = append_viewpoint_history(
+                    coords=coords,
+                    lengths=lengths,
+                    viewpoint=vp,
+                    step=step_idx + 1,
+                )
+                if is_canvas_policy:
+                    canvas_summary = canvas_layernorm_spatial(
+                        model=model,
+                        state=state,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                    )
                 step_states.append(state)
                 step_scales.append(float(vp.scales[0].detach().cpu().item()))
 
@@ -369,7 +495,7 @@ def main() -> None:
             "mious": mious,
             "mean_scales": mean_scales,
             "metadata": {
-                "policy": "canvit_sac",
+                "policy": policy_name,
                 "checkpoint": str(args.checkpoint),
                 "dataset": args.dataset,
                 "split": args.split,

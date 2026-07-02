@@ -284,6 +284,34 @@ def _segmentation_metrics(
     return losses, miou
 
 
+def _update_miou_accumulator(
+    *,
+    model,
+    probe: torch.nn.Module,
+    state,
+    masks: torch.Tensor,
+    cfg: CanViTEnvConfig,
+    acc: mIoUAccumulator,
+) -> None:
+    """Update dataset-level mIoU for one CanViT canvas state without CE."""
+    spatial = model.get_spatial(state.canvas).reshape(
+        masks.shape[0],
+        cfg.canvas_grid_size,
+        cfg.canvas_grid_size,
+        -1,
+    )
+    with torch.autocast(device_type=spatial.device.type, enabled=False):
+        logits = probe(spatial.float()).float()
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(
+            logits,
+            size=masks.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    acc.update(logits.argmax(dim=1), masks)
+
+
 def _viewpoint_entropy(values: list[np.ndarray], *, bins: int) -> float:
     """Entropy of visited (y, x, scale) bins, normalized to [0, 1]."""
     if not values:
@@ -1161,6 +1189,178 @@ def evaluate(
     return metrics
 
 
+def _should_run_final_full_validation_miou(args: argparse.Namespace) -> bool:
+    """Return whether this run should finish with a full validation mIoU pass."""
+    if getattr(args, "skip_final_full_validation_miou", False):
+        return False
+    return getattr(args, "optuna_trial", None) is None
+
+
+def _evaluate_best_full_validation_miou(
+    *,
+    actor: CanvasStateActor,
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    canvit_dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[dict[str, float], list[int], list[float]]:
+    """Evaluate best.pt per timestep on validation with mIoUAccumulator."""
+    best_path = args.checkpoint_dir / "best.pt"
+    if not best_path.is_file():
+        raise FileNotFoundError(f"Cannot run final full mIoU; missing {best_path}")
+
+    checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+    actor.load_state_dict(checkpoint["actor"])
+    actor.eval()
+
+    img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
+    full_validation_dataset = _build_segmentation_dataset(
+        args=args,
+        cfg=cfg,
+        split="validation",
+        img_tf=img_tf,
+        mask_tf=mask_tf,
+    )
+    if len(full_validation_dataset) == 0:
+        raise ValueError("Full validation dataset must be non-empty.")
+
+    full_validation_loader = DataLoader(
+        full_validation_dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        **_dataloader_kwargs(args, device),
+    )
+
+    accs = [
+        mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
+        for _ in range(args.t + 1)
+    ]
+    n_images = 0
+
+    for images, masks in tqdm(
+        full_validation_loader,
+        desc="Full validation timestep mIoU for best Canvas SAC",
+        leave=False,
+    ):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        batch_size = images.shape[0]
+        n_images += batch_size
+        state = model.init_state(
+            batch_size=batch_size,
+            canvas_grid_size=cfg.canvas_grid_size,
+        )
+        coords, lengths = empty_viewpoint_history(
+            batch_size=batch_size,
+            max_steps=args.max_history,
+            device=device,
+        )
+        full_vp = Viewpoint.full_scene(batch_size=batch_size, device=device)
+        with torch.inference_mode():
+            full_glimpse = sample_at_viewpoint(
+                spatial=images,
+                viewpoint=full_vp,
+                glimpse_size_px=cfg.glimpse_size_px,
+            ).to(dtype=canvit_dtype)
+            out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
+            state = out.state
+            _update_miou_accumulator(
+                model=model,
+                probe=probe,
+                state=state,
+                masks=masks,
+                cfg=cfg,
+                acc=accs[0],
+            )
+            canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+        coords, lengths = append_viewpoint_history(
+            coords=coords,
+            lengths=lengths,
+            viewpoint=full_vp,
+            step=0,
+        )
+        for step_idx in range(args.t):
+            obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
+            with torch.no_grad():
+                action = actor.deterministic_action(obs)
+            vp = action_to_viewpoint(action, min_scale=args.min_scale)
+            with torch.inference_mode():
+                glimpse = sample_at_viewpoint(
+                    spatial=images,
+                    viewpoint=vp,
+                    glimpse_size_px=cfg.glimpse_size_px,
+                ).to(dtype=canvit_dtype)
+                out = model(glimpse=glimpse, state=state, viewpoint=vp)
+                state = out.state
+                _update_miou_accumulator(
+                    model=model,
+                    probe=probe,
+                    state=state,
+                    masks=masks,
+                    cfg=cfg,
+                    acc=accs[step_idx + 1],
+                )
+                canvas_summary = canvas_layernorm_spatial(
+                    model=model,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                )
+            coords, lengths = append_viewpoint_history(
+                coords=coords,
+                lengths=lengths,
+                viewpoint=vp,
+                step=step_idx + 1,
+            )
+
+    metrics = {
+        f"final_full_validation/miou_t{step_idx}": float(acc.compute())
+        for step_idx, acc in enumerate(accs)
+    }
+    timesteps = list(range(args.t + 1))
+    miou_values = [
+        metrics[f"final_full_validation/miou_t{step_idx}"]
+        for step_idx in timesteps
+    ]
+
+    print(
+        "Best checkpoint full validation mIoU by timestep "
+        f"(accumulator, {n_images} images):"
+    )
+    for step_idx, miou in zip(timesteps, miou_values, strict=True):
+        print(f"  t{step_idx}: {miou:.4f}")
+    return metrics, timesteps, miou_values
+
+
+def _log_final_full_validation_miou_curve(
+    *,
+    comet_exp,
+    timesteps: list[int],
+    miou_values: list[float],
+    step: int,
+) -> None:
+    """Log final mIoU vs timestep as a Comet curve panel."""
+    if hasattr(comet_exp, "log_curve"):
+        comet_exp.log_curve(
+            "final_full_validation_miou_by_timestep",
+            x=timesteps,
+            y=miou_values,
+            step=step,
+        )
+        return
+    for timestep, miou in zip(timesteps, miou_values, strict=True):
+        comet_exp.log_metric(
+            "final_full_validation/miou_by_timestep",
+            miou,
+            step=timestep,
+        )
+
+
 def _split_eval_metrics(metrics: dict[str, float], split: str) -> dict[str, float]:
     """Return explicit split-prefixed aliases for eval metrics."""
     prefix = f"eval/{split}/"
@@ -1203,13 +1403,6 @@ def _maybe_visualize_reward_maps(
     """Optionally save live canvas SAC reward/Q maps after validation."""
     if args.reward_map_images <= 0:
         return
-    # Fixed by Codex on 2026-06-23
-    # Problem: Canvas SAC validation logged scalar metrics but could not show
-    # whether the image-dependent critic's Q landscape matched true CE gains.
-    # Solution: reuse the reward-map renderer with live CanvasStateActor/Critic
-    # modules and explicitly select the canvas policy path.
-    # Result: Each enabled eval pass can save and optionally Comet-log reward
-    # maps for the same canvas-dependent networks being validated.
     indices = list(range(min(args.reward_map_images, len(eval_dataset))))
     paths = visualize_reward_maps_for_indices(
         actor=actor,
@@ -1718,7 +1911,6 @@ def train_once(args: argparse.Namespace) -> float:
             probe=probe,
             cfg=cfg,
             args=args,
-            canvas_feature_dim=canvas_feature_dim,
             canvit_dtype=canvit_dtype,
             device=device,
         )
@@ -1801,6 +1993,41 @@ def train_once(args: argparse.Namespace) -> float:
         comet_exp.log_metric("final/reward", latest_metrics["eval/reward"], step=update_count)
         comet_exp.log_metric("final/ce_gain", latest_metrics["eval/ce_gain"], step=update_count)
         comet_exp.log_metric("final/miou", latest_metrics["eval/sac_miou"], step=update_count)
+
+    if _should_run_final_full_validation_miou(args):
+        # Problem: the in-loop validation loader is intentionally capped by
+        # --eval-images, so best.pt may not have a full-validation mIoU
+        # trajectory attached to it.
+        # Solution: after all training checkpoints are saved, reload best.pt
+        # and run the Canvas SAC policy over the uncapped validation split with
+        # one mIoUAccumulator per timestep.
+        # Result: completed non-Optuna runs finish with a full-validation
+        # t0..tN mIoU curve panel for the selected best model.
+        (
+            full_validation_metrics,
+            full_validation_timesteps,
+            full_validation_mious,
+        ) = _evaluate_best_full_validation_miou(
+            actor=actor,
+            model=model,
+            probe=probe,
+            cfg=cfg,
+            args=args,
+            canvit_dtype=canvit_dtype,
+            device=device,
+        )
+        if comet_exp is not None:
+            comet_exp.log_metrics(full_validation_metrics, step=update_count)
+            _log_final_full_validation_miou_curve(
+                comet_exp=comet_exp,
+                timesteps=full_validation_timesteps,
+                miou_values=full_validation_mious,
+                step=update_count,
+            )
+    else:
+        print("Skipped final full validation mIoU evaluation.")
+
+    if comet_exp is not None:
         comet_exp.end()
     print(f"Saved canvas SAC latest checkpoint to {args.checkpoint_dir / 'latest.pt'}")
     print(f"Best eval/reward: {best_relative_ce_gain:+.4f}")
@@ -1874,6 +2101,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument(
+        "--skip-final-full-validation-miou",
+        action="store_true",
+        help=(
+            "Skip the post-training best.pt evaluation on the full validation "
+            "split with mIoUAccumulator."
+        ),
+    )
     parser.add_argument(
         "--skip-eval-random",
         action="store_true",
