@@ -70,12 +70,13 @@ from PIL import Image
 from tqdm import tqdm
 
 from canvit_rl.ade_labels import remap_ade_mask_labels
-from canvit_rl.canvas_state import canvas_layernorm_spatial
+from canvit_rl.canvas.state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import _repeat_state_chunks, _segmentation_cross_entropy_losses
-from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic, ViewpointHistoryCritic
+from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 from canvit_rl.viewpoint_policy import (
     ViewpointGaussianActor,
+    ViewpointHistoryCritic,
     action_to_viewpoint,
     viewpoint_to_action,
 )
@@ -132,14 +133,6 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
             (self.scene_size_px, self.scene_size_px),
             resample=resample_nearest,
         )
-        # Fixed by Codex on 2026-06-23
-        # Fixed by Codex on 2026-06-24
-        # Problem: Older synthetic masks may contain raw ADE ids 1..150, and
-        # label 150 is out of bounds for reward-map CE targets.
-        # Solution: preserve semantic labels but normalize raw ADE ids to
-        # zero-based 0..149 while keeping IGNORE_LABEL=255 padding.
-        # Result: Reward maps can read synthetic roots without ADE-style split
-        # subfolders while retaining valid semantic targets.
         mask_tensor = torch.from_numpy(
             remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
         )
@@ -152,13 +145,6 @@ def _build_dataset(*, root: Path, split: str, cfg: CanViTEnvConfig, img_tf, mask
         ((root / "images" / split).is_dir() and (root / "masks" / split).is_dir())
         or ((root / "images").is_dir() and (root / "masks").is_dir())
     ):
-        # Fixed by Codex on 2026-06-24
-        # Problem: Reward-map visualization needed to read the same synthetic
-        # training/validation split layout produced by the generator.
-        # Solution: detect images/<split> and masks/<split> first, falling back
-        # to the old flat images/ and masks/ layout.
-        # Result: --dataset synthetic_segmentation --split validation reads the
-        # validation synthetic split without custom paths.
         return SyntheticSegmentationDataset(
             root=root,
             split=split,
@@ -253,12 +239,6 @@ def _sample_canvit_glimpse(
     canvit_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Sample one CanViT glimpse and match the frozen backbone precision."""
-    # Problem: live Canvas SAC training can cast frozen CanViT to bf16, but the
-    # reward-map visualizer sampled fp32 glimpses before calling model(...).
-    # Solution: infer the patch-embed dtype from the passed model and cast each
-    # sampled glimpse once at the model boundary.
-    # Result: standalone fp32 maps and live bf16 training maps both feed Conv2d
-    # the dtype its weights expect.
     return sample_at_viewpoint(
         spatial=image,
         viewpoint=viewpoint,
@@ -309,14 +289,6 @@ def _build_actor_and_critics(
     target = str(
         payload.get("target", payload.get("metadata", {}).get("target", "raw_ce_gain"))
     )
-    # Fixed by Codex on 2026-06-23
-    # Problem: Canvas SAC checkpoints store CanvasStateActor/Critic weights,
-    # but this visualizer always rebuilt viewpoint-history networks.
-    # Solution: dispatch from checkpoint metadata and construct the matching
-    # canvas-dependent modules when the checkpoint was produced by
-    # train_canvas_sac.py.
-    # Result: The same reward-map command can inspect both image-independent
-    # viewpoint-history SAC and image-dependent canvas SAC checkpoints.
     if state_representation == "current_canvas_layernorm_with_viewpoint_history":
         canvas_feature_dim = int(
             payload.get(
@@ -431,13 +403,6 @@ def _evaluate_grid(
             )
             raw_gain = current_ce.expand_as(ce_after) - ce_after
             if reward_target == "relative_ce_reduction":
-                # Fixed by Codex on 2026-06-25
-                # Problem: Critic pretraining now targets normalized CE gain,
-                # but reward-map plots compared Q against raw CE deltas.
-                # Solution: use the checkpoint's target metadata to plot the
-                # same true reward scale the critic was trained on.
-                # Result: Critic-only Q maps can be visually compared against
-                # matching relative CE-gain targets.
                 reward = raw_gain / current_ce.expand_as(ce_after).clamp_min(1e-6)
             else:
                 reward = raw_gain
@@ -446,13 +411,6 @@ def _evaluate_grid(
                 "lengths": lengths.repeat(repeats),
             }
             if canvas_summary is not None:
-                # Fixed by Codex on 2026-06-23
-                # Problem: Canvas SAC critics require the current image canvas
-                # state in addition to viewpoint history.
-                # Solution: repeat the pre-action canvas summary for every
-                # candidate action in this grid chunk.
-                # Result: Predicted Q maps use Q(canvas, history, action)
-                # instead of the image-independent Q(history, action) path.
                 history_batch["canvas"] = canvas_summary.repeat(
                     repeats,
                     1,
@@ -568,10 +526,6 @@ def _save_combined_reward_maps(
             reward_ax.set_ylabel("y center")
             fig.colorbar(reward_im, ax=reward_ax, fraction=0.046, pad=0.04)
             if reward_max_center is not None:
-                # Problem: large hollow peak markers obscured diffused maps.
-                # Solution: use a compact X at the argmax location while
-                # keeping reward/Q colors distinct. Result: peak alignment is
-                # visible without covering the local heatmap structure.
                 reward_ax.scatter(
                     [reward_max_center[0]],
                     [reward_max_center[1]],
@@ -724,15 +678,6 @@ def visualize_reward_maps_for_indices(
                     canvas_summary = None
                     actor_batch = {"coords": coords, "lengths": lengths}
                     if policy_kind == "canvas":
-                        # Fixed by Codex on 2026-06-24
-                        # Problem: Reward maps only showed the first post-warmup
-                        # state, so later canvas-dependent policy states could not
-                        # be inspected.
-                        # Solution: roll out the deterministic policy for the
-                        # requested number of learned glimpses, reconstructing the
-                        # canvas observation before each canvas actor decision.
-                        # Result: --state-step N visualizes the next-action
-                        # reward/Q landscape after N learned policy glimpses.
                         canvas_summary = canvas_layernorm_spatial(
                             model=model,
                             state=state,

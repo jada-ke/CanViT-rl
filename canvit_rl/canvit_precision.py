@@ -30,13 +30,6 @@ def configure_frozen_canvit_precision(
     """Put frozen CanViT in bf16/fp32 while keeping the probe in fp32."""
     dtype = resolve_canvit_dtype(requested, device)
     model.to(device=device, dtype=dtype)
-    # Fixed by Codex on 2026-06-28
-    # Problem: model.to(dtype=torch.bfloat16) also casts the upstream
-    # VPEEncoder's frozen RFF matrix, but VPEEncoder.forward disables autocast
-    # and builds fp32 coordinate features before multiplying by that matrix.
-    # Solution: keep VPEEncoder modules in fp32 after the bulk CanViT cast.
-    # Result: frozen CanViT can still run bf16 patch/canvas inference without
-    # dtype mismatches in viewpoint encoding.
     for module in model.modules():
         if module.__class__.__name__ == "VPEEncoder":
             module.to(device=device, dtype=torch.float32)

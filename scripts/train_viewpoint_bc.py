@@ -55,21 +55,19 @@ from canvit_pytorch import (
     sample_at_viewpoint,
 )
 from canvit_specialize.datasets.ade20k import (
-    ADE20kDataset,
     IGNORE_LABEL,
     NUM_CLASSES,
     make_val_transforms,
 )
-from PIL import Image
 from canvit_specialize.metrics import mIoUAccumulator
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
-from canvit_rl.ade_labels import remap_ade_mask_labels
-from canvit_rl.canvas_state import canvas_layernorm_spatial
+from canvit_rl.canvas.state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import greedy_step_batch
 from canvit_rl.sac_models import CanvasStateActor
+from canvit_rl.synthetic_data import build_segmentation_dataset
 from canvit_rl.viewpoint_policy import (
     ViewpointGaussianActor,
     action_to_viewpoint,
@@ -176,113 +174,6 @@ def _update_miou_and_ce(
     )
     acc.update(logits.argmax(dim=1), masks)
     return ce_loss
-
-
-class SyntheticSegmentationDataset(torch.utils.data.Dataset):
-    """Image/mask folder dataset for ADE-embedded synthetic segmentation."""
-
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-    def __init__(
-        self,
-        *,
-        image_dir: Path,
-        mask_dir: Path,
-        scene_size_px: int,
-        img_transform,
-    ) -> None:
-        if not image_dir.is_dir():
-            raise FileNotFoundError(f"Synthetic image directory not found: {image_dir}")
-        if not mask_dir.is_dir():
-            raise FileNotFoundError(f"Synthetic mask directory not found: {mask_dir}")
-        self.scene_size_px = scene_size_px
-        self.img_transform = img_transform
-        self.images = sorted(
-            path
-            for path in image_dir.iterdir()
-            if path.suffix.lower() in self.IMAGE_EXTENSIONS
-        )
-        if not self.images:
-            raise ValueError(f"No synthetic images found in {image_dir}")
-        mask_by_stem = {
-            path.stem: path
-            for path in mask_dir.iterdir()
-            if path.suffix.lower() in self.IMAGE_EXTENSIONS
-        }
-        missing = [path.name for path in self.images if path.stem not in mask_by_stem]
-        if missing:
-            raise ValueError(
-                "Missing synthetic masks with matching stems for: "
-                + ", ".join(missing[:10])
-            )
-        self.masks = [mask_by_stem[path.stem] for path in self.images]
-
-    def __len__(self) -> int:
-        return len(self.images)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        image = Image.open(self.images[index]).convert("RGB")
-        mask = Image.open(self.masks[index]).convert("L")
-        image_tensor = self.img_transform(image)
-        resample_nearest = getattr(Image, "Resampling", Image).NEAREST
-        mask = mask.resize(
-            (self.scene_size_px, self.scene_size_px),
-            resample=resample_nearest,
-        )
-        mask_tensor = torch.from_numpy(
-            remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
-        )
-        return image_tensor, mask_tensor
-
-
-def _build_segmentation_dataset(
-    *,
-    args: argparse.Namespace,
-    cfg: CanViTEnvConfig,
-    split: str,
-    img_tf,
-    mask_tf,
-):
-    """Build either ADE20K or folder-based synthetic segmentation data."""
-    dataset_root = Path(args.dataset)
-    split_image_dir = dataset_root / "images" / split
-    split_mask_dir = dataset_root / "masks" / split
-    inferred_synthetic = (
-        (split_image_dir.is_dir() and split_mask_dir.is_dir())
-        or ((dataset_root / "images").is_dir() and (dataset_root / "masks").is_dir())
-    )
-    dataset_format = (
-        "synthetic"
-        if args.dataset_format == "auto" and inferred_synthetic
-        else "ade20k"
-        if args.dataset_format == "auto"
-        else args.dataset_format
-    )
-    if dataset_format == "ade20k":
-        return ADE20kDataset(
-            root=dataset_root,
-            split=split,
-            img_transform=img_tf,
-            mask_transform=mask_tf,
-        )
-    if args.synthetic_image_dir:
-        image_dir = Path(args.synthetic_image_dir)
-    elif split_image_dir.is_dir():
-        image_dir = split_image_dir
-    else:
-        image_dir = dataset_root / "images"
-    if args.synthetic_mask_dir:
-        mask_dir = Path(args.synthetic_mask_dir)
-    elif split_mask_dir.is_dir():
-        mask_dir = split_mask_dir
-    else:
-        mask_dir = dataset_root / "masks"
-    return SyntheticSegmentationDataset(
-        image_dir=image_dir,
-        mask_dir=mask_dir,
-        scene_size_px=cfg.scene_size_px,
-        img_transform=img_tf,
-    )
 
 
 def _build_actor(
@@ -394,11 +285,6 @@ def _evaluate_bc_actor(
     device: torch.device,
 ) -> dict[str, float]:
     """Roll out actor, k-greedy teacher, and random baseline on held-out images."""
-    # Fixed by Codex on 2026-06-26
-    # Problem: BC training only reported same-batch rollout diagnostics, so
-    # overfitting checks had no held-out actor/teacher/random comparison.
-    # Solution: add an optional deterministic test loop over a fixed split.
-    # Result: Runs can periodically and finally report held-out mIoU/CE.
     actor_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
     teacher_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
     random_acc = mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
@@ -581,12 +467,19 @@ def train_once(
     cfg = CanViTEnvConfig()
     device = get_device()
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
-    dataset = _build_segmentation_dataset(
-        args=args,
-        cfg=cfg,
+    dataset = build_segmentation_dataset(
+        root=Path(args.dataset),
         split=args.split,
-        img_tf=img_tf,
-        mask_tf=mask_tf,
+        scene_size_px=cfg.scene_size_px,
+        img_transform=img_tf,
+        mask_transform=mask_tf,
+        dataset_format=args.dataset_format,
+        synthetic_image_dir=(
+            Path(args.synthetic_image_dir) if args.synthetic_image_dir else None
+        ),
+        synthetic_mask_dir=(
+            Path(args.synthetic_mask_dir) if args.synthetic_mask_dir else None
+        ),
     )
     if args.max_samples is not None:
         dataset = torch.utils.data.Subset(
@@ -601,12 +494,19 @@ def train_once(
     )
     test_loader = None
     if args.test_images > 0:
-        test_dataset = _build_segmentation_dataset(
-            args=args,
-            cfg=cfg,
+        test_dataset = build_segmentation_dataset(
+            root=Path(args.dataset),
             split=args.test_split,
-            img_tf=img_tf,
-            mask_tf=mask_tf,
+            scene_size_px=cfg.scene_size_px,
+            img_transform=img_tf,
+            mask_transform=mask_tf,
+            dataset_format=args.dataset_format,
+            synthetic_image_dir=(
+                Path(args.synthetic_image_dir) if args.synthetic_image_dir else None
+            ),
+            synthetic_mask_dir=(
+                Path(args.synthetic_mask_dir) if args.synthetic_mask_dir else None
+            ),
         )
         test_dataset = torch.utils.data.Subset(
             test_dataset, range(min(args.test_images, len(test_dataset)))

@@ -75,8 +75,11 @@ except ImportError:
 
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import _segmentation_cross_entropy_losses
-from canvit_rl.sac_models import ViewpointHistoryCritic
-from canvit_rl.viewpoint_policy import ViewpointGaussianActor, action_to_viewpoint
+from canvit_rl.viewpoint_policy import (
+    ViewpointGaussianActor,
+    ViewpointHistoryCritic,
+    action_to_viewpoint,
+)
 
 try:
     from visualize_sac_reward_maps import visualize_reward_maps_for_indices

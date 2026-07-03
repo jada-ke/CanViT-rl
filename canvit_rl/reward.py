@@ -39,15 +39,7 @@ def reconstruction_reward(
 
 def delta_reward(current_sim: float, previous_sim: float) -> float:
     """
-    Reward as gain in cosine similarity vs the previous step.
-
-    Encourages the policy to keep improving the representation
-    rather than reaching a plateau.
-
-    Args:
-        current_sim:  Cosine similarity after the current glimpse.
-        previous_sim: Cosine similarity after the previous glimpse (0.0 at episode start).
-
+    Reward as gain vs the previous step.
     Returns:
         Scalar reward (positive if improved, negative if regressed).
     """
@@ -61,11 +53,4 @@ def relative_ce_reduction(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     """Reward as fractional CE improvement: (CE_t - CE_t+1) / CE_t."""
-    # Fixed by Codex on 2026-06-22
-    # Problem: Raw CE reduction rewards vary with the current absolute CE scale,
-    # so equally useful fractional improvements can have different magnitudes.
-    # Solution: normalize one-step CE reduction by CE_t with a small denominator
-    # clamp for numerical safety.
-    # Result: Positive reward still means CE decreased, but the scale is now a
-    # relative improvement signal.
     return (ce_before - ce_after) / ce_before.clamp_min(eps)

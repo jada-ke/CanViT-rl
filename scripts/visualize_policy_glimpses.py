@@ -5,35 +5,6 @@ Usage:
     python scripts/visualize_policy_glimpses.py
     python scripts/visualize_policy_glimpses.py --image-index 0 --t 5 --k 32
     python scripts/visualize_policy_glimpses.py --policy eg-c2f --t 5 --image-index 3648 --split training
-    python scripts/visualize_policy_glimpses.py \
-        --policy viewpoint-bc \
-        --policy-checkpoint checkpoints/viewpoint_bc/im32_k16_t1/latest.pt \
-        --t 1 --image-index 0
-    python scripts/visualize_policy_glimpses.py \
-        --policy viewpoint-sac \
-        --policy-checkpoint checkpoints/viewpoint_sac/full-im32-t1/best.pt \
-        --t 1 --image-index 0
-    python scripts/visualize_policy_glimpses.py \
-        --policy canvas-sac \
-        --policy-checkpoint checkpoints/canvas_sac/im1-t1/best.pt \
-        --t 1 --image-index 0 --image-index 1
-    python scripts/visualize_policy_glimpses.py \
-        --episodes 8 --split validation --output-dir results/greedy_glimpses
-    uv run python scripts/visualize_policy_glimpses.py \
-        --policy canvas-sac \
-        --policy-checkpoint checkpoints/canvas_sac/im1-t1/best.pt \
-        --t 1 \
-        --image-index 0 --image-index 1 \
-        --split training \
-        --output-dir results/canvas_policy_glimpses
-
-    uv run python scripts/visualize_policy_glimpses.py \
-        --policy canvas-sac  \
-        --policy-checkpoint checkpoints/canvas_sac/synthetic-im7-t1-10_000-critlr_3/best.pt \
-        --dataset synthetic_segmentation  --split validation\
-        --t 1 \
-        --image-index 0,1,2 \
-        --output-dir results/synthetic-im7-t1-10_000-critlr_3
     
     uv run python scripts/visualize_policy_glimpses.py \
         --policy canvas-bc \
@@ -43,6 +14,17 @@ Usage:
         --t 1 \
         --image-index 0,1,2 \
         --output-dir results/canvas_bc/synthetic_im7_t1_k32_5000
+
+    uv run python scripts/visualize_policy_glimpses.py \
+        --policy canvas-sac \
+        --policy-checkpoint checkpoints/canvas_sac/synthetic-im1-t1_100/latest.pt \
+        --dataset synthetic_segmentation \
+        --split validation \
+        --t 1 \
+        --image-index 0,1,2 \
+        --output-dir results/canvas_sac/synthetic_im1_t1_100
+
+    
 """
 
 from __future__ import annotations
@@ -76,7 +58,7 @@ from canvit_eval.episode import run_episode  # noqa: E402
 from canvit_eval.policies import make_policy  # noqa: E402
 
 from canvit_rl.ade_labels import remap_ade_mask_labels
-from canvit_rl.canvas_state import canvas_layernorm_spatial
+from canvit_rl.canvas.state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import miou_from_state, run_greedy_episode
 from canvit_rl.sac_models import CanvasStateActor
@@ -137,13 +119,6 @@ class SyntheticSegmentationDataset(torch.utils.data.Dataset):
             (self.scene_size_px, self.scene_size_px),
             resample=resample_nearest,
         )
-        # Fixed by Codex on 2026-06-24
-        # Problem: Older synthetic masks may contain raw ADE ids 1..150, and
-        # label 150 is out of bounds for visualization CE metrics.
-        # Solution: preserve semantic labels but normalize raw ADE ids to
-        # zero-based 0..149 while keeping IGNORE_LABEL=255 padding.
-        # Result: Synthetic roots can be visualized without ADE-style split
-        # subfolders while retaining valid semantic targets.
         mask_tensor = torch.from_numpy(
             remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
         )
@@ -156,13 +131,6 @@ def _build_dataset(*, root: Path, split: str, cfg: CanViTEnvConfig, img_tf, mask
         ((root / "images" / split).is_dir() and (root / "masks" / split).is_dir())
         or ((root / "images").is_dir() and (root / "masks").is_dir())
     ):
-        # Fixed by Codex on 2026-06-24
-        # Problem: Policy-glimpse visualization needed to read the same
-        # synthetic training/validation split layout produced by the generator.
-        # Solution: detect images/<split> and masks/<split> first, falling back
-        # to the old flat images/ and masks/ layout.
-        # Result: --dataset synthetic_segmentation --split validation reads the
-        # validation synthetic split without custom paths.
         return SyntheticSegmentationDataset(
             root=root,
             split=split,
@@ -284,11 +252,6 @@ def _viewpoint_rect(
     index: int = 0,
 ) -> tuple[float, float, float, float]:
     """Convert a CanViT [-1, 1] center plus scale into pixel rectangle bounds."""
-    # Fixed by Codex on 2026-06-12
-    # Problem: Viewpoint centers use CanViT's matrix-indexing order (y,x), but
-    # the visualizer previously treated them as Cartesian (x,y).
-    # Solution: unpack row/col as y/x before converting to image-space pixels.
-    # Result: boxes align with the same convention used by sample_at_viewpoint.
     cy, cx = viewpoint.centers[index].detach().cpu().tolist()
     scale = float(viewpoint.scales[index].detach().cpu().item())
     center_x = (float(cx) + 1.0) * 0.5 * image_size
@@ -478,11 +441,6 @@ def _run_eg_c2f_episode(
     device: torch.device,
 ) -> dict:
     """Run canvit-eval's entropy-guided coarse-to-fine policy for visualization."""
-    # Fixed by Codex on 2026-06-12
-    # Problem: the visualizer only supported the local k-greedy rollout path.
-    # Solution: call canvit-eval's policy/episode API directly and adapt its
-    # returned steps into the same dict shape used by the renderer.
-    # Result: k-greedy and EG-C2F visualizations share one plotting pipeline.
     policy = make_policy(
         "entropy_coarse_to_fine",
         batch_size=1,
@@ -550,12 +508,6 @@ def _build_viewpoint_actor_from_checkpoint(
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     checkpoint_args = {}
     if isinstance(payload, dict) and "actor" in payload:
-        # Fixed by Codex on 2026-06-18
-        # Problem: SAC best.pt stores actor and critics together, while the
-        # visualizer previously documented only BC actor checkpoints.
-        # Solution: Treat any checkpoint with an "actor" key as a compatible
-        # viewpoint-history actor source and ignore critic weights for rollout.
-        # Result: Full SAC checkpoints can be visualized directly.
         actor_state = payload["actor"]
         checkpoint_args = dict(payload.get("args", {}))
     elif isinstance(payload, dict):
@@ -600,15 +552,6 @@ def _build_learned_actor_from_checkpoint(
     if state_representation in canvas_state_representations:
         if not isinstance(payload, dict) or "actor" not in payload:
             raise ValueError(f"Expected canvas actor checkpoint with actor: {checkpoint}")
-        # Fixed by Codex on 2026-06-23
-        # Fixed by Codex on 2026-06-26
-        # Problem: policy-glimpse visualization only loaded image-independent
-        # viewpoint actors, and later only recognized Canvas SAC metadata, so
-        # current_canvas BC checkpoints still fell through to the wrong actor.
-        # Solution: detect both Canvas SAC and canvas-state BC metadata strings
-        # and rebuild CanvasStateActor from top-level or saved-args feature dim.
-        # Result: Image-dependent SAC and BC policies share the canvas rollout
-        # path in the glimpse visualizer.
         d_model = int(_checkpoint_arg(checkpoint_args, "d-model", args.d_model))
         rff_dim = int(_checkpoint_arg(checkpoint_args, "rff-dim", args.rff_dim))
         rff_seed = int(_checkpoint_arg(checkpoint_args, "rff-seed", args.rff_seed))
@@ -831,13 +774,6 @@ def _run_canvas_sac_episode(
     prev_score = score
 
     for step in range(1, t + 1):
-        # Fixed by Codex on 2026-06-23
-        # Problem: The canvas actor's observation includes the current CanViT
-        # canvas, not just the fixed-slot viewpoint history.
-        # Solution: reconstruct the layernorm-spatial canvas summary at each
-        # committed state before asking the actor for the next viewpoint.
-        # Result: The rollout matches train_canvas_sac.py's observation
-        # contract for image-dependent policies.
         canvas_summary = canvas_layernorm_spatial(
             model=model,
             state=state,
@@ -993,12 +929,6 @@ def _parse_image_indices(values: list[str] | None) -> list[int] | None:
         return None
     indices: list[int] = []
     for value in values:
-        # Fixed by Codex on 2026-06-26
-        # Problem: policy glimpse commands needed one --image-index flag per
-        # image, making synthetic train-set visual sweeps unnecessarily noisy.
-        # Solution: accept comma-separated values while preserving repeated
-        # flag compatibility.
-        # Result: commands can use --image-index 0,1,2 or repeated flags.
         indices.extend(int(item) for item in value.split(",") if item.strip())
     if not indices:
         raise ValueError("--image-index must include at least one integer.")

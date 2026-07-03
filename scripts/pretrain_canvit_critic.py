@@ -52,16 +52,13 @@ from canvit_pytorch import (
 )
 from canvit_pytorch.policies import random_viewpoints
 from canvit_specialize.datasets.ade20k import (
-    ADE20kDataset,
     IGNORE_LABEL,
     make_val_transforms,
 )
-from PIL import Image
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
-from canvit_rl.ade_labels import remap_ade_mask_labels
-from canvit_rl.canvas_state import canvas_layernorm_spatial
+from canvit_rl.canvas.state import canvas_layernorm_spatial
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import (
     _index_state_batch,
@@ -69,7 +66,9 @@ from canvit_rl.greedy import (
     _repeat_state_chunks,
     _segmentation_cross_entropy_losses,
 )
-from canvit_rl.sac_models import CanvasStateCritic, ViewpointHistoryCritic
+from canvit_rl.sac_models import CanvasStateCritic
+from canvit_rl.synthetic_data import build_segmentation_dataset
+from canvit_rl.viewpoint_policy import ViewpointHistoryCritic
 
 
 def _sync_for_timing(device: torch.device) -> None:
@@ -196,75 +195,6 @@ def _limit_dataset(dataset, max_samples: int | None, *, offset: int = 0):
     return torch.utils.data.Subset(dataset, range(start, stop))
 
 
-class SyntheticSegmentationDataset(torch.utils.data.Dataset):
-    """Split-aware folder dataset for ADE-embedded synthetic segmentation."""
-
-    IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-    def __init__(
-        self,
-        *,
-        root: Path,
-        split: str,
-        scene_size_px: int,
-        img_transform,
-    ) -> None:
-        split_image_dir = root / "images" / split
-        split_mask_dir = root / "masks" / split
-        image_dir = split_image_dir if split_image_dir.is_dir() else root / "images"
-        mask_dir = split_mask_dir if split_mask_dir.is_dir() else root / "masks"
-        if not image_dir.is_dir():
-            raise FileNotFoundError(f"Synthetic image directory not found: {image_dir}")
-        if not mask_dir.is_dir():
-            raise FileNotFoundError(f"Synthetic mask directory not found: {mask_dir}")
-        self.images = sorted(
-            path
-            for path in image_dir.iterdir()
-            if path.suffix.lower() in self.IMAGE_EXTENSIONS
-        )
-        if not self.images:
-            raise ValueError(f"No synthetic images found in {image_dir}")
-        mask_by_stem = {
-            path.stem: path
-            for path in mask_dir.iterdir()
-            if path.suffix.lower() in self.IMAGE_EXTENSIONS
-        }
-        missing = [path.name for path in self.images if path.stem not in mask_by_stem]
-        if missing:
-            raise ValueError(
-                "Missing synthetic masks with matching stems for: "
-                + ", ".join(missing[:10])
-            )
-        self.masks = [mask_by_stem[path.stem] for path in self.images]
-        self.scene_size_px = scene_size_px
-        self.img_transform = img_transform
-
-    def __len__(self) -> int:
-        return len(self.images)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        image = Image.open(self.images[index]).convert("RGB")
-        mask = Image.open(self.masks[index]).convert("L")
-        image_tensor = self.img_transform(image)
-        resample_nearest = getattr(Image, "Resampling", Image).NEAREST
-        mask = mask.resize(
-            (self.scene_size_px, self.scene_size_px),
-            resample=resample_nearest,
-        )
-        # Fixed by Codex on 2026-06-25
-        # Problem: Critic pretraining needed to consume the same ADE-embedded
-        # synthetic split layout as Canvas SAC without treating 255 padding as
-        # a real class.
-        # Solution: read images/<split> and masks/<split> when present, and
-        # keep zero-based ADE labels plus IGNORE_LABEL=255.
-        # Result: Image-dependent and image-independent critic pretraining can
-        # share the synthetic dataset root.
-        mask_tensor = torch.from_numpy(
-            remap_ade_mask_labels(np.asarray(mask)).astype(np.int64)
-        )
-        return image_tensor, mask_tensor
-
-
 def _build_segmentation_dataset(
     *,
     args: argparse.Namespace,
@@ -274,32 +204,16 @@ def _build_segmentation_dataset(
     mask_tf,
 ):
     """Build ADE20K or split-aware synthetic segmentation data."""
-    dataset_root = Path(args.dataset)
-    split_image_dir = dataset_root / "images" / split
-    split_mask_dir = dataset_root / "masks" / split
-    inferred_synthetic = (
-        (split_image_dir.is_dir() and split_mask_dir.is_dir())
-        or ((dataset_root / "images").is_dir() and (dataset_root / "masks").is_dir())
-    )
-    dataset_format = (
-        "synthetic"
-        if args.dataset_format == "auto" and inferred_synthetic
-        else "ade20k"
-        if args.dataset_format == "auto"
-        else args.dataset_format
-    )
-    if dataset_format == "synthetic":
-        return SyntheticSegmentationDataset(
-            root=dataset_root,
-            split=split,
-            scene_size_px=cfg.scene_size_px,
-            img_transform=img_tf,
-        )
-    return ADE20kDataset(
-        root=dataset_root,
+    # Problem: critic pretraining had its own synthetic reader with the same
+    # ADE-id normalization as SAC. Solution: use the shared dataset builder so
+    # future synthetic layout fixes happen in one module.
+    return build_segmentation_dataset(
+        root=Path(args.dataset),
         split=split,
+        scene_size_px=cfg.scene_size_px,
         img_transform=img_tf,
         mask_transform=mask_tf,
+        dataset_format=args.dataset_format,
     )
 
 

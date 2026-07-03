@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from canvit_rl.env import CanViTEnvConfig, get_device
-from canvit_rl.canvas_state import (
+from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
     empty_viewpoint_history,
