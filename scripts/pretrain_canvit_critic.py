@@ -70,6 +70,11 @@ from canvit_rl.sac_models import CanvasStateCritic
 from canvit_rl.synthetic_data import build_segmentation_dataset
 from canvit_rl.viewpoint_policy import ViewpointHistoryCritic
 
+try:
+    from visualize_sac_reward_maps import visualize_reward_maps_for_indices
+except ImportError:
+    from scripts.visualize_sac_reward_maps import visualize_reward_maps_for_indices
+
 
 def _sync_for_timing(device: torch.device) -> None:
     """Synchronize CUDA kernels before reading throughput timings."""
@@ -144,6 +149,14 @@ def _spearman(x: np.ndarray, y: np.ndarray) -> float:
 def _mean(values: list[float]) -> float:
     """Return 0 for empty metric windows."""
     return sum(values) / len(values) if values else 0.0
+
+
+def _parse_reward_map_scales(value: str) -> list[float]:
+    """Parse comma-separated reward-map scales."""
+    scales = [float(item) for item in value.split(",") if item.strip()]
+    if not scales or any(scale <= 0 or scale > 1 for scale in scales):
+        raise ValueError("--reward-map-scales must contain values in (0, 1].")
+    return scales
 
 
 def _grad_norm(parameters) -> float:
@@ -685,6 +698,60 @@ def _evaluate_many(
     return {key: _mean(values) for key, values in windows.items()}, eval_iter
 
 
+def _maybe_visualize_reward_maps(
+    *,
+    q1: torch.nn.Module,
+    q2: torch.nn.Module,
+    eval_dataset,
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    device: torch.device,
+    batch_idx: int,
+    comet_exp,
+) -> None:
+    """Save true-reward vs critic-Q maps for periodic critic diagnostics."""
+    if args.reward_map_images <= 0:
+        return
+    indices = list(range(min(args.reward_map_images, len(eval_dataset))))
+    if not indices:
+        return
+    state_representation = (
+        "canvas" if args.state_mode == "canvas" else "viewpoint_history"
+    )
+    # Problem: scalar top-k/ranking metrics can hide whether the predicted Q
+    # landscape is too diffuse. Solution: reuse the SAC reward-map renderer on
+    # the critic-only post-full-scene state. Result: pretraining checkpoints can
+    # be inspected visually at the same cadence as Canvas SAC reward maps.
+    paths = visualize_reward_maps_for_indices(
+        actor=None,
+        q1=q1,
+        q2=q2,
+        dataset=eval_dataset,
+        indices=indices,
+        model=model,
+        probe=probe,
+        cfg=cfg,
+        device=device,
+        min_scale=args.min_scale,
+        scales=_parse_reward_map_scales(args.reward_map_scales),
+        grid_size=args.reward_map_grid_size,
+        chunk_size=args.reward_map_chunk_size,
+        output_dir=args.reward_map_output_dir,
+        split_label=args.eval_split,
+        title_prefix=f"Critic pretrain reward map batch={batch_idx}",
+        policy_kind=state_representation,
+        reward_target="relative_ce_reduction",
+        max_history=args.max_history,
+        state_step=0,
+        output_name_suffix=f"batch_{batch_idx:06d}",
+    )
+    if comet_exp is not None:
+        for path in paths:
+            comet_exp.log_image(str(path), name=path.name, step=batch_idx)
+
+
 def train_once(
     args: argparse.Namespace,
     *,
@@ -701,6 +768,14 @@ def train_once(
         raise ValueError("--comet-log-interval must be positive.")
     if args.test_images <= 0:
         raise ValueError("--test-images must be positive.")
+    if args.reward_map_images < 0:
+        raise ValueError("--reward-map-images must be non-negative.")
+    if args.reward_map_grid_size < 2:
+        raise ValueError("--reward-map-grid-size must be >= 2.")
+    if args.reward_map_chunk_size < 1:
+        raise ValueError("--reward-map-chunk-size must be positive.")
+    if args.reward_map_interval is not None and args.reward_map_interval < 1:
+        raise ValueError("--reward-map-interval must be positive.")
     if args.max_history < args.t + 1:
         raise ValueError(
             f"--max-history ({args.max_history}) must be >= t+1 ({args.t + 1})."
@@ -809,6 +884,8 @@ def train_once(
     elapsed_seconds = 0.0
     committed_glimpses = 0
     candidate_glimpses = 0
+    reward_map_interval = max(args.reward_map_interval or args.comet_log_interval, 1)
+    next_reward_map_batch = reward_map_interval
 
     pbar = tqdm(
         range(start_batch, args.batches + 1),
@@ -1058,6 +1135,22 @@ def train_once(
                 )
             metric_windows.clear()
 
+        if args.reward_map_images > 0 and batch_idx >= next_reward_map_batch:
+            _maybe_visualize_reward_maps(
+                q1=q1,
+                q2=q2,
+                eval_dataset=eval_dataset,
+                model=model,
+                probe=probe,
+                cfg=cfg,
+                args=args,
+                device=device,
+                batch_idx=batch_idx,
+                comet_exp=comet_exp,
+            )
+            while next_reward_map_batch <= batch_idx:
+                next_reward_map_batch += reward_map_interval
+
     if metric_windows:
         eval_metrics, eval_iter = _evaluate_many(
             q1=q1,
@@ -1252,6 +1345,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--comet-log-interval", type=int, default=25)
+    parser.add_argument(
+        "--reward-map-images",
+        type=int,
+        default=0,
+        help=(
+            "If >0, save true-reward vs critic-Q maps for this many eval "
+            "images every --reward-map-interval batches."
+        ),
+    )
+    parser.add_argument("--reward-map-grid-size", type=int, default=11)
+    parser.add_argument("--reward-map-scales", type=str, default="0.25,0.50")
+    parser.add_argument("--reward-map-chunk-size", type=int, default=16)
+    parser.add_argument(
+        "--reward-map-interval",
+        type=int,
+        default=None,
+        help=(
+            "Critic batch interval for reward maps. Defaults to "
+            "--comet-log-interval when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--reward-map-output-dir",
+        type=Path,
+        default=Path("results/critic_reward_maps"),
+    )
     parser.add_argument(
         "--rollout-policy",
         choices=["best", "random"],
