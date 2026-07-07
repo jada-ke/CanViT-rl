@@ -150,7 +150,12 @@ class CanvasStateEncoder(nn.Module):
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
-        self.out_norm = nn.LayerNorm(d_model + self.vpe.output_dim)
+        self.history_gru = nn.GRU(
+            input_size=self.vpe.output_dim,
+            hidden_size=d_model,
+            batch_first=True,
+        )
+        self.out_norm = nn.LayerNorm(2 * d_model)
 
     @property
     def output_dim(self) -> int:
@@ -178,7 +183,10 @@ class CanvasStateEncoder(nn.Module):
         step_ids = torch.arange(seq_len, device=canvas.device)[None, :]
         valid_steps = step_ids < lengths[:, None]
         vpe = vpe * valid_steps[..., None].float()
-        history_z = vpe.sum(dim=1) / lengths.clamp_min(1).float()[:, None]
+        history_seq, _ = self.history_gru(vpe)
+        last_step = lengths.clamp_min(1).sub(1).clamp_max(seq_len - 1)
+        batch_ids = torch.arange(coords.shape[0], device=coords.device)
+        history_z = history_seq[batch_ids, last_step]
         history_z = history_z * (lengths > 0).float()[:, None]
         return self.out_norm(torch.cat([canvas_z, history_z], dim=-1))
 
