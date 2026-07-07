@@ -79,6 +79,7 @@ from canvit_rl.viewpoint_policy import (
     ViewpointGaussianActor,
     ViewpointHistoryCritic,
     action_to_viewpoint,
+    randomize_actor_mean_viewpoint_prior,
 )
 
 try:
@@ -427,6 +428,21 @@ def _build_networks(
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
     ).to(device)
+    if (
+        args.randomize_actor_init
+        and args.resume is None
+        and args.actor_checkpoint is None
+    ):
+        prior = randomize_actor_mean_viewpoint_prior(
+            actor,
+            min_scale=args.min_scale,
+            center_radius=args.actor_init_center_radius,
+        )
+        print(
+            "Randomized viewpoint SAC actor init: "
+            f"center=({prior['center_y']:+.3f}, {prior['center_x']:+.3f}) "
+            f"scale={prior['scale']:.3f}"
+        )
     critic_kwargs = dict(
         d_model=args.d_model,
         max_steps=args.max_history,
@@ -934,6 +950,8 @@ def train_once(args: argparse.Namespace) -> float:
         raise ValueError("--reward-map-images must be non-negative.")
     if args.reward_map_grid_size < 2:
         raise ValueError("--reward-map-grid-size must be >= 2.")
+    if not 0.0 <= args.actor_init_center_radius < 1.0:
+        raise ValueError("--actor-init-center-radius must be in [0, 1).")
     if args.reward_map_chunk_size < 1:
         raise ValueError("--reward-map-chunk-size must be positive.")
     _parse_scales(args.reward_map_scales)
@@ -1265,7 +1283,23 @@ def train_once(args: argparse.Namespace) -> float:
             args=args,
             device=device,
         )
-        best_ce_gain = max(best_ce_gain, latest_metrics["eval/ce_gain"])
+        current_ce_gain = latest_metrics["eval/ce_gain"]
+        if current_ce_gain > best_ce_gain:
+            best_ce_gain = current_ce_gain
+            _save_checkpoint(
+                path=args.checkpoint_dir / "best.pt",
+                actor=actor,
+                q1=q1,
+                q2=q2,
+                target_q1=target_q1,
+                target_q2=target_q2,
+                agent=agent,
+                args=args,
+                batch=args.batches,
+                updates=update_count,
+                best_ce_gain=best_ce_gain,
+                eval_metrics=latest_metrics,
+            )
         if comet_exp is not None:
             comet_exp.log_metrics(latest_metrics, step=update_count)
         _maybe_visualize_reward_maps(
@@ -1281,23 +1315,9 @@ def train_once(args: argparse.Namespace) -> float:
             update_count=update_count,
             comet_exp=comet_exp,
         )
-    final_ce_gain = latest_metrics["eval/ce_gain"]
-    if final_ce_gain >= best_ce_gain:
-        best_ce_gain = final_ce_gain
-        _save_checkpoint(
-            path=args.checkpoint_dir / "best.pt",
-            actor=actor,
-            q1=q1,
-            q2=q2,
-            target_q1=target_q1,
-            target_q2=target_q2,
-            agent=agent,
-            args=args,
-            batch=args.batches,
-            updates=update_count,
-            best_ce_gain=best_ce_gain,
-            eval_metrics=latest_metrics,
-        )
+    # Problem: end-of-training weights can differ from the last evaluated
+    # checkpoint. Solution: only periodic/fallback eval blocks write best.pt,
+    # so best.pt always corresponds to the metrics stored with it.
     _save_checkpoint(
         path=args.checkpoint_dir / "latest.pt",
         actor=actor,
@@ -1342,6 +1362,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rff-seed", type=int, default=42)
     parser.add_argument("--max-history", type=int, default=6)
     parser.add_argument("--min-scale", type=float, default=0.25)
+    parser.add_argument(
+        "--randomize-actor-init",
+        action="store_true",
+        help=(
+            "Initialize the deterministic actor mean to a random near-center "
+            "Viewpoint instead of the default zero-action midpoint-scale prior."
+        ),
+    )
+    parser.add_argument(
+        "--actor-init-center-radius",
+        type=float,
+        default=0.25,
+        help=(
+            "Uniform radius for --randomize-actor-init center coordinates; "
+            "centers are sampled from [-radius, radius]."
+        ),
+    )
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)

@@ -15,6 +15,7 @@ from canvit_rl.canvas.eval import dataloader_kwargs
 from canvit_rl.env import CanViTEnvConfig
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 from canvit_rl.synthetic_data import build_segmentation_dataset
+from canvit_rl.viewpoint_policy import randomize_actor_mean_viewpoint_prior
 
 
 @dataclass
@@ -149,6 +150,21 @@ def build_canvas_sac_networks(
         rff_seed=args.rff_seed,
     )
     actor = CanvasStateActor(**kwargs).to(device)
+    if (
+        getattr(args, "randomize_actor_init", False)
+        and getattr(args, "resume", None) is None
+        and getattr(args, "init_actor_checkpoint", None) is None
+    ):
+        prior = randomize_actor_mean_viewpoint_prior(
+            actor,
+            min_scale=args.min_scale,
+            center_radius=args.actor_init_center_radius,
+        )
+        print(
+            "Randomized canvas SAC actor init: "
+            f"center=({prior['center_y']:+.3f}, {prior['center_x']:+.3f}) "
+            f"scale={prior['scale']:.3f}"
+        )
     q1 = CanvasStateCritic(**kwargs).to(device)
     q2 = CanvasStateCritic(**kwargs).to(device)
     target_q1 = copy.deepcopy(q1).to(device)

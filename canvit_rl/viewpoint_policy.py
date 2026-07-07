@@ -7,6 +7,15 @@ import torch.nn as nn
 from canvit_pytorch import VPEEncoder, Viewpoint
 
 
+def _action_scale_from_viewpoint_scale(
+    scale: torch.Tensor,
+    *,
+    min_scale: float,
+) -> torch.Tensor:
+    """Map real Viewpoint scales into the actor's tanh action coordinate."""
+    return 2.0 * (scale - min_scale) / (1.0 - min_scale) - 1.0
+
+
 def viewpoint_to_action(
     viewpoint: Viewpoint,
     *,
@@ -15,8 +24,8 @@ def viewpoint_to_action(
     """Map a Viewpoint's center/scale tensors into the actor action range."""
     centers = viewpoint.centers.float()
     scales = viewpoint.scales.float()
-    scale_raw = (scales - min_scale) / (1.0 - min_scale)
-    scale_raw = scale_raw.clamp(0.0, 1.0).mul(2.0).sub(1.0)
+    scale_raw = _action_scale_from_viewpoint_scale(scales, min_scale=min_scale)
+    scale_raw = scale_raw.clamp(-1.0, 1.0)
     return torch.cat([centers.float(), scale_raw[:, None].float()], dim=-1)
 
 
@@ -29,6 +38,54 @@ def action_to_viewpoint(
     centers = action[:, :2].float()
     scales = ((action[:, 2] + 1.0) * 0.5 * (1.0 - min_scale) + min_scale).float()
     return Viewpoint(centers=centers, scales=scales)
+
+
+def randomize_actor_mean_viewpoint_prior(
+    actor: nn.Module,
+    *,
+    min_scale: float,
+    center_radius: float,
+) -> dict[str, float]:
+    """Initialize deterministic actor output to a random near-center Viewpoint.
+
+    The actor emits tanh-squashed actions, so we set the pre-tanh mean bias to
+    atanh(target_action). This leaves the log-std rows alone while making the
+    initial deterministic policy a controlled random prior instead of the
+    default zero-action center/mid-scale prior.
+    """
+    if not 0.0 <= center_radius < 1.0:
+        raise ValueError("--actor-init-center-radius must be in [0, 1).")
+    if not 0.0 < min_scale < 1.0:
+        raise ValueError("--min-scale must be in (0, 1) for actor init.")
+    head = getattr(actor, "head", None)
+    if not isinstance(head, nn.Sequential) or not isinstance(head[-1], nn.Linear):
+        raise TypeError("actor must expose a Sequential head ending in nn.Linear.")
+    output = head[-1]
+    if output.out_features < 6:
+        raise ValueError("actor head must output mean/log_std with at least 6 values.")
+
+    device = output.weight.device
+    center = torch.empty(2, device=device).uniform_(-center_radius, center_radius)
+    scale = torch.empty(1, device=device).uniform_(min_scale, 1.0)
+    scale_action = _action_scale_from_viewpoint_scale(scale, min_scale=min_scale)
+    action = torch.cat([center, scale_action]).clamp(-0.999, 0.999)
+    mean_bias = torch.atanh(action)
+
+    with torch.no_grad():
+        # Problem: default Linear initialization makes deterministic SAC start
+        # at action ~= 0, i.e. centered viewpoint with midpoint scale.
+        # Solution: zero only the mean rows and set their bias to a sampled
+        # near-center Viewpoint prior in pre-tanh coordinates.
+        # Result: log-std exploration remains untouched while update-0 eval can
+        # test whether SAC learns from a weaker randomized initial prior.
+        output.weight[:3].zero_()
+        output.bias[:3].copy_(mean_bias)
+
+    return {
+        "center_y": float(center[0].detach().cpu().item()),
+        "center_x": float(center[1].detach().cpu().item()),
+        "scale": float(scale[0].detach().cpu().item()),
+    }
 
 
 # class ViewpointHistoryEncoder(nn.Module):

@@ -539,10 +539,24 @@ def train_once(args: argparse.Namespace) -> float:
             selected_split=args.eval_split,
             train_split=args.split,
         )
-        best_relative_ce_gain = max(
-            best_relative_ce_gain,
-            latest_metrics["eval/reward"],
-        )
+        current_eval_reward = latest_metrics["eval/reward"]
+        if current_eval_reward > best_relative_ce_gain:
+            best_relative_ce_gain = current_eval_reward
+            save_canvas_sac_checkpoint(
+                path=args.checkpoint_dir / "best.pt",
+                actor=actor,
+                q1=q1,
+                q2=q2,
+                target_q1=target_q1,
+                target_q2=target_q2,
+                agent=agent,
+                args=args,
+                canvas_feature_dim=canvas_feature_dim,
+                batch=args.batches,
+                updates=update_count,
+                best_relative_ce_gain=best_relative_ce_gain,
+                eval_metrics=latest_metrics,
+            )
         if comet_exp is not None:
             comet_exp.log_metrics(latest_metrics, step=update_count)
         if args.reward_map_images > 0 and last_reward_map_update != update_count:
@@ -560,24 +574,9 @@ def train_once(args: argparse.Namespace) -> float:
                 update_count=update_count,
                 comet_exp=comet_exp,
             )
-    final_relative_ce_gain = latest_metrics["eval/reward"]
-    if final_relative_ce_gain >= best_relative_ce_gain:
-        best_relative_ce_gain = final_relative_ce_gain
-        save_canvas_sac_checkpoint(
-            path=args.checkpoint_dir / "best.pt",
-            actor=actor,
-            q1=q1,
-            q2=q2,
-            target_q1=target_q1,
-            target_q2=target_q2,
-            agent=agent,
-            args=args,
-            canvas_feature_dim=canvas_feature_dim,
-            batch=args.batches,
-            updates=update_count,
-            best_relative_ce_gain=best_relative_ce_gain,
-            eval_metrics=latest_metrics,
-        )
+    # Problem: end-of-training weights can differ from the last evaluated
+    # checkpoint. Solution: only periodic/fallback eval blocks write best.pt,
+    # so best.pt always corresponds to the metrics stored with it.
     save_canvas_sac_checkpoint(
         path=args.checkpoint_dir / "latest.pt",
         actor=actor,

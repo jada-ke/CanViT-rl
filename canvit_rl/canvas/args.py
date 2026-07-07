@@ -68,6 +68,23 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rff-seed", type=int, default=42)
     parser.add_argument("--max-history", type=int, default=6)
     parser.add_argument("--min-scale", type=float, default=0.25)
+    parser.add_argument(
+        "--randomize-actor-init",
+        action="store_true",
+        help=(
+            "Initialize the deterministic actor mean to a random near-center "
+            "Viewpoint instead of the default zero-action midpoint-scale prior."
+        ),
+    )
+    parser.add_argument(
+        "--actor-init-center-radius",
+        type=float,
+        default=0.25,
+        help=(
+            "Uniform radius for --randomize-actor-init center coordinates; "
+            "centers are sampled from [-radius, radius]."
+        ),
+    )
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
@@ -160,6 +177,8 @@ def validate_canvas_sac_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-history must be at least t+1.")
     if args.t + 1 > 21:
         raise ValueError("EG-C2F evaluation requires --t <= 20.")
+    if not 0.0 <= args.actor_init_center_radius < 1.0:
+        raise ValueError("--actor-init-center-radius must be in [0, 1).")
     if args.reward_map_images < 0:
         raise ValueError("--reward-map-images must be non-negative.")
     if args.reward_map_grid_size < 2:
