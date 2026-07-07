@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from canvit_pytorch import VPEEncoder
 
 
@@ -161,7 +162,11 @@ class CanvasStateEncoder(nn.Module):
     def output_dim(self) -> int:
         return self.out_norm.normalized_shape[0]
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def encode_with_canvas_features(
+        self,
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return pooled state features plus the pre-pool canvas feature map."""
         canvas = batch["canvas"]
         coords = batch["coords"]
         lengths = batch["lengths"]
@@ -188,7 +193,10 @@ class CanvasStateEncoder(nn.Module):
         batch_ids = torch.arange(coords.shape[0], device=coords.device)
         history_z = history_seq[batch_ids, last_step]
         history_z = history_z * (lengths > 0).float()[:, None]
-        return self.out_norm(torch.cat([canvas_z, history_z], dim=-1))
+        return self.out_norm(torch.cat([canvas_z, history_z], dim=-1)), canvas_features
+
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.encode_with_canvas_features(batch)[0]
 
 
 class CanvasStateActor(nn.Module):
@@ -248,27 +256,57 @@ class CanvasStateCritic(nn.Module):
         d_model: int,
         rff_dim: int,
         rff_seed: int,
+        use_action_location_features: bool = False,
     ) -> None:
         super().__init__()
+        self.use_action_location_features = use_action_location_features
         self.encoder = CanvasStateEncoder(
             canvas_feature_dim=canvas_feature_dim,
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
         )
+        q_input_dim = self.encoder.output_dim + 3
+        if use_action_location_features:
+            q_input_dim += d_model
         self.q = nn.Sequential(
-            nn.LayerNorm(self.encoder.output_dim + 3),
-            nn.Linear(self.encoder.output_dim + 3, d_model),
+            nn.LayerNorm(q_input_dim),
+            nn.Linear(q_input_dim, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
 
+    @staticmethod
+    def sample_action_location_features(
+        canvas_features: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample pre-pool canvas features at the action center."""
+        # Problem: the pooled canvas summary discards exact spatial alignment.
+        # Solution: treat action[..., :2] as (y, x), flip to grid_sample's
+        # (x, y) convention, and read the critic feature map at that location.
+        # Result: Q receives features from the region the candidate Viewpoint
+        # actually targets, while still preserving the global state summary.
+        grid = action[..., :2].flip(-1).to(dtype=canvas_features.dtype)
+        grid = grid[:, None, None, :]
+        return F.grid_sample(
+            canvas_features,
+            grid,
+            align_corners=False,
+        ).squeeze(-1).squeeze(-1)
+
     def forward(
         self,
         batch: dict[str, torch.Tensor],
         action: torch.Tensor,
     ) -> torch.Tensor:
-        z = self.encoder(batch)
-        return self.q(torch.cat([z, action], dim=-1)).squeeze(-1)
+        if self.use_action_location_features:
+            z, canvas_features = self.encoder.encode_with_canvas_features(batch)
+            local_z = self.sample_action_location_features(canvas_features, action)
+            q_input = torch.cat([z, local_z, action], dim=-1)
+        else:
+            z = self.encoder(batch)
+            q_input = torch.cat([z, action], dim=-1)
+        return self.q(q_input).squeeze(-1)

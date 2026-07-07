@@ -165,8 +165,20 @@ def build_canvas_sac_networks(
             f"center=({prior['center_y']:+.3f}, {prior['center_x']:+.3f}) "
             f"scale={prior['scale']:.3f}"
         )
-    q1 = CanvasStateCritic(**kwargs).to(device)
-    q2 = CanvasStateCritic(**kwargs).to(device)
+    critic_kwargs = dict(
+        kwargs,
+        use_action_location_features=getattr(
+            args,
+            "critic_local_action_features",
+            False,
+        ),
+    )
+    # Problem: baseline Canvas critics only saw pooled, action-agnostic canvas
+    # features. Solution: pass the opt-in local-feature flag only to critics.
+    # Result: actor checkpoints stay comparable while Q networks can be A/B
+    # tested with action-location feature sampling.
+    q1 = CanvasStateCritic(**critic_kwargs).to(device)
+    q2 = CanvasStateCritic(**critic_kwargs).to(device)
     target_q1 = copy.deepcopy(q1).to(device)
     target_q2 = copy.deepcopy(q2).to(device)
     return actor, q1, q2, target_q1, target_q2

@@ -67,6 +67,14 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rff-dim", type=int, default=128)
     parser.add_argument("--rff-seed", type=int, default=42)
     parser.add_argument("--max-history", type=int, default=6)
+    parser.add_argument(
+        "--critic-local-action-features",
+        action="store_true",
+        help=(
+            "Append grid-sampled canvas-stem features from the candidate "
+            "action center to each CanvasStateCritic Q input."
+        ),
+    )
     parser.add_argument("--min-scale", type=float, default=0.25)
     parser.add_argument(
         "--randomize-actor-init",

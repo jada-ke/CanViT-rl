@@ -10,11 +10,18 @@ This is the canvas-state analogue of scripts/train_viewpoint_sac.py:
 Example:
     python scripts/train_canvas_sac.py \
     --dataset synthetic_segmentation \
-    --batches 100 --batch-size 1 --max-samples 1 --t 1 \
+    --batches 100 --batch-size 1 --max-samples 1 --t 2 \
     --eval-images 1 --eval-batch-size 1 --eval-split training\
     --replay-batch-size 4 \
-    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1_100 \
-    --experiment-name synthetic-im1-t1_100
+    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1_feat \
+    --experiment-name synthetic-im1-t1_100_feat \
+    --comet-project synthetic-tests \
+    --reward-map-output-dir results/synthetic_sac_test_feat \
+    --reward-map-images 1 \
+    --reward-map-interval 100 \
+    --skip-eval-random \
+    --critic-local-action-features
+
 """
 
 from __future__ import annotations
@@ -365,10 +372,7 @@ def train_once(args: argparse.Namespace) -> float:
                                     np.min(rewards_np)
                                 ),
                             }
-                        )
-                    train_metrics["train/batch"] = float(batch_idx)
-                    train_metrics["train/updates"] = float(update_count)
-                    train_metrics["train/replay_size"] = float(replay.size)
+                        )            
                     train_metrics["throughput/glimpses_per_sec"] = glimpses_per_sec
                     train_metrics["train/viewpoint_entropy"] = viewpoint_entropy(
                         entropy_points,

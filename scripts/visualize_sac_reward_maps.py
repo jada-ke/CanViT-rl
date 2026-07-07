@@ -303,8 +303,18 @@ def _build_actor_and_critics(
             rff_seed=rff_seed,
         )
         actor = CanvasStateActor(**kwargs).to(device).eval() if "actor" in payload else None
-        q1 = CanvasStateCritic(**kwargs).to(device).eval()
-        q2 = CanvasStateCritic(**kwargs).to(device).eval()
+        critic_kwargs = dict(
+            kwargs,
+            use_action_location_features=bool(
+                saved_args.get("critic_local_action_features", False)
+            ),
+        )
+        # Problem: reward-map reconstruction must match the saved critic
+        # architecture. Solution: replay the train_canvas_sac.py flag stored in
+        # checkpoint args. Result: local-feature critics load without manual
+        # visualization-script edits.
+        q1 = CanvasStateCritic(**critic_kwargs).to(device).eval()
+        q2 = CanvasStateCritic(**critic_kwargs).to(device).eval()
         policy_kind = "canvas"
     else:
         actor = (
