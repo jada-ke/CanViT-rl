@@ -70,7 +70,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from canvit_rl.ade_labels import remap_ade_mask_labels
-from canvit_rl.canvas.state import canvas_layernorm_spatial
+from canvit_rl.canvas.state import canvas_layernorm_spatial, canvas_segmentation_entropy
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import _repeat_state_chunks, _segmentation_cross_entropy_losses
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
@@ -289,7 +289,10 @@ def _build_actor_and_critics(
     target = str(
         payload.get("target", payload.get("metadata", {}).get("target", "raw_ce_gain"))
     )
-    if state_representation == "current_canvas_layernorm_with_viewpoint_history":
+    if state_representation in {
+        "current_canvas_layernorm_with_viewpoint_history",
+        "current_canvas_layernorm_entropy_with_viewpoint_history",
+    }:
         canvas_feature_dim = int(
             payload.get(
                 "canvas_feature_dim",
@@ -301,6 +304,17 @@ def _build_actor_and_critics(
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
+            use_entropy_state=bool(
+                saved_args.get("canvas_entropy_state", False)
+                or state_representation
+                == "current_canvas_layernorm_entropy_with_viewpoint_history"
+            ),
+            use_canvas_avg_pool=not bool(
+                saved_args.get("disable_canvas_avg_pool", False)
+            ),
+            use_canvas_max_pool=not bool(
+                saved_args.get("disable_canvas_max_pool", False)
+            ),
         )
         actor = CanvasStateActor(**kwargs).to(device).eval() if "actor" in payload else None
         critic_kwargs = dict(
@@ -364,6 +378,7 @@ def _evaluate_grid(
     coords: torch.Tensor,
     lengths: torch.Tensor,
     canvas_summary: torch.Tensor | None,
+    canvas_entropy: torch.Tensor | None,
     current_ce: torch.Tensor,
     reward_target: str,
     q1: torch.nn.Module,
@@ -422,6 +437,13 @@ def _evaluate_grid(
             }
             if canvas_summary is not None:
                 history_batch["canvas"] = canvas_summary.repeat(
+                    repeats,
+                    1,
+                    1,
+                    1,
+                )
+            if canvas_entropy is not None:
+                history_batch["entropy"] = canvas_entropy.repeat(
                     repeats,
                     1,
                     1,
@@ -694,6 +716,18 @@ def visualize_reward_maps_for_indices(
                             canvas_grid_size=cfg.canvas_grid_size,
                         )
                         actor_batch["canvas"] = canvas_summary
+                        if getattr(actor.encoder, "use_entropy_state", False):
+                            # Problem: entropy-state actors require the same
+                            # uncertainty input at visualization time as they
+                            # saw during training. Solution: derive the
+                            # normalized probe-entropy map from the current
+                            # canvas before each rollout action.
+                            actor_batch["entropy"] = canvas_segmentation_entropy(
+                                model=model,
+                                probe=probe,
+                                state=state,
+                                canvas_grid_size=cfg.canvas_grid_size,
+                            )
                     action = actor.deterministic_action(actor_batch)
                     vp = action_to_viewpoint(action, min_scale=min_scale)
                     out = model(
@@ -721,6 +755,7 @@ def visualize_reward_maps_for_indices(
                     cfg=cfg,
                 )
                 canvas_summary = None
+                canvas_entropy = None
                 actor_vp = None
                 actor_batch = {"coords": coords, "lengths": lengths}
                 if policy_kind == "canvas":
@@ -730,6 +765,21 @@ def visualize_reward_maps_for_indices(
                         canvas_grid_size=cfg.canvas_grid_size,
                     )
                     actor_batch["canvas"] = canvas_summary
+                    needs_entropy = (
+                        actor is not None
+                        and getattr(actor.encoder, "use_entropy_state", False)
+                    ) or any(
+                        getattr(critic.encoder, "use_entropy_state", False)
+                        for critic in (q1, q2)
+                    )
+                    if needs_entropy:
+                        canvas_entropy = canvas_segmentation_entropy(
+                            model=model,
+                            probe=probe,
+                            state=state,
+                            canvas_grid_size=cfg.canvas_grid_size,
+                        )
+                        actor_batch["entropy"] = canvas_entropy
                 if actor is not None:
                     actor_action = actor.deterministic_action(actor_batch)
                     actor_vp = action_to_viewpoint(actor_action, min_scale=min_scale)
@@ -754,6 +804,7 @@ def visualize_reward_maps_for_indices(
                         coords=coords,
                         lengths=lengths,
                         canvas_summary=canvas_summary,
+                        canvas_entropy=canvas_entropy,
                         current_ce=current_ce,
                         reward_target=reward_target,
                         q1=q1,

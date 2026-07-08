@@ -148,6 +148,9 @@ def build_canvas_sac_networks(
         d_model=args.d_model,
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
+        use_entropy_state=getattr(args, "canvas_entropy_state", False),
+        use_canvas_avg_pool=not getattr(args, "disable_canvas_avg_pool", False),
+        use_canvas_max_pool=not getattr(args, "disable_canvas_max_pool", False),
     )
     actor = CanvasStateActor(**kwargs).to(device)
     if (

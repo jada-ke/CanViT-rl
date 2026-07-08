@@ -18,9 +18,10 @@ def replay_canvas_bytes(
     capacity: int,
     canvas_feature_dim: int,
     canvas_grid_size: int,
+    include_entropy: bool = False,
 ) -> int:
-    """Return bytes for current + next canvas replay tensors."""
-    return (
+    """Return bytes for current + next canvas/entropy replay tensors."""
+    canvas_bytes = (
         2
         * capacity
         * canvas_feature_dim
@@ -28,6 +29,16 @@ def replay_canvas_bytes(
         * canvas_grid_size
         * REPLAY_STORAGE_DTYPE_BYTES
     )
+    if not include_entropy:
+        return canvas_bytes
+    entropy_bytes = (
+        2
+        * capacity
+        * canvas_grid_size
+        * canvas_grid_size
+        * REPLAY_STORAGE_DTYPE_BYTES
+    )
+    return canvas_bytes + entropy_bytes
 
 
 def resolve_replay_device(
@@ -76,9 +87,11 @@ class CanvasReplayBuffer:
         canvas_feature_dim: int,
         canvas_grid_size: int,
         storage_device: torch.device,
+        store_entropy: bool = False,
     ) -> None:
         self.capacity = capacity
         self.storage_device = storage_device
+        self.store_entropy = store_entropy
         alloc_kwargs = {"device": storage_device}
         self.canvas = torch.zeros(
             (capacity, canvas_feature_dim, canvas_grid_size, canvas_grid_size),
@@ -86,6 +99,16 @@ class CanvasReplayBuffer:
             **alloc_kwargs,
         )
         self.next_canvas = torch.zeros_like(self.canvas)
+        if store_entropy:
+            self.entropy = torch.zeros(
+                (capacity, 1, canvas_grid_size, canvas_grid_size),
+                dtype=REPLAY_STORAGE_DTYPE,
+                **alloc_kwargs,
+            )
+            self.next_entropy = torch.zeros_like(self.entropy)
+        else:
+            self.entropy = None
+            self.next_entropy = None
         self.coords = torch.zeros(
             (capacity, max_history, 3),
             dtype=torch.float32,
@@ -145,6 +168,8 @@ class CanvasReplayBuffer:
         next_coords: torch.Tensor,
         next_lengths: torch.Tensor,
         dones: torch.Tensor,
+        entropy: torch.Tensor | None = None,
+        next_entropy: torch.Tensor | None = None,
     ) -> None:
         batch_size = canvas.shape[0]
         if batch_size > self.capacity:
@@ -153,6 +178,18 @@ class CanvasReplayBuffer:
                 "increase --buffer-size or reduce --batch-size."
             )
         self._copy_rows(self.canvas, canvas)
+        if self.store_entropy:
+            if entropy is None or next_entropy is None:
+                raise ValueError(
+                    "Entropy replay is enabled but entropy tensors are missing."
+                )
+            assert self.entropy is not None and self.next_entropy is not None
+            # Problem: entropy-state runs need Bellman updates from replay, not
+            # only online rollouts. Solution: store current/next entropy maps
+            # next to canvas maps. Result: actor and critics see identical state
+            # fields during online action selection and sampled SAC updates.
+            self._copy_rows(self.entropy, entropy)
+            self._copy_rows(self.next_entropy, next_entropy)
         self._copy_rows(self.coords, coords)
         self._copy_rows(self.lengths, lengths)
         self._copy_rows(self.actions, actions)
@@ -174,7 +211,7 @@ class CanvasReplayBuffer:
                 non_blocking=self.storage_device.type == device.type,
             )
 
-        return {
+        batch = {
             "canvas": move(self.canvas, dtype=torch.float32),
             "coords": move(self.coords),
             "lengths": move(self.lengths),
@@ -185,6 +222,11 @@ class CanvasReplayBuffer:
             "next_lengths": move(self.next_lengths),
             "dones": move(self.dones),
         }
+        if self.store_entropy:
+            assert self.entropy is not None and self.next_entropy is not None
+            batch["entropy"] = move(self.entropy, dtype=torch.float32)
+            batch["next_entropy"] = move(self.next_entropy, dtype=torch.float32)
+        return batch
 
 
 class CanvasSAC:
@@ -240,6 +282,9 @@ class CanvasSAC:
             "coords": sample["next_coords"],
             "lengths": sample["next_lengths"],
         }
+        if "entropy" in sample:
+            obs["entropy"] = sample["entropy"]
+            next_obs["entropy"] = sample["next_entropy"]
 
         with torch.no_grad():
             next_action, next_log_prob = self.actor.sample(next_obs)

@@ -41,6 +41,7 @@ from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
+    canvas_segmentation_entropy,
     empty_viewpoint_history,
 )
 from canvit_rl.greedy import miou_from_state
@@ -106,7 +107,10 @@ def _is_canvas_checkpoint(payload: dict[str, Any]) -> bool:
             payload.get("metadata", {}).get("state_representation", ""),
         )
     )
-    return state_representation == "current_canvas_layernorm_with_viewpoint_history"
+    return state_representation in {
+        "current_canvas_layernorm_with_viewpoint_history",
+        "current_canvas_layernorm_entropy_with_viewpoint_history",
+    }
 
 
 def _build_actor(
@@ -164,6 +168,21 @@ def _build_canvas_actor(
         d_model=d_model,
         rff_dim=rff_dim,
         rff_seed=rff_seed,
+        use_entropy_state=bool(
+            _checkpoint_value(
+                checkpoint_args,
+                "canvas-entropy-state",
+                checkpoint_args.get("canvas_entropy_state", False),
+            )
+            or payload.get("state_representation")
+            == "current_canvas_layernorm_entropy_with_viewpoint_history"
+        ),
+        use_canvas_avg_pool=not bool(
+            _checkpoint_value(checkpoint_args, "disable-canvas-avg-pool", False)
+        ),
+        use_canvas_max_pool=not bool(
+            _checkpoint_value(checkpoint_args, "disable-canvas-max-pool", False)
+        ),
     ).to(device).eval()
     actor.load_state_dict(actor_state)
     for param in actor.parameters():
@@ -380,6 +399,17 @@ def main() -> None:
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
+            canvas_entropy = (
+                canvas_segmentation_entropy(
+                    model=model,
+                    probe=probe,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                )
+                if is_canvas_policy
+                and getattr(actor.encoder, "use_entropy_state", False)
+                else None
+            )
 
             step_states = [state]
             step_scales = [1.0]
@@ -390,6 +420,8 @@ def main() -> None:
                         "coords": coords,
                         "lengths": lengths,
                     }
+                    if canvas_entropy is not None:
+                        batch["entropy"] = canvas_entropy
                     if args.stochastic:
                         action, _ = actor.sample(batch)
                     else:
@@ -431,6 +463,16 @@ def main() -> None:
                         model=model,
                         state=state,
                         canvas_grid_size=cfg.canvas_grid_size,
+                    )
+                    canvas_entropy = (
+                        canvas_segmentation_entropy(
+                            model=model,
+                            probe=probe,
+                            state=state,
+                            canvas_grid_size=cfg.canvas_grid_size,
+                        )
+                        if getattr(actor.encoder, "use_entropy_state", False)
+                        else None
                     )
                 step_states.append(state)
                 step_scales.append(float(vp.scales[0].detach().cpu().item()))

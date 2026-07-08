@@ -58,7 +58,7 @@ from canvit_eval.episode import run_episode  # noqa: E402
 from canvit_eval.policies import make_policy  # noqa: E402
 
 from canvit_rl.ade_labels import remap_ade_mask_labels
-from canvit_rl.canvas.state import canvas_layernorm_spatial
+from canvit_rl.canvas.state import canvas_layernorm_spatial, canvas_segmentation_entropy
 from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.greedy import miou_from_state, run_greedy_episode
 from canvit_rl.sac_models import CanvasStateActor
@@ -548,6 +548,7 @@ def _build_learned_actor_from_checkpoint(
     canvas_state_representations = {
         "current_canvas",
         "current_canvas_layernorm_with_viewpoint_history",
+        "current_canvas_layernorm_entropy_with_viewpoint_history",
     }
     if state_representation in canvas_state_representations:
         if not isinstance(payload, dict) or "actor" not in payload:
@@ -571,11 +572,26 @@ def _build_learned_actor_from_checkpoint(
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
+            use_entropy_state=bool(
+                checkpoint_args.get("canvas_entropy_state", False)
+                or state_representation
+                == "current_canvas_layernorm_entropy_with_viewpoint_history"
+            ),
+            use_canvas_avg_pool=not bool(
+                checkpoint_args.get("disable_canvas_avg_pool", False)
+            ),
+            use_canvas_max_pool=not bool(
+                checkpoint_args.get("disable_canvas_max_pool", False)
+            ),
         ).to(device).eval()
         actor.load_state_dict(payload["actor"])
         policy_kind = (
             "canvas-sac"
-            if state_representation == "current_canvas_layernorm_with_viewpoint_history"
+            if state_representation
+            in {
+                "current_canvas_layernorm_with_viewpoint_history",
+                "current_canvas_layernorm_entropy_with_viewpoint_history",
+            }
             else "canvas-bc"
         )
     else:
@@ -779,9 +795,20 @@ def _run_canvas_sac_episode(
             state=state,
             canvas_grid_size=cfg.canvas_grid_size,
         )
-        action = actor.deterministic_action(
-            {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
-        )
+        actor_batch = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
+        if getattr(actor.encoder, "use_entropy_state", False):
+            # Problem: entropy-state Canvas SAC checkpoints require the same
+            # probe-uncertainty map during visualization as during training.
+            # Solution: derive entropy from the current canvas before each
+            # action. Result: glimpse visualization can load entropy-state
+            # actors without hitting a missing batch['entropy'] KeyError.
+            actor_batch["entropy"] = canvas_segmentation_entropy(
+                model=model,
+                probe=probe,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+        action = actor.deterministic_action(actor_batch)
         vp = action_to_viewpoint(action, min_scale=min_scale)
         glimpse = sample_at_viewpoint(
             spatial=image,

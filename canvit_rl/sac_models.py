@@ -132,9 +132,17 @@ class CanvasStateEncoder(nn.Module):
         d_model: int,
         rff_dim: int,
         rff_seed: int,
+        use_entropy_state: bool = False,
+        use_canvas_avg_pool: bool = True,
+        use_canvas_max_pool: bool = True,
     ) -> None:
         super().__init__()
+        if not use_canvas_avg_pool and not use_canvas_max_pool:
+            raise ValueError("At least one canvas pooling branch must be enabled.")
         self.canvas_feature_dim = canvas_feature_dim
+        self.use_entropy_state = use_entropy_state
+        self.use_canvas_avg_pool = use_canvas_avg_pool
+        self.use_canvas_max_pool = use_canvas_max_pool
         self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
         self.canvas_stem = nn.Sequential(
             nn.Conv2d(canvas_feature_dim, d_model, kernel_size=1),
@@ -142,12 +150,15 @@ class CanvasStateEncoder(nn.Module):
             nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
             nn.GELU(),
         )
-        self.canvas_avg_pool = nn.AdaptiveAvgPool2d((4, 4))
-        self.canvas_max_pool = nn.AdaptiveMaxPool2d((4, 4))
+        if use_canvas_avg_pool:
+            self.canvas_avg_pool = nn.AdaptiveAvgPool2d((4, 4))
+        if use_canvas_max_pool:
+            self.canvas_max_pool = nn.AdaptiveMaxPool2d((4, 4))
+        canvas_pool_count = int(use_canvas_avg_pool) + int(use_canvas_max_pool)
         self.canvas_proj = nn.Sequential(
             nn.Flatten(),
-            nn.LayerNorm(32 * d_model),
-            nn.Linear(32 * d_model, d_model),
+            nn.LayerNorm(16 * canvas_pool_count * d_model),
+            nn.Linear(16 * canvas_pool_count * d_model, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
@@ -156,7 +167,22 @@ class CanvasStateEncoder(nn.Module):
             hidden_size=d_model,
             batch_first=True,
         )
-        self.out_norm = nn.LayerNorm(2 * d_model)
+        if use_entropy_state:
+            self.entropy_stem = nn.Sequential(
+                nn.Conv2d(1, d_model, kernel_size=1),
+                nn.GELU(),
+                nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            self.entropy_pool = nn.AdaptiveAvgPool2d((4, 4))
+            self.entropy_proj = nn.Sequential(
+                nn.Flatten(),
+                nn.LayerNorm(16 * d_model),
+                nn.Linear(16 * d_model, d_model),
+                nn.GELU(),
+                nn.LayerNorm(d_model),
+            )
+        self.out_norm = nn.LayerNorm((3 if use_entropy_state else 2) * d_model)
 
     @property
     def output_dim(self) -> int:
@@ -172,13 +198,16 @@ class CanvasStateEncoder(nn.Module):
         lengths = batch["lengths"]
         _, seq_len, _ = coords.shape
         canvas_features = self.canvas_stem(canvas.float())
-        canvas_pooled = torch.cat(
-            [
-                self.canvas_avg_pool(canvas_features),
-                self.canvas_max_pool(canvas_features),
-            ],
-            dim=1,
-        )
+        # Problem: avg and max pooling emphasize different canvas evidence,
+        # but ablations sometimes need one branch removed. Solution: build the
+        # pooled tensor from enabled branches only. Result: experiments can
+        # disable avg or max pooling without touching the downstream contract.
+        canvas_pool_parts = []
+        if self.use_canvas_avg_pool:
+            canvas_pool_parts.append(self.canvas_avg_pool(canvas_features))
+        if self.use_canvas_max_pool:
+            canvas_pool_parts.append(self.canvas_max_pool(canvas_features))
+        canvas_pooled = torch.cat(canvas_pool_parts, dim=1)
         canvas_z = self.canvas_proj(canvas_pooled)
         vpe = self.vpe(
             y=coords[..., 0].float(),
@@ -193,7 +222,14 @@ class CanvasStateEncoder(nn.Module):
         batch_ids = torch.arange(coords.shape[0], device=coords.device)
         history_z = history_seq[batch_ids, last_step]
         history_z = history_z * (lengths > 0).float()[:, None]
-        return self.out_norm(torch.cat([canvas_z, history_z], dim=-1)), canvas_features
+        state_parts = [canvas_z, history_z]
+        if self.use_entropy_state:
+            if "entropy" not in batch:
+                raise KeyError("CanvasStateEncoder requires batch['entropy'].")
+            entropy_features = self.entropy_stem(batch["entropy"].float())
+            entropy_z = self.entropy_proj(self.entropy_pool(entropy_features))
+            state_parts.append(entropy_z)
+        return self.out_norm(torch.cat(state_parts, dim=-1)), canvas_features
 
     def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         return self.encode_with_canvas_features(batch)[0]
@@ -209,6 +245,9 @@ class CanvasStateActor(nn.Module):
         d_model: int,
         rff_dim: int,
         rff_seed: int,
+        use_entropy_state: bool = False,
+        use_canvas_avg_pool: bool = True,
+        use_canvas_max_pool: bool = True,
     ) -> None:
         super().__init__()
         self.encoder = CanvasStateEncoder(
@@ -216,6 +255,9 @@ class CanvasStateActor(nn.Module):
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
+            use_entropy_state=use_entropy_state,
+            use_canvas_avg_pool=use_canvas_avg_pool,
+            use_canvas_max_pool=use_canvas_max_pool,
         )
         self.head = nn.Sequential(
             nn.Linear(self.encoder.output_dim, d_model),
@@ -257,6 +299,9 @@ class CanvasStateCritic(nn.Module):
         rff_dim: int,
         rff_seed: int,
         use_action_location_features: bool = False,
+        use_entropy_state: bool = False,
+        use_canvas_avg_pool: bool = True,
+        use_canvas_max_pool: bool = True,
     ) -> None:
         super().__init__()
         self.use_action_location_features = use_action_location_features
@@ -265,6 +310,9 @@ class CanvasStateCritic(nn.Module):
             d_model=d_model,
             rff_dim=rff_dim,
             rff_seed=rff_seed,
+            use_entropy_state=use_entropy_state,
+            use_canvas_avg_pool=use_canvas_avg_pool,
+            use_canvas_max_pool=use_canvas_max_pool,
         )
         q_input_dim = self.encoder.output_dim + 3
         if use_action_location_features:

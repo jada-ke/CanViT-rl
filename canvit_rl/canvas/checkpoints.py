@@ -47,7 +47,11 @@ def save_canvas_sac_checkpoint(
             "best_relative_ce_gain": best_relative_ce_gain,
             "selection_metric": "eval/reward",
             "eval_metrics": eval_metrics or {},
-            "state_representation": "current_canvas_layernorm_with_viewpoint_history",
+            "state_representation": (
+                "current_canvas_layernorm_entropy_with_viewpoint_history"
+                if getattr(args, "canvas_entropy_state", False)
+                else "current_canvas_layernorm_with_viewpoint_history"
+            ),
         },
         path,
     )

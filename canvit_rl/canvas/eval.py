@@ -25,6 +25,7 @@ from tqdm import tqdm
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
+    canvas_segmentation_entropy,
     empty_viewpoint_history,
 )
 from canvit_rl.env import CanViTEnvConfig
@@ -277,6 +278,16 @@ def eval_canvas_sac_batch(
             state=state,
             canvas_grid_size=cfg.canvas_grid_size,
         )
+        canvas_entropy = (
+            canvas_segmentation_entropy(
+                model=model,
+                probe=probe,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
+            )
+            if getattr(args, "canvas_entropy_state", False)
+            else None
+        )
     coords, lengths = append_viewpoint_history(
         coords=coords,
         lengths=lengths,
@@ -285,6 +296,8 @@ def eval_canvas_sac_batch(
     )
     for step_idx in range(args.t):
         obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
+        if canvas_entropy is not None:
+            obs["entropy"] = canvas_entropy
         with torch.no_grad():
             action = actor.deterministic_action(obs)
         vp = action_to_viewpoint(action, min_scale=args.min_scale)
@@ -305,6 +318,16 @@ def eval_canvas_sac_batch(
                 model=model,
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
+            )
+            canvas_entropy = (
+                canvas_segmentation_entropy(
+                    model=model,
+                    probe=probe,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                )
+                if getattr(args, "canvas_entropy_state", False)
+                else None
             )
         coords, lengths = append_viewpoint_history(
             coords=coords,
@@ -330,10 +353,15 @@ def evaluate_canvas_sac(
     canvas_feature_dim: int,
     canvit_dtype: torch.dtype,
     device: torch.device,
+    fixed_baseline_metrics: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Evaluate Random, EG-C2F, and canvas SAC on a fixed validation subset."""
+    fixed_baseline_metrics = fixed_baseline_metrics or {}
     eval_random = not args.skip_eval_random
-    eval_egc2f = not args.skip_eval_egc2f
+    eval_egc2f = (
+        not args.skip_eval_egc2f
+        and "eval/egc2f_miou" not in fixed_baseline_metrics
+    )
     random_acc = (
         mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device) if eval_random else None
     )
@@ -402,55 +430,44 @@ def evaluate_canvas_sac(
     random_miou = float(random_acc.compute()) if random_acc is not None else math.nan
     egc2f_miou = float(egc2f_acc.compute()) if egc2f_acc is not None else math.nan
     sac_miou = float(sac_acc.compute())
-    random_ce = ce_sums["random_final"] / max(n_images, 1) if eval_random else math.nan
-    egc2f_ce = ce_sums["egc2f_final"] / max(n_images, 1) if eval_egc2f else math.nan
     sac_initial_ce = ce_sums["sac_initial"] / max(n_images, 1)
     sac_ce = ce_sums["sac_final"] / max(n_images, 1)
     ce_gain = sac_initial_ce - sac_ce
     eval_reward = ce_gain / max(sac_initial_ce, 1e-12)
     metrics = {
-        "eval/random_miou": random_miou,
-        "eval/egc2f_miou": egc2f_miou,
         "eval/sac_miou": sac_miou,
-        "eval/random_final_ce": random_ce,
-        "eval/egc2f_final_ce": egc2f_ce,
         "eval/sac_final_ce": sac_ce,
         "eval/final_miou": sac_miou,
         "eval/final_ce": sac_ce,
-        "eval/miou_gain": sac_miou - random_miou,
         "eval/ce_gain": ce_gain,
         "eval/reward": eval_reward,
-        "eval/relative_ce_gain": eval_reward,
-        "eval/random_ce_gain": (
-            ce_sums["random_initial"] / max(n_images, 1) - random_ce
-            if eval_random
-            else math.nan
-        ),
-        "eval/egc2f_ce_gain": (
-            ce_sums["egc2f_initial"] / max(n_images, 1) - egc2f_ce
-            if eval_egc2f
-            else math.nan
-        ),
-        "eval/sac_vs_random": sac_miou - random_miou,
-        "eval/sac_vs_egc2f": sac_miou - egc2f_miou,
         "eval/sac_viewpoint_entropy": viewpoint_entropy(
             sac_entropy_points,
             bins=args.viewpoint_entropy_bins,
         ),
     }
-    metrics.update(
-        {
-            "final_miou": metrics["eval/final_miou"],
-            "final_ce": metrics["eval/final_ce"],
-            "miou_gain": metrics["eval/miou_gain"],
-            "ce_gain": metrics["eval/ce_gain"],
-            "reward": metrics["eval/reward"],
-            "relative_ce_gain": metrics["eval/relative_ce_gain"],
-            "sac_vs_random": metrics["eval/sac_vs_random"],
-            "sac_vs_egc2f": metrics["eval/sac_vs_egc2f"],
-            "viewpoint_entropy": metrics["eval/sac_viewpoint_entropy"],
-        }
-    )
+    if eval_egc2f:
+        metrics["eval/egc2f_miou"] = egc2f_miou
+    elif "eval/egc2f_miou" in fixed_baseline_metrics:
+        # Problem: EG-C2F is deterministic for a fixed split/horizon and was
+        # recomputed at every SAC eval interval. Solution: let the trainer pass
+        # a cached baseline mIoU. Result: EG-C2F can be evaluated once per
+        # loader while SAC metrics still update every interval.
+        metrics["eval/egc2f_miou"] = fixed_baseline_metrics["eval/egc2f_miou"]
+    if eval_random:
+        # Problem: baseline CE/comparison metrics created many extra Comet
+        # plots. Solution: keep only baseline mIoU; SAC reward and CE metrics
+        # remain under SAC-specific keys. Result: random/EG-C2F baselines are
+        # visible for mIoU comparison without CE or sac_vs_* plot clutter.
+        metrics["eval/random_miou"] = random_miou
+    aliases = {
+        "final_miou": metrics["eval/final_miou"],
+        "final_ce": metrics["eval/final_ce"],
+        "ce_gain": metrics["eval/ce_gain"],
+        "reward": metrics["eval/reward"],
+        "viewpoint_entropy": metrics["eval/sac_viewpoint_entropy"],
+    }
+    metrics.update(aliases)
     for step_idx in range(args.t):
         metrics[f"eval/sac_mean_scale_by_t{step_idx + 1}"] = (
             sac_scale_sums[step_idx] / max(sac_scale_counts[step_idx], 1)
@@ -465,7 +482,7 @@ def should_run_final_full_validation_miou(args: argparse.Namespace) -> bool:
     return getattr(args, "optuna_trial", None) is None
 
 
-def evaluate_best_full_validation_miou(
+def evaluate_full_validation_miou(
     *,
     actor: CanvasStateActor,
     model,
@@ -474,16 +491,12 @@ def evaluate_best_full_validation_miou(
     args: argparse.Namespace,
     canvit_dtype: torch.dtype,
     device: torch.device,
+    metric_prefix: str,
+    description: str,
 ) -> tuple[dict[str, float], list[int], list[float]]:
-    """Evaluate best.pt per timestep on validation with mIoUAccumulator."""
-    best_path = args.checkpoint_dir / "best.pt"
-    if not best_path.is_file():
-        raise FileNotFoundError(f"Cannot run final full mIoU; missing {best_path}")
-
-    checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
-    actor.load_state_dict(checkpoint["actor"])
+    """Evaluate the current actor per timestep on full validation."""
+    was_training = actor.training
     actor.eval()
-
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
     full_validation_dataset = build_segmentation_dataset(
         root=Path(args.dataset),
@@ -517,7 +530,7 @@ def evaluate_best_full_validation_miou(
 
     for images, masks in tqdm(
         full_validation_loader,
-        desc="Full validation timestep mIoU for best Canvas SAC",
+        desc=f"Full validation timestep mIoU for {description}",
         leave=False,
     ):
         images = images.to(device, non_blocking=True)
@@ -555,6 +568,16 @@ def evaluate_best_full_validation_miou(
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
+            canvas_entropy = (
+                canvas_segmentation_entropy(
+                    model=model,
+                    probe=probe,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                )
+                if getattr(args, "canvas_entropy_state", False)
+                else None
+            )
         coords, lengths = append_viewpoint_history(
             coords=coords,
             lengths=lengths,
@@ -563,6 +586,8 @@ def evaluate_best_full_validation_miou(
         )
         for step_idx in range(args.t):
             obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
+            if canvas_entropy is not None:
+                obs["entropy"] = canvas_entropy
             with torch.no_grad():
                 action = actor.deterministic_action(obs)
             vp = action_to_viewpoint(action, min_scale=args.min_scale)
@@ -587,6 +612,16 @@ def evaluate_best_full_validation_miou(
                     state=state,
                     canvas_grid_size=cfg.canvas_grid_size,
                 )
+                canvas_entropy = (
+                    canvas_segmentation_entropy(
+                        model=model,
+                        probe=probe,
+                        state=state,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                    )
+                    if getattr(args, "canvas_entropy_state", False)
+                    else None
+                )
             coords, lengths = append_viewpoint_history(
                 coords=coords,
                 lengths=lengths,
@@ -594,20 +629,162 @@ def evaluate_best_full_validation_miou(
                 step=step_idx + 1,
             )
 
+    if was_training:
+        actor.train()
+
     metrics = {
-        f"final_full_validation/miou_t{step_idx}": float(acc.compute())
+        f"{metric_prefix}/miou_t{step_idx}": float(acc.compute())
         for step_idx, acc in enumerate(accs)
     }
     timesteps = list(range(args.t + 1))
     miou_values = [
-        metrics[f"final_full_validation/miou_t{step_idx}"]
-        for step_idx in timesteps
+        metrics[f"{metric_prefix}/miou_t{step_idx}"] for step_idx in timesteps
     ]
 
     print(
-        "Best checkpoint full validation mIoU by timestep "
+        f"{description} full validation mIoU by timestep "
         f"(accumulator, {n_images} images):"
     )
     for step_idx, miou in zip(timesteps, miou_values, strict=True):
         print(f"  t{step_idx}: {miou:.4f}")
     return metrics, timesteps, miou_values
+
+
+def evaluate_egc2f_full_validation_miou(
+    *,
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    canvit_dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[dict[str, float], list[int], list[float]]:
+    """Evaluate EG-C2F per timestep on full validation with mIoUAccumulator."""
+    try:
+        from canvit_eval.episode import run_episode
+        from canvit_eval.policies import make_policy
+    except ImportError as exc:
+        raise RuntimeError(
+            "EG-C2F full-validation evaluation requires canvit-eval import "
+            "support. Place CanViT-eval next to this repo or install it."
+        ) from exc
+    if args.t + 1 > 21:
+        raise ValueError("EG-C2F has 21 built-in timesteps; require --t <= 20.")
+
+    img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
+    full_validation_dataset = build_segmentation_dataset(
+        root=Path(args.dataset),
+        split="validation",
+        scene_size_px=cfg.scene_size_px,
+        img_transform=img_tf,
+        mask_transform=mask_tf,
+        dataset_format=args.dataset_format,
+        synthetic_image_dir=(
+            Path(args.synthetic_image_dir) if args.synthetic_image_dir else None
+        ),
+        synthetic_mask_dir=(
+            Path(args.synthetic_mask_dir) if args.synthetic_mask_dir else None
+        ),
+    )
+    if len(full_validation_dataset) == 0:
+        raise ValueError("Full validation dataset must be non-empty.")
+
+    full_validation_loader = DataLoader(
+        full_validation_dataset,
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        **dataloader_kwargs(args, device),
+    )
+    accs = [
+        mIoUAccumulator(NUM_CLASSES, IGNORE_LABEL, device)
+        for _ in range(args.t + 1)
+    ]
+    n_images = 0
+
+    for images, masks in tqdm(
+        full_validation_loader,
+        desc="Full validation timestep mIoU for EG-C2F",
+        leave=False,
+    ):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        batch_size = images.shape[0]
+        n_images += batch_size
+        policy = make_policy(
+            "entropy_coarse_to_fine",
+            batch_size=batch_size,
+            device=device,
+            n_viewpoints=args.t + 1,
+            canvas_grid=cfg.canvas_grid_size,
+            probe=probe,
+            get_spatial_fn=model.get_spatial,
+        )
+        with torch.inference_mode():
+            steps = run_episode(
+                model=model,
+                images=images.to(dtype=canvit_dtype),
+                policy=policy,
+                n_timesteps=args.t + 1,
+                canvas_grid=cfg.canvas_grid_size,
+                glimpse_px=cfg.glimpse_size_px,
+            )
+            for step_idx, step in enumerate(steps):
+                # Problem: final-only EG-C2F mIoU cannot be overlaid against
+                # SAC timestep curves. Solution: update one accumulator per
+                # EG-C2F episode state. Result: the overlay can compare all
+                # methods across the same timestep axis.
+                update_miou_accumulator(
+                    model=model,
+                    probe=probe,
+                    state=step.state,
+                    masks=masks,
+                    cfg=cfg,
+                    acc=accs[step_idx],
+                )
+
+    metrics = {
+        f"egc2f_full_validation/miou_t{step_idx}": float(acc.compute())
+        for step_idx, acc in enumerate(accs)
+    }
+    timesteps = list(range(args.t + 1))
+    miou_values = [
+        metrics[f"egc2f_full_validation/miou_t{step_idx}"]
+        for step_idx in timesteps
+    ]
+    print(
+        "EG-C2F full validation mIoU by timestep "
+        f"(accumulator, {n_images} images):"
+    )
+    for step_idx, miou in zip(timesteps, miou_values, strict=True):
+        print(f"  t{step_idx}: {miou:.4f}")
+    return metrics, timesteps, miou_values
+
+
+def evaluate_best_full_validation_miou(
+    *,
+    actor: CanvasStateActor,
+    model,
+    probe: torch.nn.Module,
+    cfg: CanViTEnvConfig,
+    args: argparse.Namespace,
+    canvit_dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[dict[str, float], list[int], list[float]]:
+    """Evaluate best.pt per timestep on validation with mIoUAccumulator."""
+    best_path = args.checkpoint_dir / "best.pt"
+    if not best_path.is_file():
+        raise FileNotFoundError(f"Cannot run final full mIoU; missing {best_path}")
+
+    checkpoint = torch.load(best_path, map_location="cpu", weights_only=False)
+    actor.load_state_dict(checkpoint["actor"])
+    return evaluate_full_validation_miou(
+        actor=actor,
+        model=model,
+        probe=probe,
+        cfg=cfg,
+        args=args,
+        canvit_dtype=canvit_dtype,
+        device=device,
+        metric_prefix="final_full_validation",
+        description="Best checkpoint",
+    )

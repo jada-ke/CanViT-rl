@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from canvit_pytorch import Viewpoint
@@ -18,6 +20,36 @@ def canvas_layernorm_spatial(*, model, state, canvas_grid_size: int) -> torch.Te
         -1,
     )
     return spatial.permute(0, 3, 1, 2).contiguous()
+
+
+def canvas_segmentation_entropy(
+    *,
+    model,
+    probe: torch.nn.Module,
+    state,
+    canvas_grid_size: int,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return normalized probe entropy over the current canvas as [B, 1, G, G]."""
+    spatial = model.get_spatial(state.canvas).reshape(
+        state.canvas.shape[0],
+        canvas_grid_size,
+        canvas_grid_size,
+        -1,
+    )
+    with torch.autocast(device_type=spatial.device.type, enabled=False):
+        logits = probe(spatial.float()).float()
+    probs = logits.softmax(dim=1)
+    entropy = -(probs * probs.clamp_min(eps).log()).sum(dim=1, keepdim=True)
+    entropy = entropy / math.log(logits.shape[1])
+    if entropy.shape[-2:] != (canvas_grid_size, canvas_grid_size):
+        entropy = F.interpolate(
+            entropy,
+            size=(canvas_grid_size, canvas_grid_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+    return entropy.contiguous()
 
 
 def empty_viewpoint_history(

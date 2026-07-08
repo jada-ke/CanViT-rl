@@ -75,6 +75,24 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
             "action center to each CanvasStateCritic Q input."
         ),
     )
+    parser.add_argument(
+        "--canvas-entropy-state",
+        action="store_true",
+        help=(
+            "Append a compact normalized probe-entropy map embedding to the "
+            "CanvasStateActor/Critic state."
+        ),
+    )
+    parser.add_argument(
+        "--disable-canvas-avg-pool",
+        action="store_true",
+        help="Remove the adaptive-average canvas pooling branch from CanvasStateEncoder.",
+    )
+    parser.add_argument(
+        "--disable-canvas-max-pool",
+        action="store_true",
+        help="Remove the adaptive-max canvas pooling branch from CanvasStateEncoder.",
+    )
     parser.add_argument("--min-scale", type=float, default=0.25)
     parser.add_argument(
         "--randomize-actor-init",
@@ -110,6 +128,14 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
         help=(
             "Skip the post-training best.pt evaluation on the full validation "
             "split with mIoUAccumulator."
+        ),
+    )
+    parser.add_argument(
+        "--eval-init-full-validation-miou",
+        action="store_true",
+        help=(
+            "Evaluate the initialized Canvas SAC actor on the full validation "
+            "split before training and overlay it with the final mIoU curve."
         ),
     )
     parser.add_argument(
@@ -187,6 +213,11 @@ def validate_canvas_sac_args(args: argparse.Namespace) -> None:
         raise ValueError("EG-C2F evaluation requires --t <= 20.")
     if not 0.0 <= args.actor_init_center_radius < 1.0:
         raise ValueError("--actor-init-center-radius must be in [0, 1).")
+    if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
+        raise ValueError(
+            "At least one canvas pooling branch must remain enabled; do not pass "
+            "both --disable-canvas-avg-pool and --disable-canvas-max-pool."
+        )
     if args.reward_map_images < 0:
         raise ValueError("--reward-map-images must be non-negative.")
     if args.reward_map_grid_size < 2:

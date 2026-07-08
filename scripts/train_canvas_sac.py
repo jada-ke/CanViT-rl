@@ -13,14 +13,14 @@ Example:
     --batches 100 --batch-size 1 --max-samples 1 --t 2 \
     --eval-images 1 --eval-batch-size 1 --eval-split training\
     --replay-batch-size 4 \
-    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t1_feat \
-    --experiment-name synthetic-im1-t1_100_feat \
+    --checkpoint-dir checkpoints/canvas_sac/synthetic-im1-t2 \
+    --experiment-name synthetic-im1-t2_no_max \
     --comet-project synthetic-tests \
-    --reward-map-output-dir results/synthetic_sac_test_feat \
+    --reward-map-output-dir results/synthetic_sac_test\
     --reward-map-images 1 \
     --reward-map-interval 100 \
-    --skip-eval-random \
-    --critic-local-action-features
+    --skip-eval-random  \
+    --eval-init-full-validation-miou 
 
 """
 
@@ -50,6 +50,7 @@ from tqdm import tqdm
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
+    canvas_segmentation_entropy,
     empty_viewpoint_history,
 )
 from canvit_rl.canvas.sac import (
@@ -70,6 +71,8 @@ from canvit_rl.canvas.checkpoints import (
 from canvit_rl.canvas.eval import (
     evaluate_best_full_validation_miou,
     evaluate_canvas_sac,
+    evaluate_egc2f_full_validation_miou,
+    evaluate_full_validation_miou,
     segmentation_metrics,
     should_run_final_full_validation_miou,
     viewpoint_entropy,
@@ -94,7 +97,81 @@ except ImportError:
     from scripts.canvas_sac_optuna import (
         add_canvas_sac_optuna_args,
         run_canvas_sac_optuna,
-)
+    )
+
+IMPORTANT_TRAIN_METRICS = {
+    "actor/loss",
+    "actor/entropy",
+    "critic/q1_loss",
+    "critic/q2_loss",
+    "sac/alpha",
+    "train/online_reward/mean",
+    "throughput/glimpses_per_sec",
+    "train/viewpoint_entropy",
+}
+
+IMPORTANT_EVAL_SUFFIXES = {
+    "reward",
+    "ce_gain",
+    "sac_miou",
+    "final_ce",
+    "egc2f_miou",
+    "random_miou",
+    "sac_viewpoint_entropy",
+}
+
+
+def _capture_rng_state() -> dict[str, object]:
+    """Capture all RNG streams that can affect subsequent SAC training."""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            [state.clone() for state in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+def _restore_rng_state(state: dict[str, object]) -> None:
+    """Restore RNG streams after diagnostic-only eval work."""
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    cuda_state = state["torch_cuda"]
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _important_train_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Return the compact train metric set logged to Comet."""
+    filtered = {
+        key: value for key, value in metrics.items() if key in IMPORTANT_TRAIN_METRICS
+    }
+    filtered.update(
+        {
+            key: value
+            for key, value in metrics.items()
+            if key.startswith("train/mean_scale_by_t")
+        }
+    )
+    return filtered
+
+
+def _important_eval_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Return the compact eval metric set logged to Comet."""
+    filtered: dict[str, float] = {}
+    for key, value in metrics.items():
+        if key.startswith("eval/"):
+            suffix = key.rsplit("/", 1)[-1]
+            if suffix in IMPORTANT_EVAL_SUFFIXES:
+                filtered[key] = value
+            continue
+        if key in {"reward", "ce_gain", "final_ce", "viewpoint_entropy"}:
+            filtered[key] = value
+    return filtered
 
 
 def train_once(args: argparse.Namespace) -> float:
@@ -180,6 +257,7 @@ def train_once(args: argparse.Namespace) -> float:
         capacity=args.buffer_size,
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=cfg.canvas_grid_size,
+        include_entropy=args.canvas_entropy_state,
     )
     replay_device = resolve_replay_device(
         train_device=device,
@@ -200,9 +278,71 @@ def train_once(args: argparse.Namespace) -> float:
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=cfg.canvas_grid_size,
         storage_device=replay_device,
+        store_entropy=args.canvas_entropy_state,
     )
     comet_exp = make_comet_experiment(args)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    initial_full_validation_timesteps: list[int] | None = None
+    initial_full_validation_mious: list[float] | None = None
+    if args.eval_init_full_validation_miou:
+        rng_state = _capture_rng_state()
+        try:
+            # Problem: final full-validation mIoU has no untrained reference
+            # curve, but running that diagnostic can advance RNG streams before
+            # SAC training starts. Solution: evaluate the initialized actor
+            # inside an RNG save/restore bracket. Result: enabling
+            # --eval-init-full-validation-miou does not change later sampler,
+            # warmup-action, actor-sampling, or replay-sampling randomness.
+            (
+                _initial_full_validation_metrics,
+                initial_full_validation_timesteps,
+                initial_full_validation_mious,
+            ) = evaluate_full_validation_miou(
+                actor=actor,
+                model=model,
+                probe=probe,
+                cfg=cfg,
+                args=args,
+                canvit_dtype=canvit_dtype,
+                device=device,
+                metric_prefix="initial_full_validation",
+                description="Initialized actor",
+            )
+        finally:
+            _restore_rng_state(rng_state)
+
+    egc2f_eval_cache: dict[str, dict[str, float]] = {}
+
+    def evaluate_canvas_sac_with_cached_baselines(
+        split_label: str,
+        eval_loader,
+    ) -> dict[str, float]:
+        """Evaluate SAC while reusing deterministic baseline metrics per split."""
+        metrics = evaluate_canvas_sac(
+            actor=actor,
+            eval_loader=eval_loader,
+            model=model,
+            probe=probe,
+            cfg=cfg,
+            args=args,
+            canvas_feature_dim=canvas_feature_dim,
+            canvit_dtype=canvit_dtype,
+            device=device,
+            fixed_baseline_metrics=egc2f_eval_cache.get(split_label),
+        )
+        if (
+            not args.skip_eval_egc2f
+            and split_label not in egc2f_eval_cache
+            and "eval/egc2f_miou" in metrics
+        ):
+            # Problem: EG-C2F is deterministic for a fixed loader, but it was
+            # recomputed at every SAC eval interval. Solution: cache the mIoU
+            # the first time each split/loader is evaluated. Result: later
+            # evals update SAC metrics only while reusing the constant baseline.
+            egc2f_eval_cache[split_label] = {
+                "eval/egc2f_miou": metrics["eval/egc2f_miou"]
+            }
+        return metrics
 
     train_iter = iter(data.train_loader)
     train_windows: dict[str, list[float]] = defaultdict(list)
@@ -262,6 +402,16 @@ def train_once(args: argparse.Namespace) -> float:
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
+            canvas_entropy = (
+                canvas_segmentation_entropy(
+                    model=model,
+                    probe=probe,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                )
+                if args.canvas_entropy_state
+                else None
+            )
         coords, lengths = append_viewpoint_history(
             coords=coords,
             lengths=lengths,
@@ -271,6 +421,8 @@ def train_once(args: argparse.Namespace) -> float:
 
         for step_idx in range(args.t):
             obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
+            if canvas_entropy is not None:
+                obs["entropy"] = canvas_entropy
             if replay.size < args.learning_starts:
                 action = torch.empty(batch_size, 3, device=device).uniform_(-1.0, 1.0)
             else:
@@ -288,6 +440,7 @@ def train_once(args: argparse.Namespace) -> float:
             scale_sums[step_idx] += float(vp.scales.detach().sum().item())
             scale_counts[step_idx] += batch_size
             prev_canvas = canvas_summary.clone()
+            prev_entropy = canvas_entropy.clone() if canvas_entropy is not None else None
             prev_coords = coords.clone()
             prev_lengths = lengths.clone()
             with torch.inference_mode():
@@ -308,6 +461,16 @@ def train_once(args: argparse.Namespace) -> float:
                     model=model,
                     state=out.state,
                     canvas_grid_size=cfg.canvas_grid_size,
+                )
+                next_canvas_entropy = (
+                    canvas_segmentation_entropy(
+                        model=model,
+                        probe=probe,
+                        state=out.state,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                    )
+                    if args.canvas_entropy_state
+                    else None
                 )
             reward = relative_ce_reduction(current_ce, next_ce)
             coords, lengths = append_viewpoint_history(
@@ -331,11 +494,14 @@ def train_once(args: argparse.Namespace) -> float:
                 next_coords=coords,
                 next_lengths=lengths,
                 dones=done,
+                entropy=prev_entropy,
+                next_entropy=next_canvas_entropy,
             )
             reward_window.extend(reward.detach().cpu().numpy().astype(float).tolist())
             state = out.state
             current_ce = next_ce
             canvas_summary = next_canvas_summary
+            canvas_entropy = next_canvas_entropy
 
         sync_for_timing(device)
         elapsed_seconds += time.perf_counter() - batch_start
@@ -383,7 +549,10 @@ def train_once(args: argparse.Namespace) -> float:
                             scale_sums[step] / max(scale_counts[step], 1)
                         )
                     if comet_exp is not None:
-                        comet_exp.log_metrics(train_metrics, step=update_count)
+                        comet_exp.log_metrics(
+                            _important_train_metrics(train_metrics),
+                            step=update_count,
+                        )
                     train_windows.clear()
                     reward_window.clear()
                     entropy_points.clear()
@@ -391,30 +560,16 @@ def train_once(args: argparse.Namespace) -> float:
                     scale_counts = [0 for _ in range(args.t)]
 
                 if update_count >= next_eval_update:
-                    train_eval_metrics = evaluate_canvas_sac(
-                        actor=actor,
-                        eval_loader=data.train_eval_loader,
-                        model=model,
-                        probe=probe,
-                        cfg=cfg,
-                        args=args,
-                        canvas_feature_dim=canvas_feature_dim,
-                        canvit_dtype=canvit_dtype,
-                        device=device,
+                    train_eval_metrics = evaluate_canvas_sac_with_cached_baselines(
+                        args.split,
+                        data.train_eval_loader,
                     )
                     if args.eval_split == args.split:
                         selected_eval_metrics = train_eval_metrics
                     else:
-                        selected_eval_metrics = evaluate_canvas_sac(
-                            actor=actor,
-                            eval_loader=data.eval_loader,
-                            model=model,
-                            probe=probe,
-                            cfg=cfg,
-                            args=args,
-                            canvas_feature_dim=canvas_feature_dim,
-                            canvit_dtype=canvit_dtype,
-                            device=device,
+                        selected_eval_metrics = evaluate_canvas_sac_with_cached_baselines(
+                            args.eval_split,
+                            data.eval_loader,
                         )
                     eval_metrics = combine_eval_metrics(
                         selected_metrics=selected_eval_metrics,
@@ -424,7 +579,10 @@ def train_once(args: argparse.Namespace) -> float:
                     )
                     latest_metrics = eval_metrics
                     if comet_exp is not None:
-                        comet_exp.log_metrics(eval_metrics, step=update_count)
+                        comet_exp.log_metrics(
+                            _important_eval_metrics(eval_metrics),
+                            step=update_count,
+                        )
                     current_eval_reward = eval_metrics["eval/reward"]
                     current_train_reward = eval_metrics[f"eval/{args.split}/reward"]
                     current_selected_reward = eval_metrics[
@@ -512,30 +670,16 @@ def train_once(args: argparse.Namespace) -> float:
         )
 
     if latest_metrics is None:
-        train_eval_metrics = evaluate_canvas_sac(
-            actor=actor,
-            eval_loader=data.train_eval_loader,
-            model=model,
-            probe=probe,
-            cfg=cfg,
-            args=args,
-            canvas_feature_dim=canvas_feature_dim,
-            canvit_dtype=canvit_dtype,
-            device=device,
+        train_eval_metrics = evaluate_canvas_sac_with_cached_baselines(
+            args.split,
+            data.train_eval_loader,
         )
         if args.eval_split == args.split:
             selected_eval_metrics = train_eval_metrics
         else:
-            selected_eval_metrics = evaluate_canvas_sac(
-                actor=actor,
-                eval_loader=data.eval_loader,
-                model=model,
-                probe=probe,
-                cfg=cfg,
-                args=args,
-                canvas_feature_dim=canvas_feature_dim,
-                canvit_dtype=canvit_dtype,
-                device=device,
+            selected_eval_metrics = evaluate_canvas_sac_with_cached_baselines(
+                args.eval_split,
+                data.eval_loader,
             )
         latest_metrics = combine_eval_metrics(
             selected_metrics=selected_eval_metrics,
@@ -562,7 +706,10 @@ def train_once(args: argparse.Namespace) -> float:
                 eval_metrics=latest_metrics,
             )
         if comet_exp is not None:
-            comet_exp.log_metrics(latest_metrics, step=update_count)
+            comet_exp.log_metrics(
+                _important_eval_metrics(latest_metrics),
+                step=update_count,
+            )
         if args.reward_map_images > 0 and last_reward_map_update != update_count:
             maybe_visualize_canvas_sac_reward_maps(
                 actor=actor,
@@ -604,8 +751,23 @@ def train_once(args: argparse.Namespace) -> float:
     )
 
     if should_run_final_full_validation_miou(args):
+        egc2f_full_validation_timesteps: list[int] | None = None
+        egc2f_full_validation_mious: list[float] | None = None
+        if not args.skip_eval_egc2f:
+            (
+                _egc2f_full_validation_metrics,
+                egc2f_full_validation_timesteps,
+                egc2f_full_validation_mious,
+            ) = evaluate_egc2f_full_validation_miou(
+                model=model,
+                probe=probe,
+                cfg=cfg,
+                args=args,
+                canvit_dtype=canvit_dtype,
+                device=device,
+            )
         (
-            full_validation_metrics,
+            _full_validation_metrics,
             full_validation_timesteps,
             full_validation_mious,
         ) = evaluate_best_full_validation_miou(
@@ -617,14 +779,22 @@ def train_once(args: argparse.Namespace) -> float:
             canvit_dtype=canvit_dtype,
             device=device,
         )
-        if comet_exp is not None:
-            comet_exp.log_metrics(full_validation_metrics, step=update_count)
-            log_final_full_validation_miou_curve(
-                comet_exp=comet_exp,
-                timesteps=full_validation_timesteps,
-                miou_values=full_validation_mious,
-                step=update_count,
-            )
+        log_final_full_validation_miou_curve(
+            comet_exp=comet_exp,
+            timesteps=full_validation_timesteps,
+            miou_values=full_validation_mious,
+            step=update_count,
+            initial_miou_values=initial_full_validation_mious
+            if initial_full_validation_timesteps == full_validation_timesteps
+            else None,
+            egc2f_miou_values=egc2f_full_validation_mious
+            if egc2f_full_validation_timesteps == full_validation_timesteps
+            else None,
+            comparison_output=(
+                args.checkpoint_dir
+                / "final_full_validation_miou_by_timestep_overlay.png"
+            ),
+        )
     else:
         print("Skipped final full validation mIoU evaluation.")
 
