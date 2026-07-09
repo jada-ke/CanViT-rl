@@ -13,15 +13,8 @@ import torch
 
 def add_canvas_sac_optuna_args(parser: argparse.ArgumentParser) -> None:
     """Register Optuna flags without duplicating train_canvas_sac setup."""
-    # Problem: Canvas SAC needs hyperparameter sweeps, but copying the full
-    # training parser/setup into a second script would make future CLI changes
-    # drift.
-    # Solution: expose only sweep-control flags here and let train_canvas_sac.py
-    # keep owning dataset/model/checkpoint arguments.
-    # Result: One trainer configuration can run either a single SAC job or an
-    # Optuna study over trial-specific hyperparameters.
     parser.add_argument("--optuna-trials", type=int, default=0)
-    parser.add_argument("--optuna-study-name", type=str, default="canvas-sac")
+    parser.add_argument("--optuna-study-name", type=str, default="ade20k-sac-t2")
     parser.add_argument("--optuna-storage", type=str, default=None)
 
 
@@ -54,13 +47,6 @@ def build_canvas_sac_trial_args(
 ) -> argparse.Namespace:
     """Apply a Canvas SAC search space to a deep-copied argparse namespace."""
     trial_args = copy.deepcopy(args)
-
-    # Problem: Sharing checkpoint/resume state across trials contaminates the
-    # objective with weights from a different hyperparameter setting.
-    # Solution: each trial writes to its own child directory and uses a unique
-    # seed while still inheriting all fixed CLI setup from the base namespace.
-    # Result: Optuna compares independent Canvas SAC runs without duplicating
-    # the expensive CanViT/data configuration code.
     trial_args.optuna_trial = trial.number
     trial_args.seed = args.seed + trial.number
     trial_args.checkpoint_dir = _trial_checkpoint_dir(args.checkpoint_dir, trial.number)
@@ -78,17 +64,12 @@ def build_canvas_sac_trial_args(
         if tag
     )
 
-    # Problem: the original sweep space was broad and tuned for short/synthetic
-    # runs, while ADE20K trials are expensive and memory-sensitive.
-    # Solution: search the narrower ADE20K-focused optimizer/entropy ranges and
-    # leave replay sizing to the launch command. Result: Optuna spends trials on
-    # learning dynamics rather than memory-dependent knobs.
-    trial_args.actor_lr = trial.suggest_float("actor_lr", 3e-4, 1.5e-3, log=True)
-    trial_args.critic_lr = trial.suggest_float("critic_lr", 1e-4, 8e-4, log=True)
-    trial_args.alpha_lr = trial.suggest_float("alpha_lr", 1e-4, 1e-3, log=True)
-    trial_args.init_alpha = trial.suggest_float("init_alpha", 0.005, 0.05, log=True)
-    trial_args.target_entropy = trial.suggest_float("target_entropy", -5.0, -2.0)
-    trial_args.tau = trial.suggest_float("tau", 0.002, 0.01, log=True)
+    trial_args.actor_lr = trial.suggest_float("actor_lr", 2e-4, 9e-4, log=True)
+    trial_args.critic_lr = trial.suggest_float("critic_lr", 1e-4, 6e-4, log=True)
+    trial_args.alpha_lr = trial.suggest_float("alpha_lr", 1e-4, 8e-4, log=True)
+    trial_args.init_alpha = trial.suggest_float("init_alpha", 0.01, 0.08, log=True)
+    trial_args.target_entropy = trial.suggest_float("target_entropy", -6.0, -2.5)
+    # Keep tau fixed from CLI. It is only meaningful for gamma > 0 bootstrapping.
     # trial_args.gamma = trial.suggest_categorical("gamma", [0.0, 0.25, 0.5, 0.9])
     # trial_args.d_model = trial.suggest_categorical("d_model", [])
     # trial_args.rff_dim = trial.suggest_categorical("rff_dim", [64, 128, 256])
@@ -125,7 +106,7 @@ def run_canvas_sac_optuna(
                 torch.cuda.ipc_collect()
 
     study = optuna.create_study(
-        direction="maximize",
+        direction="minimize",
         study_name=args.optuna_study_name,
         storage=args.optuna_storage,
         load_if_exists=bool(args.optuna_storage),

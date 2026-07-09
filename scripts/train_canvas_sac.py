@@ -236,7 +236,7 @@ def train_once(args: argparse.Namespace) -> float:
         init_alpha=args.init_alpha,
         target_entropy=args.target_entropy,
     )
-    start_batch, update_count, best_relative_ce_gain = load_canvas_sac_resume(
+    start_batch, update_count, best_eval_final_ce = load_canvas_sac_resume(
         args=args,
         actor=actor,
         q1=q1,
@@ -583,7 +583,7 @@ def train_once(args: argparse.Namespace) -> float:
                             _important_eval_metrics(eval_metrics),
                             step=update_count,
                         )
-                    current_eval_reward = eval_metrics["eval/reward"]
+                    current_eval_final_ce = eval_metrics["eval/final_ce"]
                     current_train_reward = eval_metrics[f"eval/{args.split}/reward"]
                     current_selected_reward = eval_metrics[
                         f"eval/{args.eval_split}/reward"
@@ -600,11 +600,16 @@ def train_once(args: argparse.Namespace) -> float:
                         canvas_feature_dim=canvas_feature_dim,
                         batch=batch_idx,
                         updates=update_count,
-                        best_relative_ce_gain=best_relative_ce_gain,
+                        best_eval_final_ce=best_eval_final_ce,
                         eval_metrics=eval_metrics,
                     )
-                    if current_eval_reward > best_relative_ce_gain:
-                        best_relative_ce_gain = current_eval_reward
+                    # Problem: reward can be noisy and indirect for selecting
+                    # deployable segmentation checkpoints. Solution: choose
+                    # best.pt by lowest selected-split final CE. Result: the
+                    # saved best model tracks the validation segmentation loss
+                    # after the full SAC rollout.
+                    if current_eval_final_ce < best_eval_final_ce:
+                        best_eval_final_ce = current_eval_final_ce
                         save_canvas_sac_checkpoint(
                             path=args.checkpoint_dir / "best.pt",
                             actor=actor,
@@ -617,7 +622,7 @@ def train_once(args: argparse.Namespace) -> float:
                             canvas_feature_dim=canvas_feature_dim,
                             batch=batch_idx,
                             updates=update_count,
-                            best_relative_ce_gain=best_relative_ce_gain,
+                            best_eval_final_ce=best_eval_final_ce,
                             eval_metrics=eval_metrics,
                         )
                     reward_text = (
@@ -663,8 +668,8 @@ def train_once(args: argparse.Namespace) -> float:
                 "upd": update_count,
                 "replay": replay.size,
                 "gl/s": f"{glimpses_per_sec:.1f}",
-                "best": f"{best_relative_ce_gain:+.4f}"
-                if best_relative_ce_gain != float("-inf")
+                "best_ce": f"{best_eval_final_ce:.4f}"
+                if best_eval_final_ce != float("inf")
                 else "nan",
             }
         )
@@ -687,9 +692,9 @@ def train_once(args: argparse.Namespace) -> float:
             selected_split=args.eval_split,
             train_split=args.split,
         )
-        current_eval_reward = latest_metrics["eval/reward"]
-        if current_eval_reward > best_relative_ce_gain:
-            best_relative_ce_gain = current_eval_reward
+        current_eval_final_ce = latest_metrics["eval/final_ce"]
+        if current_eval_final_ce < best_eval_final_ce:
+            best_eval_final_ce = current_eval_final_ce
             save_canvas_sac_checkpoint(
                 path=args.checkpoint_dir / "best.pt",
                 actor=actor,
@@ -702,7 +707,7 @@ def train_once(args: argparse.Namespace) -> float:
                 canvas_feature_dim=canvas_feature_dim,
                 batch=args.batches,
                 updates=update_count,
-                best_relative_ce_gain=best_relative_ce_gain,
+                best_eval_final_ce=best_eval_final_ce,
                 eval_metrics=latest_metrics,
             )
         if comet_exp is not None:
@@ -740,7 +745,7 @@ def train_once(args: argparse.Namespace) -> float:
         canvas_feature_dim=canvas_feature_dim,
         batch=args.batches,
         updates=update_count,
-        best_relative_ce_gain=best_relative_ce_gain,
+        best_eval_final_ce=best_eval_final_ce,
         eval_metrics=latest_metrics,
     )
     torch.save(actor.state_dict(), args.checkpoint_dir / "actor_final.pt")
@@ -801,8 +806,8 @@ def train_once(args: argparse.Namespace) -> float:
     if comet_exp is not None:
         comet_exp.end()
     print(f"Saved canvas SAC latest checkpoint to {args.checkpoint_dir / 'latest.pt'}")
-    print(f"Best eval/reward: {best_relative_ce_gain:+.4f}")
-    return best_relative_ce_gain
+    print(f"Best eval/final_ce: {best_eval_final_ce:.4f}")
+    return best_eval_final_ce
 
 
 def parse_args() -> argparse.Namespace:

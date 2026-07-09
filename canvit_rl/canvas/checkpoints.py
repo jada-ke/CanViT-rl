@@ -24,10 +24,10 @@ def save_canvas_sac_checkpoint(
     canvas_feature_dim: int,
     batch: int,
     updates: int,
-    best_relative_ce_gain: float,
+    best_eval_final_ce: float,
     eval_metrics: dict[str, float] | None,
 ) -> None:
-    """Save canvas SAC state; best selection matches relative CE reward."""
+    """Save canvas SAC state; best selection matches final validation CE."""
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -44,8 +44,9 @@ def save_canvas_sac_checkpoint(
             "canvas_feature_dim": canvas_feature_dim,
             "batch": batch,
             "updates": updates,
-            "best_relative_ce_gain": best_relative_ce_gain,
-            "selection_metric": "eval/reward",
+            "best_eval_final_ce": best_eval_final_ce,
+            "selection_metric": "eval/final_ce",
+            "selection_mode": "min",
             "eval_metrics": eval_metrics or {},
             "state_representation": (
                 "current_canvas_layernorm_entropy_with_viewpoint_history"
@@ -69,7 +70,7 @@ def load_canvas_sac_resume(
 ) -> tuple[int, int, float]:
     """Resume a canvas SAC checkpoint while keeping every network trainable."""
     if args.resume is None:
-        return 1, 0, float("-inf")
+        return 1, 0, float("inf")
     checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
     actor.load_state_dict(checkpoint["actor"])
     q1.load_state_dict(checkpoint["q1"])
@@ -84,15 +85,16 @@ def load_canvas_sac_resume(
         agent.alpha_opt.load_state_dict(checkpoint["alpha_opt"])
     if "log_alpha" in checkpoint:
         agent.log_alpha.data.copy_(checkpoint["log_alpha"])
+    selection_metric = checkpoint.get("selection_metric")
+    best_eval_final_ce = checkpoint.get("best_eval_final_ce")
+    if best_eval_final_ce is None and selection_metric == "eval/final_ce":
+        best_eval_final_ce = checkpoint.get("eval_metrics", {}).get("eval/final_ce")
+    if best_eval_final_ce is None:
+        best_eval_final_ce = float("inf")
     return (
         int(checkpoint.get("batch", 0)) + 1,
         int(checkpoint.get("updates", 0)),
-        float(
-            checkpoint.get(
-                "best_relative_ce_gain",
-                checkpoint.get("best_ce_gain", float("-inf")),
-            )
-        ),
+        float(best_eval_final_ce),
     )
 
 
