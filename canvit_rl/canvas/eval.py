@@ -213,14 +213,25 @@ def eval_egc2f_batch(
         get_spatial_fn=model.get_spatial,
     )
     with torch.inference_mode():
-        steps = run_episode(
-            model=model,
-            images=images.to(dtype=canvit_dtype),
-            policy=policy,
-            n_timesteps=args.t + 1,
-            canvas_grid=cfg.canvas_grid_size,
-            glimpse_px=cfg.glimpse_size_px,
-        )
+        # Problem: pre-casting the whole image tensor to bf16 made EG-C2F
+        # sample full-scene glimpses through a different precision path than
+        # SAC, whose sampled glimpses are cast only after sampling. Solution:
+        # keep images in loader precision and let autocast handle frozen CanViT
+        # inference. Result: t0 and later EG-C2F comparisons use the same input
+        # precision convention as the trained-policy rollout.
+        with torch.autocast(
+            device_type=images.device.type,
+            dtype=canvit_dtype,
+            enabled=canvit_dtype != torch.float32,
+        ):
+            steps = run_episode(
+                model=model,
+                images=images,
+                policy=policy,
+                n_timesteps=args.t + 1,
+                canvas_grid=cfg.canvas_grid_size,
+                glimpse_px=cfg.glimpse_size_px,
+            )
         initial_ce, _ = segmentation_metrics(
             model=model, probe=probe, state=steps[0].state, masks=masks, cfg=cfg
         )
@@ -720,14 +731,25 @@ def evaluate_egc2f_full_validation_miou(
             get_spatial_fn=model.get_spatial,
         )
         with torch.inference_mode():
-            steps = run_episode(
-                model=model,
-                images=images.to(dtype=canvit_dtype),
-                policy=policy,
-                n_timesteps=args.t + 1,
-                canvas_grid=cfg.canvas_grid_size,
-                glimpse_px=cfg.glimpse_size_px,
-            )
+            # Problem: final full-validation EG-C2F used bf16 image tensors,
+            # while the trained-policy curve sampled fp32 images and cast only
+            # the resulting glimpse. Solution: run canvit-eval under autocast
+            # with fp32 images. Result: the EG-C2F and SAC timestep curves no
+            # longer differ just because their full-scene warmup was sampled in
+            # different precision.
+            with torch.autocast(
+                device_type=device.type,
+                dtype=canvit_dtype,
+                enabled=canvit_dtype != torch.float32,
+            ):
+                steps = run_episode(
+                    model=model,
+                    images=images,
+                    policy=policy,
+                    n_timesteps=args.t + 1,
+                    canvas_grid=cfg.canvas_grid_size,
+                    glimpse_px=cfg.glimpse_size_px,
+                )
             for step_idx, step in enumerate(steps):
                 # Problem: final-only EG-C2F mIoU cannot be overlaid against
                 # SAC timestep curves. Solution: update one accumulator per
