@@ -25,6 +25,7 @@ dependencies = [
     "canvit-specialize",
     "comet-ml>=3.49.0",
     "optuna>=4.0.0",
+    "canvit-pretrain",
 ]
 
 [project.optional-dependencies]
@@ -56,3 +57,4 @@ line-length = 88
 canvit-pytorch = { git = "https://github.com/m2b3/CanViT-PyTorch.git" }
 canvit-specialize = { git = "https://github.com/m2b3/CanViT-specialize.git" }
 canvit-eval = { git = "https://github.com/m2b3/CanViT-eval.git" }
+canvit-pretrain = { git = "https://github.com/m2b3/CanViT-pretrain.git" }
