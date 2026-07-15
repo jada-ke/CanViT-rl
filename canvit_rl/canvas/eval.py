@@ -41,6 +41,20 @@ if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
 DATALOADER_PREFETCH_FACTOR = 4
 
 
+def _eval_tqdm_kwargs(desc: str) -> dict[str, object]:
+    """Return tqdm settings that stay quiet in non-interactive job logs."""
+    return {
+        "desc": desc,
+        "leave": False,
+        # Problem: validation progress bars write noisy carriage-return lines
+        # into SLURM .out files. Solution: disable bars when stderr is not a
+        # TTY and throttle redraws for interactive runs. Result: eval remains
+        # visible locally without spamming batch job logs.
+        "disable": not sys.stderr.isatty(),
+        "mininterval": 5.0,
+    }
+
+
 def viewpoint_entropy(values: list[np.ndarray], *, bins: int) -> float:
     """Entropy of visited (y, x, scale) bins, normalized to [0, 1]."""
     if not values:
@@ -386,7 +400,10 @@ def evaluate_canvas_sac(
     sac_scale_counts = [0 for _ in range(args.t)]
     sac_entropy_points: list[np.ndarray] = []
 
-    for images, masks in tqdm(eval_loader, desc="Evaluating canvas SAC", leave=False):
+    for images, masks in tqdm(
+        eval_loader,
+        **_eval_tqdm_kwargs("Evaluating canvas SAC"),
+    ):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         batch_size = images.shape[0]
@@ -541,8 +558,7 @@ def evaluate_full_validation_miou(
 
     for images, masks in tqdm(
         full_validation_loader,
-        desc=f"Full validation timestep mIoU for {description}",
-        leave=False,
+        **_eval_tqdm_kwargs(f"Full validation timestep mIoU for {description}"),
     ):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
@@ -714,8 +730,7 @@ def evaluate_egc2f_full_validation_miou(
 
     for images, masks in tqdm(
         full_validation_loader,
-        desc="Full validation timestep mIoU for EG-C2F",
-        leave=False,
+        **_eval_tqdm_kwargs("Full validation timestep mIoU for EG-C2F"),
     ):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)

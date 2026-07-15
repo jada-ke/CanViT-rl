@@ -204,6 +204,8 @@ def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
         raise ValueError("--gae-lambda must be in [0, 1].")
     if args.max_grad_norm < 0.0:
         raise ValueError("--max-grad-norm must be non-negative.")
+    if args.progress_log_interval < 0:
+        raise ValueError("--progress-log-interval must be non-negative.")
 
 
 def save_canvas_ppo_checkpoint(
@@ -483,10 +485,16 @@ def train_once(args: argparse.Namespace) -> float:
         range(start_batch, args.batches + 1),
         desc="Training canvas PPO",
         dynamic_ncols=True,
+        # Problem: on clusters, tqdm writes carriage-return updates into the
+        # SLURM .out file as one line per batch. Solution: show the live bar
+        # only for interactive terminals. Result: batch-level progress stays
+        # useful locally without flooding non-TTY job logs.
+        disable=not sys.stderr.isatty(),
     )
     for batch_idx in pbar:
         sync_for_timing(device)
         batch_start = time.perf_counter()
+        batch_reward_values: list[float] = []
         try:
             images, masks = next(train_iter)
         except StopIteration:
@@ -625,7 +633,9 @@ def train_once(args: argparse.Namespace) -> float:
                 values=value,
                 entropy=prev_entropy,
             )
-            reward_window.extend(reward.detach().cpu().numpy().astype(float).tolist())
+            reward_values = reward.detach().cpu().numpy().astype(float).tolist()
+            reward_window.extend(reward_values)
+            batch_reward_values.extend(reward_values)
             state = out.state
             current_ce = next_ce
             canvas_summary = next_canvas_summary
@@ -640,6 +650,37 @@ def train_once(args: argparse.Namespace) -> float:
         elapsed_seconds += time.perf_counter() - batch_start
         committed_glimpses += batch_size * (args.t + 1)
         glimpses_per_sec = committed_glimpses / max(elapsed_seconds, 1e-12)
+
+        if (
+            not sys.stderr.isatty()
+            and args.progress_log_interval > 0
+            and (
+                batch_idx == start_batch
+                or batch_idx == args.batches
+                or batch_idx % args.progress_log_interval == 0
+            )
+        ):
+            batch_reward_mean = (
+                float(np.mean(batch_reward_values)) if batch_reward_values else float("nan")
+            )
+            # Problem: disabling tqdm keeps SLURM logs clean but can make long
+            # runs look silent between evals. Solution: emit one compact plain
+            # progress line every N batches in non-TTY runs. Result: logs show
+            # liveness and core PPO loss/exploration signals without a line per
+            # batch.
+            print(
+                "train_progress "
+                f"batch={batch_idx}/{args.batches} "
+                f"update={update_count} "
+                f"reward={batch_reward_mean:+.4f} "
+                f"actor_loss={metrics.get('actor/loss', float('nan')):+.4f} "
+                f"value_loss={metrics.get('critic/value_loss', float('nan')):.4f} "
+                f"entropy={metrics.get('actor/entropy', float('nan')):.4f} "
+                f"std={metrics.get('actor/std_mean', float('nan')):.4f} "
+                f"kl={metrics.get('ppo/approx_kl', float('nan')):.5f} "
+                f"glimpses_per_sec={glimpses_per_sec:.1f}",
+                flush=True,
+            )
 
         if update_count % args.comet_log_interval == 0:
             train_metrics = {
@@ -891,6 +932,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument(
+        "--progress-log-interval",
+        type=int,
+        default=100,
+        help=(
+            "For non-interactive runs with tqdm disabled, print one compact "
+            "training progress line every N batches. Use 0 to disable."
+        ),
+    )
     add_canvas_ppo_optuna_args(parser)
     args = parser.parse_args()
     validate_canvas_ppo_args(args)
