@@ -9,7 +9,7 @@ from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 REPLAY_STORAGE_DTYPE = torch.float16
 REPLAY_STORAGE_DTYPE_BYTES = 2
-REPLAY_GPU_FRACTION = 0.55
+REPLAY_GPU_FRACTION = 0.85
 MAX_CPU_REPLAY_BYTES = 96 * 1024**3
 
 
