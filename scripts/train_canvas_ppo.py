@@ -96,6 +96,14 @@ from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.reward import relative_ce_reduction
 from canvit_rl.viewpoint_policy import action_to_viewpoint
 
+try:
+    from canvas_ppo_optuna import add_canvas_ppo_optuna_args, run_canvas_ppo_optuna
+except ImportError:
+    from scripts.canvas_ppo_optuna import (
+        add_canvas_ppo_optuna_args,
+        run_canvas_ppo_optuna,
+    )
+
 IMPORTANT_TRAIN_METRICS = {
     "actor/loss",
     "actor/entropy",
@@ -177,6 +185,25 @@ def _normal_autograd_input(tensor: torch.Tensor | None) -> torch.Tensor | None:
     if tensor is None:
         return None
     return tensor.detach().clone()
+
+
+def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
+    """Validate PPO-specific constraints after shared Canvas arg checks."""
+    validate_canvas_sac_args(args)
+    if args.t < 1:
+        raise ValueError("Canvas PPO requires --t >= 1 so each rollout has actions.")
+    if args.ppo_epochs < 1:
+        raise ValueError("--ppo-epochs must be positive.")
+    if args.ppo_minibatch_size < 1:
+        raise ValueError("--ppo-minibatch-size must be positive.")
+    if not 0.0 <= args.ppo_clip_coef <= 1.0:
+        raise ValueError("--ppo-clip-coef must be in [0, 1].")
+    if args.ppo_target_kl < 0.0:
+        raise ValueError("--ppo-target-kl must be non-negative.")
+    if not 0.0 <= args.gae_lambda <= 1.0:
+        raise ValueError("--gae-lambda must be in [0, 1].")
+    if args.max_grad_norm < 0.0:
+        raise ValueError("--max-grad-norm must be non-negative.")
 
 
 def save_canvas_ppo_checkpoint(
@@ -293,9 +320,7 @@ def load_canvas_ppo_pretrained_initializers(
 
 def train_once(args: argparse.Namespace) -> float:
     """Run full current-canvas PPO and return best relative eval CE gain."""
-    validate_canvas_sac_args(args)
-    if args.t < 1:
-        raise ValueError("Canvas PPO requires --t >= 1 so each rollout has actions.")
+    validate_canvas_ppo_args(args)
     parse_reward_map_scales(args.reward_map_scales)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -866,25 +891,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    add_canvas_ppo_optuna_args(parser)
     args = parser.parse_args()
-    validate_canvas_sac_args(args)
-    if args.t < 1:
-        raise ValueError("Canvas PPO requires --t >= 1 so each rollout has actions.")
-    if args.ppo_epochs < 1:
-        raise ValueError("--ppo-epochs must be positive.")
-    if args.ppo_minibatch_size < 1:
-        raise ValueError("--ppo-minibatch-size must be positive.")
-    if not 0.0 <= args.ppo_clip_coef <= 1.0:
-        raise ValueError("--ppo-clip-coef must be in [0, 1].")
-    if args.ppo_target_kl < 0.0:
-        raise ValueError("--ppo-target-kl must be non-negative.")
-    if not 0.0 <= args.gae_lambda <= 1.0:
-        raise ValueError("--gae-lambda must be in [0, 1].")
+    validate_canvas_ppo_args(args)
     return args
 
 
 def main() -> None:
-    train_once(parse_args())
+    args = parse_args()
+    if args.optuna_trials:
+        run_canvas_ppo_optuna(args, train_once)
+        return
+    train_once(args)
 
 
 if __name__ == "__main__":
