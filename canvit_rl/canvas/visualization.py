@@ -41,6 +41,8 @@ def maybe_visualize_canvas_sac_reward_maps(
     canvit_dtype: torch.dtype,
     update_count: int,
     comet_exp,
+    algorithm_label: str = "SAC",
+    policy_label: str = "sac",
 ) -> None:
     """Optionally save live canvas SAC reward/Q maps after validation."""
     if args.reward_map_images <= 0:
@@ -66,10 +68,12 @@ def maybe_visualize_canvas_sac_reward_maps(
         chunk_size=args.reward_map_chunk_size,
         output_dir=args.reward_map_output_dir,
         split_label=args.eval_split,
-        title_prefix=f"Canvas SAC validation reward map update={update_count}",
+        title_prefix=(
+            f"Canvas {algorithm_label} validation reward map update={update_count}"
+        ),
         policy_kind="canvas",
         max_history=args.max_history,
-        output_name_suffix=f"update_{update_count:06d}",
+        output_name_suffix=f"{policy_label}_update_{update_count:06d}",
     )
     paths.extend(
         visualize_canvas_policy_for_indices(
@@ -85,9 +89,11 @@ def maybe_visualize_canvas_sac_reward_maps(
             min_scale=args.min_scale,
             output_dir=args.reward_map_output_dir,
             split_label=args.eval_split,
-            title_prefix=f"Canvas SAC validation policy update={update_count}",
+            title_prefix=(
+                f"Canvas {algorithm_label} validation policy update={update_count}"
+            ),
             canvit_dtype=canvit_dtype,
-            output_name_suffix=f"update_{update_count:06d}",
+            output_name_suffix=f"{policy_label}_update_{update_count:06d}",
         )
     )
     if comet_exp is not None:
