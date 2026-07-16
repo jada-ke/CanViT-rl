@@ -460,11 +460,22 @@ def _evaluate_grid(
 
 def _corr(x: np.ndarray, y: np.ndarray) -> float:
     """Pearson correlation for flattened maps, nan for constant maps."""
-    x_flat = x.reshape(-1)
-    y_flat = y.reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if int(finite.sum()) < 2:
+        return float("nan")
+    x_flat = x[finite].reshape(-1)
+    y_flat = y[finite].reshape(-1)
     if np.std(x_flat) == 0 or np.std(y_flat) == 0:
         return float("nan")
     return float(np.corrcoef(x_flat, y_flat)[0, 1])
+
+
+def _finite_map_max(values: np.ndarray) -> float:
+    """Return the finite map maximum, or nan without triggering all-NaN warnings."""
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return float("nan")
+    return float(finite_values.max())
 
 
 def _show_image_background(ax, image_np: np.ndarray) -> None:
@@ -552,7 +563,8 @@ def _save_combined_reward_maps(
                 alpha=0.58,
             )
             reward_ax.set_title(
-                f"scale={scale:.2f} true reward\nmax={np.nanmax(reward_map):+.4f}"
+                f"scale={scale:.2f} true reward\n"
+                f"max={_finite_map_max(reward_map):+.4f}"
             )
             reward_ax.set_xlabel("x center")
             reward_ax.set_ylabel("y center")

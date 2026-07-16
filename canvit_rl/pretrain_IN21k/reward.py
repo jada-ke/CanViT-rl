@@ -107,8 +107,50 @@ def dense_raw_mse_reduction_reward(
     *,
     eps: float = 1e-6,
 ) -> Tensor:
-    """CE-style reward: relative reduction in raw-space distillation MSE."""
+    """CE-style reward: relative reduction in raw-space distillation MSE.
+
+    Deprecated for multi-step episodes (T > 1): this divides by the current
+    step's ``before`` loss, so once ``before != l0`` the scale becomes
+    path-dependent and no longer has the potential-based shaping guarantee.
+    At T=1 it is identical to ``raw_mse_l0_delta`` because ``before`` and the
+    episode reset loss coincide.
+    """
     return (before.loss_raw - after.loss_raw) / before.loss_raw.clamp_min(eps)
+
+
+def dense_raw_mse_l0_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    l0: Tensor,
+    *,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Potential-based raw-space loss delta normalized by episode reset loss.
+
+    Problem: dividing raw MSE deltas by each step's own ``before`` loss makes
+    multi-step rewards path-dependent. Solution: hold the t=0 reset loss fixed
+    as ``l0`` for the whole episode. Result: per-sample rewards stay difficulty
+    normalized while preserving the telescoping potential-difference form.
+    """
+    return (before.loss_raw - after.loss_raw) / l0.clamp_min(eps)
+
+
+def dense_loss_l0_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    l0: Tensor,
+    *,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Potential-based normalized-space loss delta scaled by reset loss.
+
+    Problem: l0-normalized shaping is useful in standardized DINOv3 space too,
+    but mixing a normalized loss delta with raw-space l0 would silently distort
+    reward scale. Solution: require callers to pass the episode t=0
+    ``loss_norm`` reference for this mode. Result: normalized-space rewards get
+    the same policy-invariant telescoping behavior as raw-space l0 deltas.
+    """
+    return (before.loss_norm - after.loss_norm) / l0.clamp_min(eps)
 
 
 def dense_reward(
@@ -116,6 +158,7 @@ def dense_reward(
     mode: str,
     before: DenseDistillationMetrics,
     after: DenseDistillationMetrics,
+    l0: Tensor | None = None,
     eps: float = 1e-6,
 ) -> Tensor:
     """Dispatch the configured dense SAC reward mode."""
@@ -123,4 +166,16 @@ def dense_reward(
         return dense_raw_mse_reduction_reward(before, after, eps=eps)
     if mode == "norm_loss_reduction":
         return dense_loss_reduction_reward(before, after, eps=eps)
+    if mode == "raw_mse_l0_delta":
+        if l0 is None:
+            raise ValueError(
+                "raw_mse_l0_delta requires l0 (episode t=0 reference loss)."
+            )
+        return dense_raw_mse_l0_delta_reward(before, after, l0, eps=eps)
+    if mode == "norm_loss_l0_delta":
+        if l0 is None:
+            raise ValueError(
+                "norm_loss_l0_delta requires l0 (episode t=0 reference loss)."
+            )
+        return dense_loss_l0_delta_reward(before, after, l0, eps=eps)
     raise ValueError(f"Unsupported dense reward mode: {mode}")

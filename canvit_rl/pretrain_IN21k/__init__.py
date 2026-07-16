@@ -3,7 +3,9 @@
 from canvit_rl.pretrain_IN21k.dense_train_batch import (
     DenseTrainBatch,
     FixedDenseSubsetLoader,
+    PairedDenseShardLoader,
     apply_dense_feature_config,
+    dense_glimpse_images,
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
     validate_dense_feature_source,
@@ -15,7 +17,9 @@ from canvit_rl.pretrain_IN21k.pretrain_modules import (
 from canvit_rl.pretrain_IN21k.reward import (
     DenseDistillationMetrics,
     dense_distillation_metrics,
+    dense_loss_l0_delta_reward,
     dense_loss_reduction_reward,
+    dense_raw_mse_l0_delta_reward,
     dense_raw_mse_reduction_reward,
     dense_reward,
 )
@@ -24,9 +28,13 @@ __all__ = [
     "DenseDistillationMetrics",
     "DenseTrainBatch",
     "FixedDenseSubsetLoader",
+    "PairedDenseShardLoader",
     "apply_dense_feature_config",
+    "dense_glimpse_images",
     "dense_distillation_metrics",
+    "dense_loss_l0_delta_reward",
     "dense_loss_reduction_reward",
+    "dense_raw_mse_l0_delta_reward",
     "dense_raw_mse_reduction_reward",
     "dense_reward",
     "init_normalizer_stats_from_shard",

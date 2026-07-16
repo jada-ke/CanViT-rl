@@ -44,8 +44,16 @@ def save_dense_sac_checkpoint(
             "batch": batch,
             "updates": updates,
             "metrics": metrics,
-            "state_representation": "current_canvas_layernorm_with_viewpoint_history",
-            "reward": getattr(args, "reward_mode", "raw_mse_reduction"),
+            # Problem: dense SAC can optionally train actor/critics with an
+            # extra spatial uncertainty map. Solution: persist the same state
+            # representation labels used by Canvas SAC. Result: resume and
+            # diagnostic loaders can rebuild the correct entropy-aware model.
+            "state_representation": (
+                "current_canvas_layernorm_entropy_with_viewpoint_history"
+                if getattr(args, "canvas_entropy_state", False)
+                else "current_canvas_layernorm_with_viewpoint_history"
+            ),
+            "reward": getattr(args, "reward_mode", "raw_mse_l0_delta"),
         },
         path,
     )

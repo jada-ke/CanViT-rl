@@ -42,6 +42,12 @@ class DenseTrainBatch:
     cls_target: Tensor
     raw_scene_target: Tensor
     raw_cls_target: Tensor
+    glimpse_images: Tensor | None = None
+
+
+def dense_glimpse_images(batch: DenseTrainBatch) -> Tensor:
+    """Return the image tensor used for policy-selected non-t0 glimpses."""
+    return batch.images if batch.glimpse_images is None else batch.glimpse_images
 
 
 class FixedDenseSubsetLoader:
@@ -205,6 +211,229 @@ class FixedDenseSubsetLoader:
         )
 
 
+class PairedDenseShardLoader:
+    """Small paired-shard loader for hidden-image/oracle-target diagnostics."""
+
+    def __init__(
+        self,
+        *,
+        hidden_shards_dir: Path,
+        target_shards_dir: Path,
+        image_size: int,
+        batch_size: int,
+        hidden_image_root: Path | None,
+        hidden_tar_dir: Path | None,
+        target_image_root: Path,
+        shuffle_seed: int,
+    ) -> None:
+        validate_dense_feature_source(
+            feature_image_root=hidden_image_root,
+            tar_dir=hidden_tar_dir,
+        )
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        self.batch_size = batch_size
+        self.generator = torch.Generator().manual_seed(shuffle_seed)
+        self.images, self.glimpse_images, self.patches, self.cls, self.labels = (
+            self._load_paired_records(
+                hidden_shards_dir=hidden_shards_dir,
+                target_shards_dir=target_shards_dir,
+                image_size=image_size,
+                hidden_image_root=hidden_image_root,
+                hidden_tar_dir=hidden_tar_dir,
+                target_image_root=target_image_root,
+            )
+        )
+        self.order = torch.randperm(self.images.shape[0], generator=self.generator)
+        self.pos = 0
+
+    @staticmethod
+    @staticmethod
+    def _list_shards(shards_dir: Path) -> list[Path]:
+        """Return sorted dense-feature shard files from one source."""
+        shard_files = sorted(Path(shards_dir).glob("*.pt"))
+        if not shard_files:
+            raise FileNotFoundError(f"No dense-feature shards found in {shards_dir}")
+        return shard_files
+
+    @staticmethod
+    def _sample_key(rel_path: str) -> str:
+        """Return the stable key used to join independently shuffled exports."""
+        return Path(rel_path).name
+
+    @classmethod
+    def _index_hidden_records(
+        cls,
+        *,
+        hidden_shards_dir: Path,
+    ) -> dict[str, tuple[Path, str]]:
+        """Index usable hidden rows by sample basename across all hidden shards."""
+        index: dict[str, tuple[Path, str]] = {}
+        for hidden_shard_path in cls._list_shards(hidden_shards_dir):
+            hidden_shard = torch.load(
+                hidden_shard_path,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
+            failed = set(hidden_shard.get("failed_indices", []))
+            for idx, rel_path in enumerate(hidden_shard["paths"]):
+                if idx in failed:
+                    continue
+                key = cls._sample_key(str(rel_path))
+                if key in index:
+                    raise ValueError(
+                        f"Duplicate hidden sample key {key!r}; use unique staged "
+                        "filenames before feature export."
+                    )
+                index[key] = (hidden_shard_path, str(rel_path))
+            del hidden_shard
+        return index
+
+    @staticmethod
+    def _load_hidden_image(
+        *,
+        rel_path: str,
+        hidden_image_root: Path | None,
+        hidden_tar_reader,
+    ) -> Image.Image:
+        """Load the hidden t0 image for one paired shard row."""
+        if hidden_tar_reader is not None:
+            return hidden_tar_reader.read_image(rel_path)
+        assert hidden_image_root is not None
+        with Image.open(hidden_image_root / rel_path) as image_file:
+            return image_file.convert("RGB")
+
+    @staticmethod
+    def _load_target_image(
+        *,
+        rel_path: str,
+        target_image_root: Path,
+    ) -> Image.Image:
+        """Load the oracle image if available for non-t0 glimpses."""
+        with Image.open(target_image_root / rel_path) as image_file:
+            return image_file.convert("RGB")
+
+    @classmethod
+    def _load_paired_records(
+        cls,
+        *,
+        hidden_shards_dir: Path,
+        target_shards_dir: Path,
+        image_size: int,
+        hidden_image_root: Path | None,
+        hidden_tar_dir: Path | None,
+        target_image_root: Path,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Materialize paired hidden images and oracle targets into memory."""
+        transform = preprocess(image_size)
+        hidden_images: list[Tensor] = []
+        target_images: list[Tensor] = []
+        patches: list[Tensor] = []
+        cls_tokens: list[Tensor] = []
+        labels: list[int] = []
+        hidden_index = cls._index_hidden_records(hidden_shards_dir=hidden_shards_dir)
+        tar_readers: dict[Path, object] = {}
+        target_keys_seen: set[str] = set()
+        try:
+            for target_shard_path in cls._list_shards(target_shards_dir):
+                target_shard = torch.load(
+                    target_shard_path,
+                    map_location="cpu",
+                    weights_only=False,
+                    mmap=True,
+                )
+                target_failed = set(target_shard.get("failed_indices", []))
+                for idx, target_rel_path in enumerate(target_shard["paths"]):
+                    if idx in target_failed:
+                        continue
+                    key = cls._sample_key(str(target_rel_path))
+                    if key in target_keys_seen:
+                        raise ValueError(
+                            f"Duplicate target sample key {key!r}; use unique "
+                            "staged filenames before feature export."
+                        )
+                    target_keys_seen.add(key)
+                    hidden_record = hidden_index.get(key)
+                    if hidden_record is None:
+                        continue
+                    hidden_shard_path, hidden_rel_path = hidden_record
+                    hidden_tar_reader = None
+                    if hidden_tar_dir is not None:
+                        hidden_tar_reader = tar_readers.get(hidden_shard_path)
+                        if hidden_tar_reader is None:
+                            hidden_tar_reader = FixedDenseSubsetLoader._open_tar_reader(
+                                hidden_tar_dir,
+                                hidden_shard_path,
+                            )
+                            tar_readers[hidden_shard_path] = hidden_tar_reader
+                    # Problem: hidden and oracle parquet exports can be shuffled
+                    # independently, so shard filenames and row indices are not
+                    # stable pair identifiers. Solution: join rows by the
+                    # staged sample basename and then load hidden pixels plus
+                    # oracle features/images from their own sources. Result:
+                    # paired SAC training is correct even after independent
+                    # parquet/shard shuffles.
+                    hidden_image = cls._load_hidden_image(
+                        rel_path=hidden_rel_path,
+                        hidden_image_root=hidden_image_root,
+                        hidden_tar_reader=hidden_tar_reader,
+                    )
+                    target_image = cls._load_target_image(
+                        rel_path=str(target_rel_path),
+                        target_image_root=target_image_root,
+                    )
+                    hidden_images.append(transform(hidden_image))
+                    target_images.append(transform(target_image))
+                    patches.append(target_shard["patches"][idx].clone())
+                    cls_tokens.append(target_shard["cls"][idx].clone())
+                    labels.append(int(target_shard["class_idxs"][idx]))
+                del target_shard
+        finally:
+            for reader in tar_readers.values():
+                reader.close()
+        if not hidden_images:
+            raise ValueError("No usable paired dense-shard rows were found.")
+        missing = len(target_keys_seen) - len(hidden_images)
+        if missing:
+            print(
+                f"PairedDenseShardLoader skipped {missing} target rows without "
+                "matching hidden basename."
+            )
+        return (
+            torch.stack(hidden_images),
+            torch.stack(target_images),
+            torch.stack(patches),
+            torch.stack(cls_tokens),
+            torch.tensor(labels, dtype=torch.long),
+        )
+
+    def _next_indices(self) -> Tensor:
+        """Return a reshuffled mini-batch of paired indices."""
+        pieces: list[Tensor] = []
+        remaining = self.batch_size
+        while remaining > 0:
+            if self.pos >= len(self.order):
+                self.order = torch.randperm(len(self.order), generator=self.generator)
+                self.pos = 0
+            take = min(remaining, len(self.order) - self.pos)
+            pieces.append(self.order[self.pos : self.pos + take])
+            self.pos += take
+            remaining -= take
+        return torch.cat(pieces)
+
+    def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Return hidden images, oracle images, targets, and labels."""
+        idx = self._next_indices()
+        return (
+            self.images.index_select(0, idx),
+            self.glimpse_images.index_select(0, idx),
+            self.patches.index_select(0, idx),
+            self.cls.index_select(0, idx),
+            self.labels.index_select(0, idx),
+        )
+
+
 def validate_dense_feature_source(
     *,
     feature_image_root: Path | str | None,
@@ -254,8 +483,15 @@ def load_dense_train_batch(
     non_blocking: bool = True,
 ) -> DenseTrainBatch:
     """Load and standardize one CanViT-pretrain dense-feature train batch."""
-    images, raw_patches, raw_cls, labels = train_loader.next()
+    batch_parts = train_loader.next()
+    if len(batch_parts) == 5:
+        images, glimpse_images, raw_patches, raw_cls, labels = batch_parts
+    else:
+        images, raw_patches, raw_cls, labels = batch_parts
+        glimpse_images = None
     images = images.to(device=device, non_blocking=non_blocking)
+    if glimpse_images is not None:
+        glimpse_images = glimpse_images.to(device=device, non_blocking=non_blocking)
     labels = labels.to(device=device, non_blocking=non_blocking)
 
     # Problem: dense features are stored as fp16 in shards, but distillation
@@ -282,6 +518,7 @@ def load_dense_train_batch(
         cls_target=cls_target,
         raw_scene_target=raw_scene_target,
         raw_cls_target=raw_cls_target,
+        glimpse_images=glimpse_images,
     )
 
 
