@@ -97,8 +97,16 @@ def dense_loss_reduction_reward(
     *,
     eps: float = 1e-6,
 ) -> Tensor:
-    """CE-style reward: relative reduction in normalized distillation loss."""
+    """Step-relative normalized-space reduction: (L[t-1] - L[t]) / L[t-1]."""
     return (before.loss_norm - after.loss_norm) / before.loss_norm.clamp_min(eps)
+
+
+def dense_loss_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+) -> Tensor:
+    """Plain normalized-space loss delta: L[t-1] - L[t]."""
+    return before.loss_norm - after.loss_norm
 
 
 def dense_raw_mse_reduction_reward(
@@ -107,15 +115,16 @@ def dense_raw_mse_reduction_reward(
     *,
     eps: float = 1e-6,
 ) -> Tensor:
-    """CE-style reward: relative reduction in raw-space distillation MSE.
-
-    Deprecated for multi-step episodes (T > 1): this divides by the current
-    step's ``before`` loss, so once ``before != l0`` the scale becomes
-    path-dependent and no longer has the potential-based shaping guarantee.
-    At T=1 it is identical to ``raw_mse_l0_delta`` because ``before`` and the
-    episode reset loss coincide.
-    """
+    """Step-relative raw-space reduction: (L[t-1] - L[t]) / L[t-1]."""
     return (before.loss_raw - after.loss_raw) / before.loss_raw.clamp_min(eps)
+
+
+def dense_raw_mse_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+) -> Tensor:
+    """Plain raw-space loss delta: L[t-1] - L[t]."""
+    return before.loss_raw - after.loss_raw
 
 
 def dense_raw_mse_l0_delta_reward(
@@ -162,6 +171,10 @@ def dense_reward(
     eps: float = 1e-6,
 ) -> Tensor:
     """Dispatch the configured dense SAC reward mode."""
+    if mode == "raw_mse_delta":
+        return dense_raw_mse_delta_reward(before, after)
+    if mode == "norm_loss_delta":
+        return dense_loss_delta_reward(before, after)
     if mode == "raw_mse_reduction":
         return dense_raw_mse_reduction_reward(before, after, eps=eps)
     if mode == "norm_loss_reduction":

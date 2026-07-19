@@ -13,6 +13,15 @@ REPLAY_GPU_FRACTION = 0.85
 MAX_CPU_REPLAY_BYTES = 96 * 1024**3
 
 
+def should_pin_replay_memory(
+    *,
+    storage_device: torch.device,
+    train_device: torch.device,
+) -> bool:
+    """Return whether CPU replay should use pinned host memory for CUDA updates."""
+    return storage_device.type == "cpu" and train_device.type == "cuda"
+
+
 def replay_canvas_bytes(
     *,
     capacity: int,
@@ -88,48 +97,87 @@ class CanvasReplayBuffer:
         canvas_grid_size: int,
         storage_device: torch.device,
         store_entropy: bool = False,
+        pin_memory: bool = False,
     ) -> None:
         self.capacity = capacity
         self.storage_device = storage_device
         self.store_entropy = store_entropy
-        alloc_kwargs = {"device": storage_device}
-        self.canvas = torch.zeros(
+        self.pin_memory = pin_memory and storage_device.type == "cpu"
+        self._sample_staging: dict[tuple[int, int], torch.Tensor] = {}
+
+        # Problem: CPU replay avoids VRAM pressure but pageable host tensors
+        # make every sampled mini-batch copy block the trainer.
+        # Solution: optionally allocate CPU replay and sample-staging tensors as
+        # pinned memory, then use non-blocking transfers for CUDA updates.
+        # Result: large CPU replay keeps GPU memory flat while reducing the
+        # CPU-to-GPU transfer penalty relative to regular host memory.
+        self.canvas = self._zeros(
             (capacity, canvas_feature_dim, canvas_grid_size, canvas_grid_size),
             dtype=REPLAY_STORAGE_DTYPE,
-            **alloc_kwargs,
         )
-        self.next_canvas = torch.zeros_like(self.canvas)
+        self.next_canvas = self._zeros_like(self.canvas)
         if store_entropy:
-            self.entropy = torch.zeros(
+            self.entropy = self._zeros(
                 (capacity, 1, canvas_grid_size, canvas_grid_size),
                 dtype=REPLAY_STORAGE_DTYPE,
-                **alloc_kwargs,
             )
-            self.next_entropy = torch.zeros_like(self.entropy)
+            self.next_entropy = self._zeros_like(self.entropy)
         else:
             self.entropy = None
             self.next_entropy = None
-        self.coords = torch.zeros(
+        self.coords = self._zeros(
             (capacity, max_history, 3),
             dtype=torch.float32,
-            **alloc_kwargs,
         )
-        self.next_coords = torch.zeros_like(self.coords)
-        self.lengths = torch.zeros(capacity, dtype=torch.long, **alloc_kwargs)
-        self.next_lengths = torch.zeros_like(self.lengths)
-        self.actions = torch.zeros(
+        self.next_coords = self._zeros_like(self.coords)
+        self.lengths = self._zeros((capacity,), dtype=torch.long)
+        self.next_lengths = self._zeros_like(self.lengths)
+        self.actions = self._zeros(
             (capacity, 3),
             dtype=torch.float32,
-            **alloc_kwargs,
         )
-        self.rewards = torch.zeros(
+        self.rewards = self._zeros(
             capacity,
             dtype=torch.float32,
-            **alloc_kwargs,
         )
-        self.dones = torch.zeros_like(self.rewards)
+        self.dones = self._zeros_like(self.rewards)
         self.pos = 0
         self.size = 0
+
+    def _zeros(
+        self,
+        shape: tuple[int, ...] | int,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Allocate replay storage on the selected device."""
+        if self.storage_device.type == "cpu":
+            return torch.zeros(
+                shape,
+                dtype=dtype,
+                device=self.storage_device,
+                pin_memory=self.pin_memory,
+            )
+        return torch.zeros(shape, dtype=dtype, device=self.storage_device)
+
+    def _zeros_like(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Allocate a matching replay tensor while preserving pinning policy."""
+        return self._zeros(tuple(tensor.shape), dtype=tensor.dtype)
+
+    def _staging_for(self, values: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Return a per-source pinned staging tensor for async CUDA copies."""
+        key = (values.data_ptr(), batch_size)
+        staging = self._sample_staging.get(key)
+        expected_shape = (batch_size, *values.shape[1:])
+        if staging is None or tuple(staging.shape) != expected_shape:
+            staging = torch.empty(
+                expected_shape,
+                dtype=values.dtype,
+                device=self.storage_device,
+                pin_memory=True,
+            )
+            self._sample_staging[key] = staging
+        return staging
 
     def _copy_rows(self, tensor: torch.Tensor, values: torch.Tensor) -> None:
         """Copy a batch into circular replay slots without host NumPy staging."""
@@ -205,6 +253,14 @@ class CanvasReplayBuffer:
         idx = torch.randint(0, self.size, (batch_size,), device=self.storage_device)
 
         def move(values: torch.Tensor, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+            if self.pin_memory and self.storage_device.type == "cpu" and device.type == "cuda":
+                selected = self._staging_for(values, batch_size)
+                torch.index_select(values, 0, idx, out=selected)
+                return selected.to(
+                    device=device,
+                    dtype=dtype or values.dtype,
+                    non_blocking=True,
+                )
             return values.index_select(0, idx).to(
                 device=device,
                 dtype=dtype or values.dtype,

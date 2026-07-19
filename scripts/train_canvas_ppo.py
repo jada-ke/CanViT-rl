@@ -920,7 +920,7 @@ def parse_args() -> argparse.Namespace:
         comet_tags="canvas-ppo",
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--ppo-minibatch-size", type=int, default=4)
+    parser.add_argument("--ppo-minibatch-size", type=int, default=16)
     parser.add_argument("--ppo-clip-coef", type=float, default=0.2)
     parser.add_argument("--ppo-value-coef", type=float, default=0.5)
     parser.add_argument("--ppo-entropy-coef", type=float, default=0.03)

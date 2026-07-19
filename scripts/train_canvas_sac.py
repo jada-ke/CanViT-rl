@@ -59,6 +59,7 @@ from canvit_rl.canvas.sac import (
     CanvasSAC,
     replay_canvas_bytes,
     resolve_replay_device,
+    should_pin_replay_memory,
     validate_replay_memory,
 )
 from canvit_rl.canvit_precision import configure_frozen_canvit_precision
@@ -267,10 +268,15 @@ def train_once(args: argparse.Namespace) -> float:
         storage_device=replay_device,
         replay_bytes=replay_bytes,
     )
+    replay_pin_memory = should_pin_replay_memory(
+        storage_device=replay_device,
+        train_device=device,
+    )
     print(
         "Replay storage: "
         f"device={replay_device}, dtype={REPLAY_STORAGE_DTYPE}, "
-        f"canvas_bytes={replay_bytes / 1024**3:.2f} GiB"
+        f"canvas_bytes={replay_bytes / 1024**3:.2f} GiB, "
+        f"pin_memory={replay_pin_memory}"
     )
     replay = CanvasReplayBuffer(
         capacity=args.buffer_size,
@@ -279,6 +285,7 @@ def train_once(args: argparse.Namespace) -> float:
         canvas_grid_size=cfg.canvas_grid_size,
         storage_device=replay_device,
         store_entropy=args.canvas_entropy_state,
+        pin_memory=replay_pin_memory,
     )
     comet_exp = make_comet_experiment(args)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -287,12 +294,6 @@ def train_once(args: argparse.Namespace) -> float:
     if args.eval_init_full_validation_miou:
         rng_state = _capture_rng_state()
         try:
-            # Problem: final full-validation mIoU has no untrained reference
-            # curve, but running that diagnostic can advance RNG streams before
-            # SAC training starts. Solution: evaluate the initialized actor
-            # inside an RNG save/restore bracket. Result: enabling
-            # --eval-init-full-validation-miou does not change later sampler,
-            # warmup-action, actor-sampling, or replay-sampling randomness.
             (
                 _initial_full_validation_metrics,
                 initial_full_validation_timesteps,
@@ -335,10 +336,6 @@ def train_once(args: argparse.Namespace) -> float:
             and split_label not in egc2f_eval_cache
             and "eval/egc2f_miou" in metrics
         ):
-            # Problem: EG-C2F is deterministic for a fixed loader, but it was
-            # recomputed at every SAC eval interval. Solution: cache the mIoU
-            # the first time each split/loader is evaluated. Result: later
-            # evals update SAC metrics only while reusing the constant baseline.
             egc2f_eval_cache[split_label] = {
                 "eval/egc2f_miou": metrics["eval/egc2f_miou"]
             }

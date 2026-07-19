@@ -69,11 +69,18 @@ def build_canvas_sac_trial_args(
     trial_args.alpha_lr = trial.suggest_float("alpha_lr", 1e-4, 8e-4, log=True)
     trial_args.init_alpha = trial.suggest_float("init_alpha", 0.01, 0.08, log=True)
     trial_args.target_entropy = trial.suggest_float("target_entropy", -6.0, -2.5)
-    # Keep tau fixed from CLI. It is only meaningful for gamma > 0 bootstrapping.
+     # Keep tau fixed from CLI. It is only meaningful for gamma > 0 bootstrapping.
     # trial_args.gamma = trial.suggest_categorical("gamma", [0.0, 0.25, 0.5, 0.9])
     # trial_args.d_model = trial.suggest_categorical("d_model", [])
     # trial_args.rff_dim = trial.suggest_categorical("rff_dim", [64, 128, 256])
-    # Keep replay_batch_size and learning_starts fixed from CLI for ADE20K.
+    # trial_args.replay_batch_size = trial.suggest_categorical(
+    #     "replay_batch_size",
+    #     [8, 16],
+    # )
+    # trial_args.learning_starts = trial.suggest_categorical(
+    #     "learning_starts",
+    #     [64, 128, 256, 512],
+    # )
     # trial_args.updates_per_batch = trial.suggest_categorical(
     #     "updates_per_batch",
     #     [1, 2],

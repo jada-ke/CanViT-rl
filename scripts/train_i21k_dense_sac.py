@@ -66,6 +66,7 @@ from canvit_rl.canvas.sac import (
     CanvasSAC,
     replay_canvas_bytes,
     resolve_replay_device,
+    should_pin_replay_memory,
     validate_replay_memory,
 )
 from canvit_rl.canvas.eval import viewpoint_entropy
@@ -199,9 +200,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reward-mode",
         choices=[
+            "raw_mse_delta",
             "raw_mse_reduction",
-            "norm_loss_reduction",
             "raw_mse_l0_delta",
+            "norm_loss_delta",
+            "norm_loss_reduction",
             "norm_loss_l0_delta",
         ],
         default="raw_mse_l0_delta",
@@ -504,7 +507,7 @@ def _episode_l0_for_reward_mode(
     normalized-space modes at reset. Result: l0 remains fixed per episode and
     always matches the delta being divided.
     """
-    if mode == "norm_loss_l0_delta" or mode == "norm_loss_reduction":
+    if mode.startswith("norm_loss"):
         return metrics.loss_norm.detach().clone()
     return metrics.loss_raw.detach().clone()
 
@@ -1432,6 +1435,10 @@ def train_once(args: argparse.Namespace) -> None:
     )
     replay_device = resolve_replay_device(train_device=device, replay_bytes=replay_bytes)
     validate_replay_memory(storage_device=replay_device, replay_bytes=replay_bytes)
+    replay_pin_memory = should_pin_replay_memory(
+        storage_device=replay_device,
+        train_device=device,
+    )
     replay = CanvasReplayBuffer(
         capacity=args.buffer_size,
         max_history=args.max_history,
@@ -1439,11 +1446,13 @@ def train_once(args: argparse.Namespace) -> None:
         canvas_grid_size=G,
         storage_device=replay_device,
         store_entropy=args.canvas_entropy_state,
+        pin_memory=replay_pin_memory,
     )
     print(
         "Replay storage: "
         f"device={replay_device}, dtype={REPLAY_STORAGE_DTYPE}, "
-        f"canvas_bytes={replay_bytes / 1024**3:.2f} GiB"
+        f"canvas_bytes={replay_bytes / 1024**3:.2f} GiB, "
+        f"pin_memory={replay_pin_memory}"
     )
 
     comet_exp = make_dense_comet_experiment(args)
