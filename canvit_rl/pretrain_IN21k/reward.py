@@ -125,6 +125,30 @@ def dense_loss_log_delta_reward(
     return before.loss_norm.clamp_min(eps).log() - after.loss_norm.clamp_min(eps).log()
 
 
+def dense_loss_log_delta_clipped_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+    clip: float = 1.0,
+) -> Tensor:
+    """Clipped normalized-space log improvement."""
+    reward = dense_loss_log_delta_reward(before, after, eps=eps)
+    return reward.clamp(min=-clip, max=clip)
+
+
+def dense_loss_log_delta_tanh_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+    scale: float = 1.0,
+) -> Tensor:
+    """Tanh-bounded normalized-space log improvement."""
+    reward = dense_loss_log_delta_reward(before, after, eps=eps)
+    return (scale * reward).tanh()
+
+
 def dense_raw_mse_reduction_reward(
     before: DenseDistillationMetrics,
     after: DenseDistillationMetrics,
@@ -153,6 +177,30 @@ def dense_raw_mse_log_delta_reward(
     return before.loss_raw.clamp_min(eps).log() - after.loss_raw.clamp_min(eps).log()
 
 
+def dense_raw_mse_log_delta_clipped_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+    clip: float = 1.0,
+) -> Tensor:
+    """Clipped raw-space log improvement."""
+    reward = dense_raw_mse_log_delta_reward(before, after, eps=eps)
+    return reward.clamp(min=-clip, max=clip)
+
+
+def dense_raw_mse_log_delta_tanh_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+    scale: float = 1.0,
+) -> Tensor:
+    """Tanh-bounded raw-space log improvement."""
+    reward = dense_raw_mse_log_delta_reward(before, after, eps=eps)
+    return (scale * reward).tanh()
+
+
 def dense_raw_mse_l0_delta_reward(
     before: DenseDistillationMetrics,
     after: DenseDistillationMetrics,
@@ -168,6 +216,32 @@ def dense_raw_mse_l0_delta_reward(
     normalized while preserving the telescoping potential-difference form.
     """
     return (before.loss_raw - after.loss_raw) / l0.clamp_min(eps)
+
+
+def dense_raw_mse_clipped_l0_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    l0: Tensor,
+    *,
+    eps: float = 1e-6,
+    clip: float = 1.0,
+) -> Tensor:
+    """Hard-clipped raw-space l0-normalized delta."""
+    reward = dense_raw_mse_l0_delta_reward(before, after, l0, eps=eps)
+    return reward.clamp(min=-clip, max=clip)
+
+
+def dense_raw_mse_tanh_l0_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    l0: Tensor,
+    *,
+    eps: float = 1e-6,
+    scale: float = 1.0,
+) -> Tensor:
+    """Bounded raw-space l0-normalized delta via tanh(scale * delta / l0)."""
+    reward = dense_raw_mse_l0_delta_reward(before, after, l0, eps=eps)
+    return (scale * reward).tanh()
 
 
 def dense_loss_l0_delta_reward(
@@ -188,6 +262,32 @@ def dense_loss_l0_delta_reward(
     return (before.loss_norm - after.loss_norm) / l0.clamp_min(eps)
 
 
+def dense_loss_clipped_l0_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    l0: Tensor,
+    *,
+    eps: float = 1e-6,
+    clip: float = 1.0,
+) -> Tensor:
+    """Hard-clipped normalized-space l0-normalized delta."""
+    reward = dense_loss_l0_delta_reward(before, after, l0, eps=eps)
+    return reward.clamp(min=-clip, max=clip)
+
+
+def dense_loss_tanh_l0_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    l0: Tensor,
+    *,
+    eps: float = 1e-6,
+    scale: float = 1.0,
+) -> Tensor:
+    """Bounded normalized-space l0 delta via tanh(scale * delta / l0)."""
+    reward = dense_loss_l0_delta_reward(before, after, l0, eps=eps)
+    return (scale * reward).tanh()
+
+
 def dense_reward(
     *,
     mode: str,
@@ -195,6 +295,9 @@ def dense_reward(
     after: DenseDistillationMetrics,
     l0: Tensor | None = None,
     eps: float = 1e-6,
+    log_clip: float = 1.0,
+    l0_clip: float = 1.0,
+    tanh_scale: float = 1.0,
 ) -> Tensor:
     """Dispatch the configured dense SAC reward mode."""
     if mode == "raw_mse_delta":
@@ -205,6 +308,34 @@ def dense_reward(
         return dense_raw_mse_log_delta_reward(before, after, eps=eps)
     if mode == "norm_loss_log_delta":
         return dense_loss_log_delta_reward(before, after, eps=eps)
+    if mode == "raw_mse_log_delta_clipped":
+        return dense_raw_mse_log_delta_clipped_reward(
+            before,
+            after,
+            eps=eps,
+            clip=log_clip,
+        )
+    if mode == "norm_loss_log_delta_clipped":
+        return dense_loss_log_delta_clipped_reward(
+            before,
+            after,
+            eps=eps,
+            clip=log_clip,
+        )
+    if mode == "raw_mse_log_delta_tanh":
+        return dense_raw_mse_log_delta_tanh_reward(
+            before,
+            after,
+            eps=eps,
+            scale=tanh_scale,
+        )
+    if mode == "norm_loss_log_delta_tanh":
+        return dense_loss_log_delta_tanh_reward(
+            before,
+            after,
+            eps=eps,
+            scale=tanh_scale,
+        )
     if mode == "raw_mse_reduction":
         return dense_raw_mse_reduction_reward(before, after, eps=eps)
     if mode == "norm_loss_reduction":
@@ -215,10 +346,58 @@ def dense_reward(
                 "raw_mse_l0_delta requires l0 (episode t=0 reference loss)."
             )
         return dense_raw_mse_l0_delta_reward(before, after, l0, eps=eps)
+    if mode == "raw_mse_clipped_l0_delta":
+        if l0 is None:
+            raise ValueError(
+                "raw_mse_clipped_l0_delta requires l0 (episode t=0 reference loss)."
+            )
+        return dense_raw_mse_clipped_l0_delta_reward(
+            before,
+            after,
+            l0,
+            eps=eps,
+            clip=l0_clip,
+        )
+    if mode == "raw_mse_tanh_l0_delta":
+        if l0 is None:
+            raise ValueError(
+                "raw_mse_tanh_l0_delta requires l0 (episode t=0 reference loss)."
+            )
+        return dense_raw_mse_tanh_l0_delta_reward(
+            before,
+            after,
+            l0,
+            eps=eps,
+            scale=tanh_scale,
+        )
     if mode == "norm_loss_l0_delta":
         if l0 is None:
             raise ValueError(
                 "norm_loss_l0_delta requires l0 (episode t=0 reference loss)."
             )
         return dense_loss_l0_delta_reward(before, after, l0, eps=eps)
+    if mode == "norm_loss_clipped_l0_delta":
+        if l0 is None:
+            raise ValueError(
+                "norm_loss_clipped_l0_delta requires l0 (episode t=0 reference loss)."
+            )
+        return dense_loss_clipped_l0_delta_reward(
+            before,
+            after,
+            l0,
+            eps=eps,
+            clip=l0_clip,
+        )
+    if mode == "norm_loss_tanh_l0_delta":
+        if l0 is None:
+            raise ValueError(
+                "norm_loss_tanh_l0_delta requires l0 (episode t=0 reference loss)."
+            )
+        return dense_loss_tanh_l0_delta_reward(
+            before,
+            after,
+            l0,
+            eps=eps,
+            scale=tanh_scale,
+        )
     raise ValueError(f"Unsupported dense reward mode: {mode}")

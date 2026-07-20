@@ -202,16 +202,27 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "raw_mse_delta",
             "raw_mse_log_delta",
+            "raw_mse_log_delta_clipped",
+            "raw_mse_log_delta_tanh",
             "raw_mse_reduction",
             "raw_mse_l0_delta",
+            "raw_mse_clipped_l0_delta",
+            "raw_mse_tanh_l0_delta",
             "norm_loss_delta",
             "norm_loss_log_delta",
+            "norm_loss_log_delta_clipped",
+            "norm_loss_log_delta_tanh",
             "norm_loss_reduction",
             "norm_loss_l0_delta",
+            "norm_loss_clipped_l0_delta",
+            "norm_loss_tanh_l0_delta",
         ],
         default="raw_mse_l0_delta",
     )
     parser.add_argument("--reward-eps", type=float, default=1e-6)
+    parser.add_argument("--reward-log-clip", type=float, default=1.0)
+    parser.add_argument("--reward-l0-clip", type=float, default=1.0)
+    parser.add_argument("--reward-tanh-scale", type=float, default=1.0)
     parser.add_argument("--canvit-dtype", choices=["float32", "bfloat16"], default="float32")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--d-model", type=int, default=256)
@@ -292,6 +303,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--reward-map-chunk-size must be positive.")
     if args.reward_map_interval is not None and args.reward_map_interval < 1:
         raise ValueError("--reward-map-interval must be positive.")
+    if args.reward_log_clip <= 0.0:
+        raise ValueError("--reward-log-clip must be positive.")
+    if args.reward_l0_clip <= 0.0:
+        raise ValueError("--reward-l0-clip must be positive.")
+    if args.reward_tanh_scale <= 0.0:
+        raise ValueError("--reward-tanh-scale must be positive.")
     if args.viewpoint_entropy_bins < 1:
         raise ValueError("--viewpoint-entropy-bins must be positive.")
     if args.eval_interval < 1:
@@ -647,6 +664,9 @@ def _evaluate_dense_reward_grid(
                 after=after_metrics,
                 l0=l0.expand(repeats),
                 eps=args.reward_eps,
+                log_clip=args.reward_log_clip,
+                l0_clip=args.reward_l0_clip,
+                tanh_scale=args.reward_tanh_scale,
             )
             critic_batch = {
                 "canvas": canvas_summary.repeat(repeats, 1, 1, 1),
@@ -927,6 +947,9 @@ def maybe_save_dense_policy_glimpses(
                         after=next_metrics,
                         l0=sample_l0,
                         eps=args.reward_eps,
+                        log_clip=args.reward_log_clip,
+                        l0_clip=args.reward_l0_clip,
+                        tanh_scale=args.reward_tanh_scale,
                     )
                     center = vp.centers[0].detach().cpu().tolist()
                     viewpoints.append(vp)
@@ -1325,6 +1348,9 @@ def evaluate_dense_sac(
                     after=next_metrics,
                     l0=episode_l0,
                     eps=args.reward_eps,
+                    log_clip=args.reward_log_clip,
+                    l0_clip=args.reward_l0_clip,
+                    tanh_scale=args.reward_tanh_scale,
                 )
                 current_metrics = next_metrics
                 canvas_summary = canvas_layernorm_spatial(
@@ -1641,6 +1667,9 @@ def train_once(args: argparse.Namespace) -> None:
                 after=next_metrics,
                 l0=episode_l0,
                 eps=args.reward_eps,
+                log_clip=args.reward_log_clip,
+                l0_clip=args.reward_l0_clip,
+                tanh_scale=args.reward_tanh_scale,
             )
             rollout_viewpoints.append(
                 Viewpoint(
