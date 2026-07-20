@@ -201,9 +201,11 @@ def parse_args() -> argparse.Namespace:
         "--reward-mode",
         choices=[
             "raw_mse_delta",
+            "raw_mse_log_delta",
             "raw_mse_reduction",
             "raw_mse_l0_delta",
             "norm_loss_delta",
+            "norm_loss_log_delta",
             "norm_loss_reduction",
             "norm_loss_l0_delta",
         ],

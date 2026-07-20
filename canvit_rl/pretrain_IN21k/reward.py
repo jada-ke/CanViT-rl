@@ -109,6 +109,22 @@ def dense_loss_delta_reward(
     return before.loss_norm - after.loss_norm
 
 
+def dense_loss_log_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Normalized-space log improvement: log(L[t-1] + eps) - log(L[t] + eps).
+
+    Problem: plain deltas can be noisy while direct ratios can spike on small
+    denominators. Solution: reward proportional loss improvement in log space.
+    Result: rewards remain scale-normalized and telescope across multi-step
+    episodes without needing an external l0 tensor.
+    """
+    return before.loss_norm.clamp_min(eps).log() - after.loss_norm.clamp_min(eps).log()
+
+
 def dense_raw_mse_reduction_reward(
     before: DenseDistillationMetrics,
     after: DenseDistillationMetrics,
@@ -125,6 +141,16 @@ def dense_raw_mse_delta_reward(
 ) -> Tensor:
     """Plain raw-space loss delta: L[t-1] - L[t]."""
     return before.loss_raw - after.loss_raw
+
+
+def dense_raw_mse_log_delta_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Raw-space log improvement: log(L[t-1] + eps) - log(L[t] + eps)."""
+    return before.loss_raw.clamp_min(eps).log() - after.loss_raw.clamp_min(eps).log()
 
 
 def dense_raw_mse_l0_delta_reward(
@@ -175,6 +201,10 @@ def dense_reward(
         return dense_raw_mse_delta_reward(before, after)
     if mode == "norm_loss_delta":
         return dense_loss_delta_reward(before, after)
+    if mode == "raw_mse_log_delta":
+        return dense_raw_mse_log_delta_reward(before, after, eps=eps)
+    if mode == "norm_loss_log_delta":
+        return dense_loss_log_delta_reward(before, after, eps=eps)
     if mode == "raw_mse_reduction":
         return dense_raw_mse_reduction_reward(before, after, eps=eps)
     if mode == "norm_loss_reduction":
