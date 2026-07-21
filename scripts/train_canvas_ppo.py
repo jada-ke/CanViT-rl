@@ -75,6 +75,7 @@ from canvit_rl.canvas.logging import (
     make_comet_experiment,
 )
 from canvit_rl.canvas.ppo import CanvasPPO, CanvasPPORollout, canvas_actor_sample
+from canvit_rl.canvas.ppo import CanvasPPOCollapseError
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
@@ -188,6 +189,67 @@ def _normal_autograd_input(tensor: torch.Tensor | None) -> torch.Tensor | None:
     return tensor.detach().clone()
 
 
+def _maybe_raise_ppo_trial_collapse(
+    *,
+    args: argparse.Namespace,
+    metrics: dict[str, float],
+    batch_viewpoint_entropy: float,
+    batch_idx: int,
+    update_count: int,
+) -> None:
+    """Prune unstable Optuna PPO trials as soon as collapse metrics blow up."""
+    if getattr(args, "optuna_trial", None) is None:
+        return
+    if getattr(args, "no_optuna_prune_collapse", False):
+        return
+
+    checks = {
+        "ppo/approx_kl": getattr(args, "optuna_prune_kl", 0.08),
+        "ppo/clip_fraction": getattr(args, "optuna_prune_clip_fraction", 0.95),
+        "actor/std_max": getattr(args, "optuna_prune_std_max", 1.01),
+    }
+    for key, threshold in checks.items():
+        value = metrics.get(key)
+        if value is None:
+            continue
+        if not np.isfinite(value):
+            raise CanvasPPOCollapseError(
+                f"{key} became non-finite at batch={batch_idx} update={update_count}: "
+                f"{value}"
+            )
+        if value > threshold:
+            raise CanvasPPOCollapseError(
+                f"{key}={value:.6g} exceeded {threshold:.6g} at "
+                f"batch={batch_idx} update={update_count}"
+            )
+
+    actor_entropy = metrics.get("actor/entropy")
+    entropy_min = getattr(args, "optuna_prune_entropy_min", -2.0)
+    if actor_entropy is not None:
+        if not np.isfinite(actor_entropy):
+            raise CanvasPPOCollapseError(
+                "actor/entropy became non-finite at "
+                f"batch={batch_idx} update={update_count}: {actor_entropy}"
+            )
+        if actor_entropy < entropy_min:
+            raise CanvasPPOCollapseError(
+                f"actor/entropy={actor_entropy:.6g} fell below {entropy_min:.6g} "
+                f"at batch={batch_idx} update={update_count}"
+            )
+
+    grace_updates = getattr(args, "optuna_prune_grace_updates", 200)
+    viewpoint_entropy_min = getattr(args, "optuna_prune_viewpoint_entropy_min", 0.02)
+    if update_count >= grace_updates and batch_viewpoint_entropy < viewpoint_entropy_min:
+        # Problem: Optuna was selecting low-CE but collapsed viewpoint policies.
+        # Solution: prune trials once sampled action diversity collapses after
+        # a grace period. Result: failed trials stop early and Optuna spends
+        # later trials on non-degenerate active-view policies.
+        raise CanvasPPOCollapseError(
+            f"train/viewpoint_entropy={batch_viewpoint_entropy:.6g} fell below "
+            f"{viewpoint_entropy_min:.6g} at batch={batch_idx} update={update_count}"
+        )
+
+
 def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
     """Validate PPO-specific constraints after shared Canvas arg checks."""
     validate_canvas_sac_args(args)
@@ -209,6 +271,15 @@ def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
         raise ValueError("--ppo-log-std-min must be <= --ppo-log-std-max.")
     if args.progress_log_interval < 0:
         raise ValueError("--progress-log-interval must be non-negative.")
+    if getattr(args, "optuna_prune_grace_updates", 0) < 0:
+        raise ValueError("--optuna-prune-grace-updates must be non-negative.")
+    for name in [
+        "optuna_prune_kl",
+        "optuna_prune_clip_fraction",
+        "optuna_prune_std_max",
+    ]:
+        if getattr(args, name, 0.0) <= 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive.")
 
 
 def save_canvas_ppo_checkpoint(
@@ -500,6 +571,7 @@ def train_once(args: argparse.Namespace) -> float:
         sync_for_timing(device)
         batch_start = time.perf_counter()
         batch_reward_values: list[float] = []
+        batch_entropy_points: list[np.ndarray] = []
         try:
             images, masks = next(train_iter)
         except StopIteration:
@@ -595,6 +667,7 @@ def train_once(args: argparse.Namespace) -> float:
             entropy_points.append(
                 torch.cat([vp.centers, vp.scales[:, None]], dim=1).detach().cpu().numpy()
             )
+            batch_entropy_points.append(entropy_points[-1])
             scale_sums[step_idx] += float(vp.scales.detach().sum().item())
             scale_counts[step_idx] += batch_size
             prev_canvas = canvas_summary.clone()
@@ -667,6 +740,17 @@ def train_once(args: argparse.Namespace) -> float:
         update_count += 1
         for key, value in metrics.items():
             train_windows[key].append(value)
+        batch_viewpoint_entropy = viewpoint_entropy(
+            batch_entropy_points,
+            bins=args.viewpoint_entropy_bins,
+        )
+        _maybe_raise_ppo_trial_collapse(
+            args=args,
+            metrics=metrics,
+            batch_viewpoint_entropy=batch_viewpoint_entropy,
+            batch_idx=batch_idx,
+            update_count=update_count,
+        )
 
         sync_for_timing(device)
         elapsed_seconds += time.perf_counter() - batch_start

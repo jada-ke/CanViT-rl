@@ -16,6 +16,46 @@ def add_canvas_ppo_optuna_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--optuna-trials", type=int, default=0)
     parser.add_argument("--optuna-study-name", type=str, default="ade20k-ppo-t1")
     parser.add_argument("--optuna-storage", type=str, default=None)
+    parser.add_argument("--no-optuna-prune-collapse", action="store_true")
+    parser.add_argument(
+        "--optuna-prune-kl",
+        type=float,
+        default=0.08,
+        help="Prune a PPO trial if update approximate KL exceeds this value.",
+    )
+    parser.add_argument(
+        "--optuna-prune-clip-fraction",
+        type=float,
+        default=0.95,
+        help="Prune a PPO trial if clip fraction exceeds this value.",
+    )
+    parser.add_argument(
+        "--optuna-prune-std-max",
+        type=float,
+        default=1.01,
+        help="Prune a PPO trial if actor/std_max exceeds this value.",
+    )
+    parser.add_argument(
+        "--optuna-prune-entropy-min",
+        type=float,
+        default=-2.0,
+        help="Prune a PPO trial if Gaussian actor entropy drops below this value.",
+    )
+    parser.add_argument(
+        "--optuna-prune-viewpoint-entropy-min",
+        type=float,
+        default=0.02,
+        help=(
+            "Prune a PPO trial if the sampled training batch viewpoint entropy "
+            "drops below this value after the warmup grace period."
+        ),
+    )
+    parser.add_argument(
+        "--optuna-prune-grace-updates",
+        type=int,
+        default=200,
+        help="Do not prune low viewpoint entropy before this many PPO updates.",
+    )
 
 
 def _trial_checkpoint_dir(base_dir: Path, trial_number: int) -> Path:
@@ -104,6 +144,7 @@ def run_canvas_ppo_optuna(
         import optuna
     except ImportError as exc:
         raise RuntimeError("Install optuna or run without --optuna-trials.") from exc
+    from canvit_rl.canvas.ppo import CanvasPPOCollapseError
 
     if args.resume is not None:
         raise ValueError("--resume cannot be used with --optuna-trials.")
@@ -113,6 +154,9 @@ def run_canvas_ppo_optuna(
         trial_args = build_canvas_ppo_trial_args(args, trial)
         try:
             return train_once(trial_args)
+        except CanvasPPOCollapseError as exc:
+            trial.set_user_attr("pruned_reason", str(exc))
+            raise optuna.TrialPruned(str(exc)) from exc
         finally:
             gc.collect()
             if torch.cuda.is_available():

@@ -10,6 +10,10 @@ import torch.nn.functional as F
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 
+class CanvasPPOCollapseError(RuntimeError):
+    """Raised when a PPO trial hits configured collapse/pruning criteria."""
+
+
 def _atanh(action: torch.Tensor) -> torch.Tensor:
     """Invert tanh safely for replaying PPO log-probs of stored actions."""
     action = action.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
