@@ -1,7 +1,7 @@
 """Generate padded-scene synthetic segmentation data from random ADE20K images.
 
 Example:
-    uv run python scripts/generate_synthetic_dataset.py \
+    uv run python scripts/synthetic_dataset/generate_synthetic_dataset.py \
         --ade-root datasets/ADE20k \
         --root synthetic_segmentation \
         --train-samples 7 \
@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from _paths import repo_path
 from canvit_rl.ade_labels import remap_ade_mask_labels
 
 
@@ -304,6 +305,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Problem: this script now lives one level deeper under scripts/, but its
+    # defaults still name repo-root data folders. Solution: normalize relative
+    # path args against the repository root once after parsing. Result: running
+    # from scripts/synthetic_dataset keeps using the same datasets/results
+    # locations as running from the repo root.
+    args.ade_root = repo_path(args.ade_root)
+    args.root = repo_path(args.root)
     if args.num_samples < 1:
         raise ValueError("--num-samples must be positive.")
     if args.train_samples is not None and args.train_samples < 1:
