@@ -160,6 +160,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--eval-feature-image-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional eval image root for validation/test images. Defaults to "
+            "--feature-image-root."
+        ),
+    )
+    parser.add_argument(
         "--paired-hidden-feature-base-dir",
         type=Path,
         default=None,
@@ -1226,6 +1235,8 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
     if args.eval_images <= 0:
         return None
     eval_feature_base_dir = args.eval_feature_base_dir or cfg.feature_base_dir
+    eval_image_root = args.eval_feature_image_root or cfg.feature_image_root
+    eval_tar_dir = None if args.eval_feature_image_root is not None else cfg.tar_dir
     shards_dir = (
         eval_feature_base_dir
         / cfg.teacher_name
@@ -1241,11 +1252,12 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
             / str(cfg.scene_resolution)
             / "shards"
         )
-        # Problem: IN1K eval may use held-out target feature shards, but the
-        # image source layout is shared with training. Solution: only override
-        # target feature_base_dir for eval and keep paired hidden pixels plus
-        # target image root on the training source. Result: one flag selects
-        # the validation/test feature split without duplicating image flags.
+        # Problem: IN1K eval may reuse target feature shards while loading
+        # validation/test pixels from a different image root. Solution: allow
+        # the eval target feature base and target image root to be overridden
+        # independently while keeping paired hidden pixels on the train source.
+        # Result: validation/test image splits can be evaluated without
+        # duplicating feature directories.
         return PairedDenseShardLoader(
             hidden_shards_dir=hidden_shards_dir,
             target_shards_dir=shards_dir,
@@ -1253,7 +1265,7 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
             batch_size=eval_batch_size,
             hidden_image_root=args.paired_hidden_feature_image_root,
             hidden_tar_dir=args.paired_hidden_tar_dir,
-            target_image_root=cfg.feature_image_root,
+            target_image_root=eval_image_root,
             shuffle_seed=args.eval_subset_seed,
         )
     # Problem: dense IN21k SAC previously had no validation pass, only online
@@ -1268,8 +1280,8 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
         subset_size=args.eval_images,
         subset_seed=args.eval_subset_seed,
         subset_shards=args.subset_shards,
-        image_root=cfg.feature_image_root,
-        tar_dir=cfg.tar_dir,
+        image_root=eval_image_root,
+        tar_dir=eval_tar_dir,
     )
 
 
