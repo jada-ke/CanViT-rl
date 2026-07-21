@@ -1743,19 +1743,103 @@ def train_once(args: argparse.Namespace) -> None:
         )
         should_log_reward_maps = args.reward_map_images > 0 and batch_idx >= next_reward_map_batch
         if should_log_reward_maps:
+            reward_map_batch = batch
+            reward_map_state = state
+            reward_map_metrics = current_metrics
+            reward_map_l0 = episode_l0
+            reward_map_coords = coords
+            reward_map_lengths = lengths
+            reward_map_canvas = canvas_summary
+            reward_map_entropy = canvas_entropy
+            if eval_loader is not None:
+                if hasattr(eval_loader, "reset"):
+                    eval_loader.reset()
+                reward_map_batch = load_dense_train_batch(
+                    train_loader=eval_loader,
+                    device=device,
+                    scene_norm=scene_norm,
+                    cls_norm=cls_norm,
+                    non_blocking=True,
+                )
+                reward_map_batch_size = reward_map_batch.images.shape[0]
+                reward_map_state = model.init_state(
+                    batch_size=reward_map_batch_size,
+                    canvas_grid_size=G,
+                )
+                reward_map_coords, reward_map_lengths = empty_viewpoint_history(
+                    batch_size=reward_map_batch_size,
+                    max_steps=args.max_history,
+                    device=device,
+                )
+                reward_map_full_vp = Viewpoint.full_scene(
+                    batch_size=reward_map_batch_size,
+                    device=device,
+                )
+                with torch.inference_mode():
+                    # Problem: reward-map figures were generated from whatever
+                    # training batch happened to be current, so visual
+                    # correlations changed image content every interval.
+                    # Solution: rebuild the reward-map state from the reset
+                    # eval loader's first batch when eval is configured.
+                    # Result: reward/Q maps compare the same images over time.
+                    reward_map_full_glimpse = sample_at_viewpoint(
+                        spatial=reward_map_batch.images,
+                        viewpoint=reward_map_full_vp,
+                        glimpse_size_px=glimpse_size_px,
+                    ).to(dtype=canvit_dtype)
+                    reward_map_out = model(
+                        glimpse=reward_map_full_glimpse,
+                        state=reward_map_state,
+                        viewpoint=reward_map_full_vp,
+                    )
+                    reward_map_state = reward_map_out.state
+                    reward_map_metrics = dense_distillation_metrics(
+                        model=model,
+                        state=reward_map_state,
+                        batch=reward_map_batch,
+                        scene_denorm=scene_norm.destandardize,
+                        cls_denorm=cls_norm.destandardize,
+                        scene_weight=args.scene_reward_weight,
+                        cls_weight=args.cls_reward_weight,
+                    )
+                    reward_map_l0 = _episode_l0_for_reward_mode(
+                        mode=args.reward_mode,
+                        metrics=reward_map_metrics,
+                    )
+                    reward_map_canvas = canvas_layernorm_spatial(
+                        model=model,
+                        state=reward_map_state,
+                        canvas_grid_size=G,
+                    )
+                    reward_map_entropy = (
+                        dense_canvas_entropy_map(
+                            model=model,
+                            state=reward_map_state,
+                            batch=reward_map_batch,
+                            canvas_grid_size=G,
+                        )
+                        if args.canvas_entropy_state
+                        else None
+                    )
+                reward_map_coords, reward_map_lengths = append_viewpoint_history(
+                    coords=reward_map_coords,
+                    lengths=reward_map_lengths,
+                    viewpoint=reward_map_full_vp,
+                    step=0,
+                )
             maybe_save_dense_reward_maps(
                 args=args,
                 comet_exp=comet_exp,
                 update_count=update_count,
                 batch_idx=batch_idx,
-                batch=batch,
-                state=state,
-                current_metrics=current_metrics,
-                l0=episode_l0,
-                coords=coords,
-                lengths=lengths,
-                canvas_summary=canvas_summary,
-                canvas_entropy=canvas_entropy,
+                batch=reward_map_batch,
+                state=reward_map_state,
+                current_metrics=reward_map_metrics,
+                l0=reward_map_l0,
+                coords=reward_map_coords,
+                lengths=reward_map_lengths,
+                canvas_summary=reward_map_canvas,
+                canvas_entropy=reward_map_entropy,
                 actor=actor,
                 q1=q1,
                 q2=q2,
@@ -1770,14 +1854,14 @@ def train_once(args: argparse.Namespace) -> None:
                 comet_exp=comet_exp,
                 update_count=update_count,
                 batch_idx=batch_idx,
-                batch=batch,
-                state=state,
-                current_metrics=current_metrics,
-                l0=episode_l0,
-                coords=coords,
-                lengths=lengths,
-                canvas_summary=canvas_summary,
-                canvas_entropy=canvas_entropy,
+                batch=reward_map_batch,
+                state=reward_map_state,
+                current_metrics=reward_map_metrics,
+                l0=reward_map_l0,
+                coords=reward_map_coords,
+                lengths=reward_map_lengths,
+                canvas_summary=reward_map_canvas,
+                canvas_entropy=reward_map_entropy,
                 actor=actor,
                 model=model,
                 scene_denorm=scene_norm.destandardize,

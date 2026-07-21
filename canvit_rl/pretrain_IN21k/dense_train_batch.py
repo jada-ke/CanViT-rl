@@ -75,12 +75,22 @@ class FixedDenseSubsetLoader:
         shard_files = sorted(Path(shards_dir).glob("*.pt"))[:subset_shards]
         if not shard_files:
             raise FileNotFoundError(f"No dense-feature shards found in {shards_dir}")
-        candidates = self._collect_candidates(shard_files)
+        candidates = self._collect_candidates(
+            shard_files,
+            image_root=image_root,
+        )
         if subset_size > len(candidates):
+            source_hint = (
+                f" with images under {image_root}"
+                if image_root is not None
+                else ""
+            )
             raise ValueError(
                 f"Requested subset_size={subset_size}, but only found "
-                f"{len(candidates)} usable samples in {len(shard_files)} shard(s). "
-                "Increase --subset-shards or reduce --subset-size."
+                f"{len(candidates)} usable samples{source_hint} in "
+                f"{len(shard_files)} shard(s). Increase --subset-shards, reduce "
+                "--subset-size/--eval-images, or point --eval-feature-base-dir "
+                "at split-specific feature shards."
             )
         chosen = torch.randperm(len(candidates), generator=self.generator)[:subset_size]
         selected = [candidates[int(i)] for i in chosen.tolist()]
@@ -95,7 +105,11 @@ class FixedDenseSubsetLoader:
         self.pos = 0
 
     @staticmethod
-    def _collect_candidates(shard_files: list[Path]) -> list[tuple[Path, int]]:
+    def _collect_candidates(
+        shard_files: list[Path],
+        *,
+        image_root: Path | None,
+    ) -> list[tuple[Path, int]]:
         """Collect usable shard row references without materializing features."""
         candidates: list[tuple[Path, int]] = []
         for shard_path in shard_files:
@@ -106,11 +120,18 @@ class FixedDenseSubsetLoader:
                 mmap=True,
             )
             failed = set(shard.get("failed_indices", []))
-            candidates.extend(
-                (shard_path, idx)
-                for idx in range(len(shard["paths"]))
-                if idx not in failed
-            )
+            for idx, rel_path in enumerate(shard["paths"]):
+                if idx in failed:
+                    continue
+                if image_root is not None and not (image_root / str(rel_path)).is_file():
+                    # Problem: train/validation/test feature rows can share a
+                    # feature base while their pixels live under different
+                    # roots. Solution: when an image root is provided, keep
+                    # only rows whose stored relative path resolves under that
+                    # root. Result: eval roots select matching split rows
+                    # instead of failing later on train-only image paths.
+                    continue
+                candidates.append((shard_path, idx))
             del shard
         return candidates
 
@@ -353,6 +374,13 @@ class PairedDenseShardLoader:
                 target_failed = set(target_shard.get("failed_indices", []))
                 for idx, target_rel_path in enumerate(target_shard["paths"]):
                     if idx in target_failed:
+                        continue
+                    if not (target_image_root / str(target_rel_path)).is_file():
+                        # Problem: paired eval target shards may include rows
+                        # from another image split when the feature base is
+                        # shared. Solution: skip target rows that do not exist
+                        # under the requested target image root. Result: paired
+                        # eval samples only rows with matching target pixels.
                         continue
                     key = cls._sample_key(str(target_rel_path))
                     if key in target_keys_seen:
