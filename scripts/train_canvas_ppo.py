@@ -74,7 +74,7 @@ from canvit_rl.canvas.logging import (
     log_final_full_validation_miou_curve,
     make_comet_experiment,
 )
-from canvit_rl.canvas.ppo import CanvasPPO, CanvasPPORollout
+from canvit_rl.canvas.ppo import CanvasPPO, CanvasPPORollout, canvas_actor_sample
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
@@ -108,6 +108,7 @@ IMPORTANT_TRAIN_METRICS = {
     "actor/loss",
     "actor/entropy",
     "actor/std_mean",
+    "actor/std_max",
     "critic/value_loss",
     "ppo/approx_kl",
     "ppo/clip_fraction",
@@ -204,6 +205,8 @@ def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
         raise ValueError("--gae-lambda must be in [0, 1].")
     if args.max_grad_norm < 0.0:
         raise ValueError("--max-grad-norm must be non-negative.")
+    if args.ppo_log_std_min > args.ppo_log_std_max:
+        raise ValueError("--ppo-log-std-min must be <= --ppo-log-std-max.")
     if args.progress_log_interval < 0:
         raise ValueError("--progress-log-interval must be non-negative.")
 
@@ -376,6 +379,8 @@ def train_once(args: argparse.Namespace) -> float:
         epochs=args.ppo_epochs,
         minibatch_size=args.ppo_minibatch_size,
         target_kl=args.ppo_target_kl,
+        log_std_min=args.ppo_log_std_min,
+        log_std_max=args.ppo_log_std_max,
     )
     start_batch, update_count, best_eval_final_ce = load_canvas_ppo_resume(
         args=args,
@@ -560,13 +565,30 @@ def train_once(args: argparse.Namespace) -> float:
             obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
             if canvas_entropy is not None:
                 obs["entropy"] = canvas_entropy
-            action, log_prob = actor.sample(obs)
+            action, log_prob, rollout_log_std = canvas_actor_sample(
+                actor,
+                obs,
+                log_std_min=args.ppo_log_std_min,
+                log_std_max=args.ppo_log_std_max,
+            )
             with torch.no_grad():
                 value = critic(obs, action)
             train_windows["actor/log_prob"].append(float(log_prob.mean().item()))
             train_windows["actor/entropy"].append(float((-log_prob).mean().item()))
             train_windows["actor/action_std"].append(
                 float(action.std(unbiased=False).item())
+            )
+            train_windows["actor/log_std_mean"].append(
+                float(rollout_log_std.mean().item())
+            )
+            train_windows["actor/log_std_max"].append(
+                float(rollout_log_std.max().item())
+            )
+            train_windows["actor/std_mean"].append(
+                float(rollout_log_std.exp().mean().item())
+            )
+            train_windows["actor/std_max"].append(
+                float(rollout_log_std.exp().max().item())
             )
 
             vp = action_to_viewpoint(action, min_scale=args.min_scale)
@@ -677,6 +699,7 @@ def train_once(args: argparse.Namespace) -> float:
                 f"value_loss={metrics.get('critic/value_loss', float('nan')):.4f} "
                 f"entropy={metrics.get('actor/entropy', float('nan')):.4f} "
                 f"std={metrics.get('actor/std_mean', float('nan')):.4f} "
+                f"std_max={metrics.get('actor/std_max', float('nan')):.4f} "
                 f"kl={metrics.get('ppo/approx_kl', float('nan')):.5f} "
                 f"glimpses_per_sec={glimpses_per_sec:.1f}",
                 flush=True,
@@ -932,6 +955,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument(
+        "--ppo-log-std-min",
+        type=float,
+        default=-5.0,
+        help="Minimum PPO actor log standard deviation after policy head clamp.",
+    )
+    parser.add_argument(
+        "--ppo-log-std-max",
+        type=float,
+        default=0.0,
+        help=(
+            "Maximum PPO actor log standard deviation. The shared actor allows "
+            "SAC-style log_std up to 2.0, but PPO defaults to 0.0 to avoid "
+            "tanh-saturated boundary actions."
+        ),
+    )
     parser.add_argument(
         "--progress-log-interval",
         type=int,

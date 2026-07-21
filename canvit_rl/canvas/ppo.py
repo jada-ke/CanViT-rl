@@ -20,22 +20,57 @@ def canvas_actor_log_prob(
     actor: CanvasStateActor,
     obs: dict[str, torch.Tensor],
     action: torch.Tensor,
+    *,
+    log_std_min: float | None = None,
+    log_std_max: float | None = None,
 ) -> torch.Tensor:
     """Return tanh-squashed Gaussian log-prob for an already sampled action."""
     mean, log_std = actor(obs)
+    if log_std_min is not None or log_std_max is not None:
+        log_std = log_std.clamp(
+            min=log_std_min if log_std_min is not None else -float("inf"),
+            max=log_std_max if log_std_max is not None else float("inf"),
+        )
     raw = _atanh(action)
     dist = torch.distributions.Normal(mean, log_std.exp())
     correction = torch.log(1.0 - action.pow(2) + 1e-6)
     return (dist.log_prob(raw) - correction).sum(dim=-1)
 
 
+def canvas_actor_sample(
+    actor: CanvasStateActor,
+    obs: dict[str, torch.Tensor],
+    *,
+    log_std_min: float,
+    log_std_max: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample PPO actions with a tighter policy std cap than SAC."""
+    mean, log_std = actor(obs)
+    # Problem: PPO can drive SAC's broad log_std cap of 2.0 into tanh
+    # saturation, causing boundary actions, KL spikes, and negative squashed
+    # log-prob entropy. Solution: clamp std inside PPO's sampling path without
+    # changing the shared actor module. Result: SAC keeps its old exploration
+    # range while PPO gets bounded, stable rollout actions.
+    log_std = log_std.clamp(log_std_min, log_std_max)
+    dist = torch.distributions.Normal(mean, log_std.exp())
+    raw = dist.rsample()
+    action = torch.tanh(raw)
+    correction = torch.log(1.0 - action.pow(2) + 1e-6)
+    log_prob = (dist.log_prob(raw) - correction).sum(dim=-1)
+    return action, log_prob, log_std
+
+
 def canvas_actor_log_prob_and_entropy(
     actor: CanvasStateActor,
     obs: dict[str, torch.Tensor],
     action: torch.Tensor,
+    *,
+    log_std_min: float,
+    log_std_max: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return action log-prob plus a stable current-policy entropy proxy."""
     mean, log_std = actor(obs)
+    log_std = log_std.clamp(log_std_min, log_std_max)
     raw = _atanh(action)
     dist = torch.distributions.Normal(mean, log_std.exp())
     correction = torch.log(1.0 - action.pow(2) + 1e-6)
@@ -155,6 +190,8 @@ class CanvasPPO:
         epochs: int,
         minibatch_size: int,
         target_kl: float | None = None,
+        log_std_min: float = -5.0,
+        log_std_max: float = 0.0,
     ) -> None:
         self.actor = actor
         self.critic = critic
@@ -167,6 +204,8 @@ class CanvasPPO:
         self.epochs = epochs
         self.minibatch_size = minibatch_size
         self.target_kl = target_kl
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
 
     def update(self, rollout: CanvasPPORollout) -> dict[str, float]:
         """Run PPO epochs over one rollout and return averaged metrics."""
@@ -197,6 +236,8 @@ class CanvasPPO:
                     self.actor,
                     obs,
                     actions,
+                    log_std_min=self.log_std_min,
+                    log_std_max=self.log_std_max,
                 )
                 ratio = (log_probs - old_log_probs).exp()
                 unclipped = ratio * advantages
@@ -232,7 +273,9 @@ class CanvasPPO:
                         "actor/log_prob": float(log_probs.mean().item()),
                         "actor/action_std": float(actions.std(unbiased=False).item()),
                         "actor/log_std_mean": float(log_std.mean().item()),
+                        "actor/log_std_max": float(log_std.max().item()),
                         "actor/std_mean": float(log_std.exp().mean().item()),
+                        "actor/std_max": float(log_std.exp().max().item()),
                         "critic/value_loss": float(value_loss.item()),
                         "critic/value_mean": float(values.mean().item()),
                         "critic/value_std": float(values.std(unbiased=False).item()),
