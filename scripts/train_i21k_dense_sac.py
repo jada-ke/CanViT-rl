@@ -151,6 +151,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-image-root", type=Path, default=None)
     parser.add_argument("--tar-dir", type=Path, default=None)
     parser.add_argument(
+        "--eval-feature-base-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional dense-feature base dir for eval/validation. Defaults to "
+            "--feature-base-dir."
+        ),
+    )
+    parser.add_argument(
         "--paired-hidden-feature-base-dir",
         type=Path,
         default=None,
@@ -256,6 +265,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-images", type=int, default=16)
     parser.add_argument("--eval-batch-size", type=int, default=0)
     parser.add_argument("--eval-subset-seed", type=int, default=10042)
+    parser.add_argument(
+        "--actor-reward-percentile-grid-size",
+        type=int,
+        default=11,
+        help=(
+            "Eval-only diagnostic grid size for ranking the actor's chosen "
+            "true dense reward against same-scale candidate centers. Set 0 "
+            "to skip eval/actor_reward_percentile."
+        ),
+    )
     parser.add_argument("--checkpoint-interval", type=int, default=200)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/i21k_dense_sac"))
     parser.add_argument("--resume", type=Path, default=None)
@@ -317,6 +336,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--eval-images must be non-negative.")
     if args.eval_batch_size < 0:
         raise ValueError("--eval-batch-size must be non-negative.")
+    if args.actor_reward_percentile_grid_size < 0:
+        raise ValueError("--actor-reward-percentile-grid-size must be non-negative.")
+    if args.actor_reward_percentile_grid_size == 1:
+        raise ValueError("--actor-reward-percentile-grid-size must be 0 or >= 2.")
     parse_reward_map_scales(args.reward_map_scales)
     if args.subset_size < 0:
         raise ValueError("--subset-size must be non-negative.")
@@ -685,6 +708,82 @@ def _evaluate_dense_reward_grid(
     )
     q_map = torch.cat(q_values).view(args.reward_map_grid_size, args.reward_map_grid_size)
     return reward_map.numpy(), q_map.numpy()
+
+
+def _evaluate_dense_reward_candidates(
+    *,
+    args: argparse.Namespace,
+    batch: DenseTrainBatch,
+    state,
+    before_metrics: DenseDistillationMetrics,
+    l0: torch.Tensor,
+    model,
+    scene_denorm,
+    cls_denorm,
+    glimpse_size_px: int,
+    canvit_dtype: torch.dtype,
+    scale: float,
+) -> torch.Tensor:
+    """Evaluate true rewards for a one-sample candidate center grid."""
+    grid_size = int(args.actor_reward_percentile_grid_size)
+    if grid_size <= 0:
+        return torch.empty(0, device=batch.images.device)
+    vp_all = _candidate_grid(
+        scale=scale,
+        grid_size=grid_size,
+        device=batch.images.device,
+    )
+    rewards: list[torch.Tensor] = []
+    total = vp_all.centers.shape[0]
+    with torch.inference_mode():
+        for start in range(0, total, args.reward_map_chunk_size):
+            stop = min(start + args.reward_map_chunk_size, total)
+            repeats = stop - start
+            vp = Viewpoint(
+                centers=vp_all.centers[start:stop],
+                scales=vp_all.scales[start:stop],
+            )
+            candidate_batch = _repeat_dense_batch(batch, repeats)
+            candidate_state = _repeat_state_chunks(state, repeats)
+            glimpse = sample_at_viewpoint(
+                spatial=dense_glimpse_images(candidate_batch),
+                viewpoint=vp,
+                glimpse_size_px=glimpse_size_px,
+            ).to(dtype=canvit_dtype)
+            out = model(glimpse=glimpse, state=candidate_state, viewpoint=vp)
+            after_metrics = dense_distillation_metrics(
+                model=model,
+                state=out.state,
+                batch=candidate_batch,
+                scene_denorm=scene_denorm,
+                cls_denorm=cls_denorm,
+                scene_weight=args.scene_reward_weight,
+                cls_weight=args.cls_reward_weight,
+            )
+            # Problem: eval/reward alone has arbitrary scale across reward
+            # formulas. Solution: rank the actor's realized reward against
+            # same-scale candidate centers using the exact dense_reward
+            # dispatcher. Result: percentile is comparable across modes while
+            # preserving each mode's raw/norm/log/l0 semantics.
+            reward = dense_reward(
+                mode=args.reward_mode,
+                before=DenseDistillationMetrics(
+                    scene_loss_norm=before_metrics.scene_loss_norm.expand(repeats),
+                    cls_loss_norm=before_metrics.cls_loss_norm.expand(repeats),
+                    loss_norm=before_metrics.loss_norm.expand(repeats),
+                    scene_loss_raw=before_metrics.scene_loss_raw.expand(repeats),
+                    cls_loss_raw=before_metrics.cls_loss_raw.expand(repeats),
+                    loss_raw=before_metrics.loss_raw.expand(repeats),
+                ),
+                after=after_metrics,
+                l0=l0.expand(repeats),
+                eps=args.reward_eps,
+                log_clip=args.reward_log_clip,
+                l0_clip=args.reward_l0_clip,
+                tanh_scale=args.reward_tanh_scale,
+            )
+            rewards.append(reward.detach().reshape(-1))
+    return torch.cat(rewards)
 
 
 def maybe_save_dense_reward_maps(
@@ -1126,7 +1225,13 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
     """Create a deterministic dense-feature eval subset from the shard source."""
     if args.eval_images <= 0:
         return None
-    shards_dir = cfg.feature_base_dir / cfg.teacher_name / str(cfg.scene_resolution) / "shards"
+    eval_feature_base_dir = args.eval_feature_base_dir or cfg.feature_base_dir
+    shards_dir = (
+        eval_feature_base_dir
+        / cfg.teacher_name
+        / str(cfg.scene_resolution)
+        / "shards"
+    )
     eval_batch_size = args.eval_batch_size or args.batch_size
     eval_batch_size = min(eval_batch_size, max(args.eval_images, 1))
     if args.paired_hidden_feature_base_dir is not None:
@@ -1136,6 +1241,11 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
             / str(cfg.scene_resolution)
             / "shards"
         )
+        # Problem: IN1K eval may use held-out target feature shards, but the
+        # image source layout is shared with training. Solution: only override
+        # target feature_base_dir for eval and keep paired hidden pixels plus
+        # target image root on the training source. Result: one flag selects
+        # the validation/test feature split without duplicating image flags.
         return PairedDenseShardLoader(
             hidden_shards_dir=hidden_shards_dir,
             target_shards_dir=shards_dir,
@@ -1232,6 +1342,12 @@ def evaluate_dense_sac(
     """Evaluate deterministic dense SAC rollout on a fixed dense-feature subset."""
     if eval_loader is None:
         return {}
+    if hasattr(eval_loader, "reset"):
+        # Problem: fixed eval subsets reshuffle after a full pass, so periodic
+        # evals could revisit the same subset in a different order. Solution:
+        # reset in-memory eval loaders before each evaluation. Result: every
+        # eval interval uses the same selected images and batch order.
+        eval_loader.reset()
     actor_was_training = actor.training
     actor.eval()
     eval_images = int(args.eval_images)
@@ -1242,6 +1358,7 @@ def evaluate_dense_sac(
     initial_raw: list[torch.Tensor] = []
     final_raw: list[torch.Tensor] = []
     rewards: list[torch.Tensor] = []
+    actor_reward_percentiles: list[torch.Tensor] = []
     entropy_points: list[np.ndarray] = []
     scale_sums = [0.0 for _ in range(args.t)]
     scale_counts = [0 for _ in range(args.t)]
@@ -1318,6 +1435,8 @@ def evaluate_dense_sac(
                     obs["entropy"] = canvas_entropy
                 action = actor.deterministic_action(obs)
                 vp = action_to_viewpoint(action, min_scale=args.min_scale)
+                state_before_step = state
+                metrics_before_step = current_metrics
                 entropy_points.append(
                     torch.cat([vp.centers, vp.scales[:, None]], dim=1)
                     .detach()
@@ -1342,9 +1461,9 @@ def evaluate_dense_sac(
                     scene_weight=args.scene_reward_weight,
                     cls_weight=args.cls_reward_weight,
                 )
-                episode_reward = episode_reward + dense_reward(
+                step_reward = dense_reward(
                     mode=args.reward_mode,
-                    before=current_metrics,
+                    before=metrics_before_step,
                     after=next_metrics,
                     l0=episode_l0,
                     eps=args.reward_eps,
@@ -1352,6 +1471,46 @@ def evaluate_dense_sac(
                     l0_clip=args.reward_l0_clip,
                     tanh_scale=args.reward_tanh_scale,
                 )
+                episode_reward = episode_reward + step_reward
+                if args.actor_reward_percentile_grid_size > 0:
+                    for sample_idx in range(batch_size):
+                        sample_index = torch.tensor([sample_idx], device=device)
+                        sample_batch = _slice_dense_batch(batch, sample_idx)
+                        sample_state = _index_state_batch(
+                            state_before_step,
+                            sample_index,
+                        )
+                        sample_metrics = _slice_dense_metrics(
+                            metrics_before_step,
+                            sample_idx,
+                        )
+                        sample_l0 = episode_l0[sample_idx : sample_idx + 1]
+                        sample_scale = float(vp.scales[sample_idx].detach().item())
+                        candidate_rewards = _evaluate_dense_reward_candidates(
+                            args=args,
+                            batch=sample_batch,
+                            state=sample_state,
+                            before_metrics=sample_metrics,
+                            l0=sample_l0,
+                            model=model,
+                            scene_denorm=scene_norm.destandardize,
+                            cls_denorm=cls_norm.destandardize,
+                            glimpse_size_px=glimpse_size_px,
+                            canvit_dtype=canvit_dtype,
+                            scale=sample_scale,
+                        )
+                        if candidate_rewards.numel() > 0:
+                            # Problem: absolute reward magnitudes vary by mode
+                            # and image. Solution: convert the actor reward to
+                            # a within-state same-scale percentile. Result:
+                            # 0.5 is grid-median behavior, 1.0 is best-on-grid.
+                            percentile = (
+                                candidate_rewards
+                                <= step_reward[sample_idx].detach()
+                            ).float().mean()
+                            actor_reward_percentiles.append(
+                                percentile.detach().cpu().reshape(1)
+                            )
                 current_metrics = next_metrics
                 canvas_summary = canvas_layernorm_spatial(
                     model=model,
@@ -1404,6 +1563,14 @@ def evaluate_dense_sac(
             bins=args.viewpoint_entropy_bins,
         ),
     }
+    if actor_reward_percentiles:
+        actor_reward_percentile_t = torch.cat(actor_reward_percentiles)
+        metrics["eval/actor_reward_percentile"] = float(
+            actor_reward_percentile_t.mean().item()
+        )
+        metrics["eval/actor_reward_percentile_std"] = float(
+            actor_reward_percentile_t.std(unbiased=False).item()
+        )
     for step in range(args.t):
         metrics[f"eval/mean_scale_by_t{step + 1}"] = (
             scale_sums[step] / max(scale_counts[step], 1)
@@ -1783,7 +1950,9 @@ def train_once(args: argparse.Namespace) -> None:
                 "eval "
                 f"batch={batch_idx} update={update_count} "
                 f"reward={eval_metrics.get('eval/reward', 0.0):+.4f} "
-                f"{display_loss_name}={eval_metrics.get(display_loss_key, 0.0):.4f}"
+                f"{display_loss_name}={eval_metrics.get(display_loss_key, 0.0):.4f} "
+                "actor_reward_pct="
+                f"{eval_metrics.get('eval/actor_reward_percentile', float('nan')):.3f}"
             )
             last_eval_batch = batch_idx
             while next_eval_batch <= batch_idx:

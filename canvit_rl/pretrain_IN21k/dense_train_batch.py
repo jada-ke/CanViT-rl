@@ -90,7 +90,8 @@ class FixedDenseSubsetLoader:
             image_root=image_root,
             tar_dir=tar_dir,
         )
-        self.order = torch.randperm(subset_size, generator=self.generator)
+        self.initial_order = torch.randperm(subset_size, generator=self.generator)
+        self.order = self.initial_order.clone()
         self.pos = 0
 
     @staticmethod
@@ -200,6 +201,11 @@ class FixedDenseSubsetLoader:
             remaining -= take
         return torch.cat(pieces)
 
+    def reset(self) -> None:
+        """Replay the same materialized subset order for deterministic eval."""
+        self.order = self.initial_order.clone()
+        self.pos = 0
+
     def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return the next reshuffled batch from the fixed subset."""
         idx = self._next_indices()
@@ -245,6 +251,7 @@ class PairedDenseShardLoader:
             )
         )
         self.order = torch.randperm(self.images.shape[0], generator=self.generator)
+        self.initial_order = self.order.clone()
         self.pos = 0
 
     @staticmethod
@@ -421,6 +428,11 @@ class PairedDenseShardLoader:
             self.pos += take
             remaining -= take
         return torch.cat(pieces)
+
+    def reset(self) -> None:
+        """Replay the same materialized paired order for deterministic eval."""
+        self.order = self.initial_order.clone()
+        self.pos = 0
 
     def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Return hidden images, oracle images, targets, and labels."""
