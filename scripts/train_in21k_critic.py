@@ -343,12 +343,12 @@ def _critic_batch(
 ) -> dict[str, torch.Tensor]:
     """Repeat one state batch to align with chunk-ordered candidate actions."""
     batch = {
-        "canvas": canvas_summary.repeat(k, 1, 1, 1),
-        "coords": coords.repeat(k, 1, 1),
-        "lengths": lengths.repeat(k),
+        "canvas": canvas_summary.repeat(k, 1, 1, 1).detach().clone(),
+        "coords": coords.repeat(k, 1, 1).detach().clone(),
+        "lengths": lengths.repeat(k).detach().clone(),
     }
     if canvas_entropy is not None:
-        batch["entropy"] = canvas_entropy.repeat(k, 1, 1, 1)
+        batch["entropy"] = canvas_entropy.repeat(k, 1, 1, 1).detach().clone()
     return batch
 
 
@@ -594,7 +594,7 @@ def run_epoch(
             )
             q1_pred = q1(critic_batch, action)
             q2_pred = q2(critic_batch, action)
-            target = rewards.float()
+            target = rewards.float().detach().clone()
             q1_loss = F.mse_loss(q1_pred, target)
             q2_loss = F.mse_loss(q2_pred, target)
             loss = q1_loss + q2_loss
