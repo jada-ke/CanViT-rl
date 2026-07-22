@@ -246,6 +246,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--rff-dim", type=int, default=128)
     parser.add_argument("--rff-seed", type=int, default=42)
+    parser.add_argument("--critic-d-model", type=int, default=256)
+    parser.add_argument("--critic-rff-dim", type=int, default=128)
     parser.add_argument("--critic-local-action-features", action="store_true")
     parser.add_argument(
         "--canvas-entropy-state",
@@ -358,6 +360,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--actor-reward-percentile-grid-size must be non-negative.")
     if args.actor_reward_percentile_grid_size == 1:
         raise ValueError("--actor-reward-percentile-grid-size must be 0 or >= 2.")
+    if args.critic_d_model < 1 or args.critic_rff_dim < 1:
+        raise ValueError("--critic-d-model and --critic-rff-dim must be positive.")
     parse_reward_map_scales(args.actor_reward_percentile_scales)
     parse_reward_map_scales(args.reward_map_scales)
     if args.subset_size < 0:
@@ -1356,7 +1360,7 @@ def load_frozen_hf_model(args: argparse.Namespace, cfg):
 
 def build_agent(args: argparse.Namespace, canvas_feature_dim: int, device: torch.device):
     """Construct Canvas SAC actor/critics using the existing model classes."""
-    common = dict(
+    actor_common = dict(
         canvas_feature_dim=canvas_feature_dim,
         d_model=args.d_model,
         rff_dim=args.rff_dim,
@@ -1365,9 +1369,15 @@ def build_agent(args: argparse.Namespace, canvas_feature_dim: int, device: torch
         use_canvas_avg_pool=not args.disable_canvas_avg_pool,
         use_canvas_max_pool=not args.disable_canvas_max_pool,
     )
-    actor = CanvasStateActor(**common).to(device)
+    actor = CanvasStateActor(**actor_common).to(device)
     critic_common = dict(
-        common,
+        actor_common,
+        # Problem: increasing --d-model to improve critic ranking also widens
+        # the actor. Solution: give q1/q2 separate capacity knobs while keeping
+        # the actor on the original defaults. Result: critic architecture can
+        # be tested without changing policy capacity or action distribution.
+        d_model=args.critic_d_model,
+        rff_dim=args.critic_rff_dim,
         use_action_location_features=args.critic_local_action_features,
     )
     q1 = CanvasStateCritic(**critic_common).to(device)
@@ -1797,6 +1807,13 @@ def train_once(args: argparse.Namespace) -> None:
         storage_device=replay_device,
         train_device=device,
     )
+    print(
+        "Replay storage plan: "
+        f"device={replay_device}, dtype={REPLAY_STORAGE_DTYPE}, "
+        f"canvas_bytes={replay_bytes / 1024**3:.2f} GiB, "
+        f"pin_memory={replay_pin_memory}",
+        flush=True,
+    )
     replay = CanvasReplayBuffer(
         capacity=args.buffer_size,
         max_history=args.max_history,
@@ -1807,10 +1824,11 @@ def train_once(args: argparse.Namespace) -> None:
         pin_memory=replay_pin_memory,
     )
     print(
-        "Replay storage: "
+        "Replay storage allocated: "
         f"device={replay_device}, dtype={REPLAY_STORAGE_DTYPE}, "
         f"canvas_bytes={replay_bytes / 1024**3:.2f} GiB, "
-        f"pin_memory={replay_pin_memory}"
+        f"pin_memory={replay_pin_memory}",
+        flush=True,
     )
 
     comet_exp = make_dense_comet_experiment(args)
