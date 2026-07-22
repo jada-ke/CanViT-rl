@@ -284,6 +284,15 @@ def parse_args() -> argparse.Namespace:
             "to skip eval/actor_reward_percentile."
         ),
     )
+    parser.add_argument(
+        "--actor-reward-percentile-scales",
+        type=str,
+        default="0.30,0.40,0.50,0.65,0.80",
+        help=(
+            "Comma-separated eval scales for scale-aware actor reward "
+            "diagnostics. Independent from --reward-map-scales."
+        ),
+    )
     parser.add_argument("--checkpoint-interval", type=int, default=200)
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/i21k_dense_sac"))
     parser.add_argument("--resume", type=Path, default=None)
@@ -349,6 +358,7 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--actor-reward-percentile-grid-size must be non-negative.")
     if args.actor_reward_percentile_grid_size == 1:
         raise ValueError("--actor-reward-percentile-grid-size must be 0 or >= 2.")
+    parse_reward_map_scales(args.actor_reward_percentile_scales)
     parse_reward_map_scales(args.reward_map_scales)
     if args.subset_size < 0:
         raise ValueError("--subset-size must be non-negative.")
@@ -742,6 +752,36 @@ def _evaluate_dense_reward_candidates(
         grid_size=grid_size,
         device=batch.images.device,
     )
+    return _evaluate_dense_reward_viewpoints(
+        args=args,
+        batch=batch,
+        state=state,
+        before_metrics=before_metrics,
+        l0=l0,
+        model=model,
+        scene_denorm=scene_denorm,
+        cls_denorm=cls_denorm,
+        glimpse_size_px=glimpse_size_px,
+        canvit_dtype=canvit_dtype,
+        vp_all=vp_all,
+    )
+
+
+def _evaluate_dense_reward_viewpoints(
+    *,
+    args: argparse.Namespace,
+    batch: DenseTrainBatch,
+    state,
+    before_metrics: DenseDistillationMetrics,
+    l0: torch.Tensor,
+    model,
+    scene_denorm,
+    cls_denorm,
+    glimpse_size_px: int,
+    canvit_dtype: torch.dtype,
+    vp_all: Viewpoint,
+) -> torch.Tensor:
+    """Evaluate true rewards for a one-sample list of candidate Viewpoints."""
     rewards: list[torch.Tensor] = []
     total = vp_all.centers.shape[0]
     with torch.inference_mode():
@@ -793,6 +833,21 @@ def _evaluate_dense_reward_candidates(
             )
             rewards.append(reward.detach().reshape(-1))
     return torch.cat(rewards)
+
+
+def _actor_center_scale_viewpoints(
+    *,
+    center: torch.Tensor,
+    scales: list[float],
+    device: torch.device,
+) -> Viewpoint:
+    """Build candidate Viewpoints that vary scale around the actor center."""
+    scale_tensor = torch.tensor(scales, device=device, dtype=center.dtype)
+    centers = center[None, :].repeat(len(scales), 1)
+    for idx, scale in enumerate(scales):
+        bound = max(1.0 - float(scale), 0.0)
+        centers[idx].clamp_(min=-bound, max=bound)
+    return Viewpoint(centers=centers, scales=scale_tensor)
 
 
 def maybe_save_dense_reward_maps(
@@ -1371,9 +1426,14 @@ def evaluate_dense_sac(
     final_raw: list[torch.Tensor] = []
     rewards: list[torch.Tensor] = []
     actor_reward_percentiles: list[torch.Tensor] = []
+    actor_scale_percentiles: list[torch.Tensor] = []
+    actor_reward_gaps: list[torch.Tensor] = []
+    actor_diagnostic_scales: list[torch.Tensor] = []
+    best_grid_scales: list[torch.Tensor] = []
     entropy_points: list[np.ndarray] = []
     scale_sums = [0.0 for _ in range(args.t)]
     scale_counts = [0 for _ in range(args.t)]
+    diagnostic_scales = parse_reward_map_scales(args.actor_reward_percentile_scales)
     with torch.inference_mode():
         for _ in range(eval_batches):
             batch = load_dense_train_batch(
@@ -1498,6 +1558,10 @@ def evaluate_dense_sac(
                         )
                         sample_l0 = episode_l0[sample_idx : sample_idx + 1]
                         sample_scale = float(vp.scales[sample_idx].detach().item())
+                        actor_reward = step_reward[sample_idx].detach()
+                        actor_diagnostic_scales.append(
+                            vp.scales[sample_idx].detach().cpu().reshape(1)
+                        )
                         candidate_rewards = _evaluate_dense_reward_candidates(
                             args=args,
                             batch=sample_batch,
@@ -1518,11 +1582,84 @@ def evaluate_dense_sac(
                             # 0.5 is grid-median behavior, 1.0 is best-on-grid.
                             percentile = (
                                 candidate_rewards
-                                <= step_reward[sample_idx].detach()
+                                <= actor_reward
                             ).float().mean()
                             actor_reward_percentiles.append(
                                 percentile.detach().cpu().reshape(1)
                             )
+                        scale_reward_chunks: list[torch.Tensor] = []
+                        scale_reward_maxima: list[tuple[float, torch.Tensor]] = []
+                        for diagnostic_scale in diagnostic_scales:
+                            scale_rewards = _evaluate_dense_reward_candidates(
+                                args=args,
+                                batch=sample_batch,
+                                state=sample_state,
+                                before_metrics=sample_metrics,
+                                l0=sample_l0,
+                                model=model,
+                                scene_denorm=scene_norm.destandardize,
+                                cls_denorm=cls_norm.destandardize,
+                                glimpse_size_px=glimpse_size_px,
+                                canvit_dtype=canvit_dtype,
+                                scale=diagnostic_scale,
+                            )
+                            if scale_rewards.numel() > 0:
+                                scale_reward_chunks.append(scale_rewards)
+                                scale_reward_maxima.append(
+                                    (diagnostic_scale, scale_rewards.max())
+                                )
+                        if scale_reward_chunks:
+                            # Problem: same-scale percentile only judges
+                            # location. Solution: compare the actor's reward
+                            # with a compact independent set of scale grids.
+                            # Result: reward gap exposes whether another
+                            # location/scale on the diagnostic grid is better
+                            # without logging every raw intermediate.
+                            all_scale_rewards = torch.cat(scale_reward_chunks)
+                            actor_reward_gaps.append(
+                                (all_scale_rewards.max() - actor_reward)
+                                .detach()
+                                .cpu()
+                                .reshape(1)
+                            )
+                            best_scale = max(
+                                scale_reward_maxima,
+                                key=lambda item: float(item[1].detach().item()),
+                            )[0]
+                            best_grid_scales.append(
+                                torch.tensor([best_scale], dtype=torch.float32)
+                            )
+                        if diagnostic_scales:
+                            scale_vp = _actor_center_scale_viewpoints(
+                                center=vp.centers[sample_idx].detach(),
+                                scales=diagnostic_scales,
+                                device=device,
+                            )
+                            center_scale_rewards = _evaluate_dense_reward_viewpoints(
+                                args=args,
+                                batch=sample_batch,
+                                state=sample_state,
+                                before_metrics=sample_metrics,
+                                l0=sample_l0,
+                                model=model,
+                                scene_denorm=scene_norm.destandardize,
+                                cls_denorm=cls_norm.destandardize,
+                                glimpse_size_px=glimpse_size_px,
+                                canvit_dtype=canvit_dtype,
+                                vp_all=scale_vp,
+                            )
+                            if center_scale_rewards.numel() > 0:
+                                # Problem: a good center can still use a poor
+                                # zoom. Solution: hold the actor center fixed
+                                # and rank its exact reward against the default
+                                # scale probes. Result: this isolates scale
+                                # quality more directly than reward-map scales.
+                                scale_percentile = (
+                                    center_scale_rewards <= actor_reward
+                                ).float().mean()
+                                actor_scale_percentiles.append(
+                                    scale_percentile.detach().cpu().reshape(1)
+                                )
                 current_metrics = next_metrics
                 canvas_summary = canvas_layernorm_spatial(
                     model=model,
@@ -1583,6 +1720,20 @@ def evaluate_dense_sac(
         metrics["eval/actor_reward_percentile_std"] = float(
             actor_reward_percentile_t.std(unbiased=False).item()
         )
+    if actor_scale_percentiles:
+        actor_scale_percentile_t = torch.cat(actor_scale_percentiles)
+        metrics["eval/actor_scale_percentile"] = float(
+            actor_scale_percentile_t.mean().item()
+        )
+    if actor_reward_gaps:
+        actor_reward_gap_t = torch.cat(actor_reward_gaps)
+        metrics["eval/actor_reward_gap"] = float(actor_reward_gap_t.mean().item())
+    if actor_diagnostic_scales:
+        actor_diagnostic_scale_t = torch.cat(actor_diagnostic_scales)
+        metrics["eval/actor_scale"] = float(actor_diagnostic_scale_t.mean().item())
+    if best_grid_scales:
+        best_grid_scale_t = torch.cat(best_grid_scales)
+        metrics["eval/best_grid_scale"] = float(best_grid_scale_t.mean().item())
     for step in range(args.t):
         metrics[f"eval/mean_scale_by_t{step + 1}"] = (
             scale_sums[step] / max(scale_counts[step], 1)
@@ -2048,7 +2199,15 @@ def train_once(args: argparse.Namespace) -> None:
                 f"reward={eval_metrics.get('eval/reward', 0.0):+.4f} "
                 f"{display_loss_name}={eval_metrics.get(display_loss_key, 0.0):.4f} "
                 "actor_reward_pct="
-                f"{eval_metrics.get('eval/actor_reward_percentile', float('nan')):.3f}"
+                f"{eval_metrics.get('eval/actor_reward_percentile', float('nan')):.3f} "
+                "actor_scale_pct="
+                f"{eval_metrics.get('eval/actor_scale_percentile', float('nan')):.3f} "
+                "actor_reward_gap="
+                f"{eval_metrics.get('eval/actor_reward_gap', float('nan')):+.4f} "
+                "actor_scale="
+                f"{eval_metrics.get('eval/actor_scale', float('nan')):.3f} "
+                "best_grid_scale="
+                f"{eval_metrics.get('eval/best_grid_scale', float('nan')):.3f}"
             )
             last_eval_batch = batch_idx
             while next_eval_batch <= batch_idx:
