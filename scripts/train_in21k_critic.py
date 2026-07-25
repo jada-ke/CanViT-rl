@@ -1,9 +1,9 @@
-"""Train an IN21k dense Canvas critic from random-k candidate rewards.
+"""Train an IN21k dense Canvas critic from candidate dense rewards.
 
 This is a critic-only diagnostic for the dense SAC architecture: sample ``--k``
-random Viewpoint candidates per state, compute the true dense reward for each,
-and regress Q(state, action) to those one-step rewards without SAC bootstrapping
-or actor updates.
+Viewpoint candidates per state, compute the true dense reward for each, and
+regress Q(state, action) to those one-step rewards without SAC bootstrapping or
+actor updates.
 
 Example:
     uv run python scripts/train_in21k_critic.py \
@@ -55,6 +55,7 @@ from canvit_rl.pretrain_IN21k.dense_train_batch import (
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
 )
+from canvit_rl.canvas.candidates import sample_candidate_viewpoints
 from canvit_rl.pretrain_IN21k.reward import DenseDistillationMetrics, dense_reward
 from canvit_rl.sac_models import CanvasStateCritic
 from canvit_rl.viewpoint_policy import viewpoint_to_action
@@ -152,6 +153,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--t", type=int, default=2)
     parser.add_argument("--k", type=int, default=32)
     parser.add_argument(
+        "--candidate-distribution",
+        choices=[
+            "random",
+            "fixed_scale",
+            "position_perturb",
+            "scale_perturb",
+            "history_perturb",
+        ],
+        default="random",
+        help=(
+            "Candidate action distribution for critic ranking targets. "
+            "random preserves the original uniform center/scale sampler."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-fixed-scale",
+        type=float,
+        default=0.6,
+        help=(
+            "Scale used by fixed_scale and as the t0/history fallback anchor "
+            "for perturbation candidate distributions."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-position-std",
+        type=float,
+        default=0.25,
+        help="Gaussian std for local center perturbation candidate distributions.",
+    )
+    parser.add_argument(
+        "--candidate-scale-std",
+        type=float,
+        default=0.15,
+        help="Gaussian std for local scale perturbation candidate distributions.",
+    )
+    parser.add_argument(
         "--rollout-policy",
         choices=["oracle", "critic", "random"],
         default="oracle",
@@ -202,6 +239,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-history must be at least --t + 1.")
     if args.k < 2:
         raise ValueError("--k must be at least 2.")
+    if not args.min_scale < args.candidate_fixed_scale <= 1.0:
+        raise ValueError("--candidate-fixed-scale must be in (min_scale, 1].")
+    if args.candidate_position_std <= 0.0 or args.candidate_scale_std <= 0.0:
+        raise ValueError(
+            "--candidate-position-std and --candidate-scale-std must be positive."
+        )
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive.")
     if args.subset_size < 0:
@@ -260,20 +303,6 @@ def _repeat_metrics_chunks(metrics: DenseDistillationMetrics, chunks: int) -> De
         cls_loss_raw=metrics.cls_loss_raw.repeat(chunks),
         loss_raw=metrics.loss_raw.repeat(chunks),
     )
-
-
-def _random_candidate_viewpoints(
-    *,
-    batch_size: int,
-    k: int,
-    min_scale: float,
-    device: torch.device,
-) -> Viewpoint:
-    """Sample random in-bounds candidate Viewpoints in chunk order [k, batch]."""
-    scales = torch.rand(k, batch_size, device=device) * (1.0 - min_scale) + min_scale
-    bounds = (1.0 - scales).clamp_min(0.0)
-    centers = (torch.rand(k, batch_size, 2, device=device) * 2.0 - 1.0) * bounds[..., None]
-    return Viewpoint(centers=centers.reshape(k * batch_size, 2), scales=scales.reshape(-1))
 
 
 def _dense_metrics(
@@ -565,11 +594,21 @@ def run_epoch(
             step=0,
         )
         for step_idx in range(args.t):
-            candidates = _random_candidate_viewpoints(
+            candidate_tensors = sample_candidate_viewpoints(
+                distribution=args.candidate_distribution,
                 batch_size=batch_size,
                 k=args.k,
                 min_scale=args.min_scale,
+                fixed_scale=args.candidate_fixed_scale,
+                position_std=args.candidate_position_std,
+                scale_std=args.candidate_scale_std,
+                coords=coords,
+                lengths=lengths,
                 device=device,
+            )
+            candidates = Viewpoint(
+                centers=candidate_tensors.centers,
+                scales=candidate_tensors.scales,
             )
             rewards, candidate_next_state, _ = _candidate_rewards_and_next(
                 args=args,
