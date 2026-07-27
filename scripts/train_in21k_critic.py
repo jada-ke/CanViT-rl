@@ -38,7 +38,6 @@ else:
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from canvit_pytorch import Viewpoint, sample_at_viewpoint
 from tqdm import tqdm
 
@@ -48,6 +47,7 @@ from canvit_rl.canvas.state import (
     empty_viewpoint_history,
 )
 from canvit_rl.canvit_precision import resolve_canvit_dtype
+from canvit_rl.canvas.critic_losses import candidate_critic_loss
 from canvit_rl.greedy import _index_state_batch, _repeat_state_chunks
 from canvit_rl.pretrain_IN21k.dense_train_batch import (
     DenseTrainBatch,
@@ -213,6 +213,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--canvas-entropy-state", action="store_true")
     parser.add_argument("--disable-canvas-avg-pool", action="store_true")
     parser.add_argument("--disable-canvas-max-pool", action="store_true")
+    parser.add_argument(
+        "--critic-loss-mode",
+        choices=["mse", "topk_mse", "mse_pairwise", "mse_listwise"],
+        default="mse",
+        help=(
+            "Supervised critic objective. mse preserves the original behavior; "
+            "other modes add top-action selection pressure."
+        ),
+    )
+    parser.add_argument(
+        "--critic-top-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of highest-reward candidates upweighted by topk_mse.",
+    )
+    parser.add_argument(
+        "--critic-top-weight",
+        type=float,
+        default=5.0,
+        help="MSE weight assigned to top true-reward candidates in topk_mse.",
+    )
+    parser.add_argument(
+        "--critic-rank-weight",
+        type=float,
+        default=0.3,
+        help="Auxiliary pairwise/listwise loss weight for hybrid objectives.",
+    )
+    parser.add_argument(
+        "--critic-pairwise-margin",
+        type=float,
+        default=0.02,
+        help="Q margin for mse_pairwise best-vs-rest ranking loss.",
+    )
+    parser.add_argument(
+        "--critic-listwise-temperature",
+        type=float,
+        default=0.05,
+        help="Reward/Q softmax temperature for mse_listwise KL loss.",
+    )
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -253,6 +292,16 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--eval-batch-size/--eval-images must be non-negative.")
     if args.critic_d_model < 1 or args.critic_rff_dim < 1:
         raise ValueError("--critic-d-model and --critic-rff-dim must be positive.")
+    if not 0.0 < args.critic_top_frac <= 1.0:
+        raise ValueError("--critic-top-frac must be in (0, 1].")
+    if args.critic_top_weight < 1.0:
+        raise ValueError("--critic-top-weight must be >= 1.")
+    if args.critic_rank_weight < 0.0:
+        raise ValueError("--critic-rank-weight must be non-negative.")
+    if args.critic_pairwise_margin <= 0.0:
+        raise ValueError("--critic-pairwise-margin must be positive.")
+    if args.critic_listwise_temperature <= 0.0:
+        raise ValueError("--critic-listwise-temperature must be positive.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
     return args
@@ -529,6 +578,9 @@ def run_epoch(
         "loss": [],
         "q1_loss": [],
         "q2_loss": [],
+        "q1_mse": [],
+        "q2_mse": [],
+        "aux_loss": [],
         "reward_mse": [],
         "pearson": [],
         "spearman": [],
@@ -634,8 +686,30 @@ def run_epoch(
             q1_pred = q1(critic_batch, action)
             q2_pred = q2(critic_batch, action)
             target = rewards.float().detach().clone()
-            q1_loss = F.mse_loss(q1_pred, target)
-            q2_loss = F.mse_loss(q2_pred, target)
+            q1_loss, q1_components = candidate_critic_loss(
+                q1_pred,
+                target,
+                batch_size=batch_size,
+                k=args.k,
+                mode=args.critic_loss_mode,
+                top_frac=args.critic_top_frac,
+                top_weight=args.critic_top_weight,
+                aux_weight=args.critic_rank_weight,
+                pairwise_margin=args.critic_pairwise_margin,
+                listwise_temperature=args.critic_listwise_temperature,
+            )
+            q2_loss, q2_components = candidate_critic_loss(
+                q2_pred,
+                target,
+                batch_size=batch_size,
+                k=args.k,
+                mode=args.critic_loss_mode,
+                top_frac=args.critic_top_frac,
+                top_weight=args.critic_top_weight,
+                aux_weight=args.critic_rank_weight,
+                pairwise_margin=args.critic_pairwise_margin,
+                listwise_temperature=args.critic_listwise_temperature,
+            )
             loss = q1_loss + q2_loss
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
@@ -657,6 +731,17 @@ def run_epoch(
                 accum["loss"].append(float(loss.detach().cpu().item()))
                 accum["q1_loss"].append(float(q1_loss.detach().cpu().item()))
                 accum["q2_loss"].append(float(q2_loss.detach().cpu().item()))
+                accum["q1_mse"].append(float(q1_components["mse"].cpu().item()))
+                accum["q2_mse"].append(float(q2_components["mse"].cpu().item()))
+                aux_terms = [
+                    value
+                    for key, value in [*q1_components.items(), *q2_components.items()]
+                    if key != "mse"
+                ]
+                if aux_terms:
+                    accum["aux_loss"].append(
+                        float(torch.stack(aux_terms).mean().cpu().item())
+                    )
                 for key, value in metrics.items():
                     accum[key].append(value)
                 selected = _select_candidate_indices(
