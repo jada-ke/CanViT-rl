@@ -1,6 +1,7 @@
 import torch
 
 from canvit_rl.canvas.sac import CanvasReplayBuffer
+from canvit_rl.pretrain_IN21k.checkpoints import load_dense_sac_critic_initializer
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 
@@ -153,3 +154,67 @@ def test_canvas_replay_buffer_samples_optional_entropy_state():
 
     assert sample["entropy"].shape == (2, 1, 5, 5)
     assert sample["next_entropy"].shape == (2, 1, 5, 5)
+
+
+def test_dense_sac_critic_initializer_loads_q_weights_and_syncs_targets(tmp_path):
+    source_q1 = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_action_location_features=True,
+    )
+    source_q2 = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_action_location_features=True,
+    )
+    q1 = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_action_location_features=True,
+    )
+    q2 = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_action_location_features=True,
+    )
+    target_q1 = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_action_location_features=True,
+    )
+    target_q2 = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_action_location_features=True,
+    )
+    checkpoint = tmp_path / "critic.pt"
+    torch.save({"q1": source_q1.state_dict(), "q2": source_q2.state_dict()}, checkpoint)
+
+    load_dense_sac_critic_initializer(
+        path=checkpoint,
+        q1=q1,
+        q2=q2,
+        target_q1=target_q1,
+        target_q2=target_q2,
+    )
+
+    for actual, expected in zip(q1.parameters(), source_q1.parameters()):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(q2.parameters(), source_q2.parameters()):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(target_q1.parameters(), q1.parameters()):
+        assert torch.equal(actual, expected)
+    for actual, expected in zip(target_q2.parameters(), q2.parameters()):
+        assert torch.equal(actual, expected)

@@ -87,3 +87,28 @@ def load_dense_sac_resume(
     if "log_alpha" in checkpoint:
         agent.log_alpha.data.copy_(checkpoint["log_alpha"])
     return int(checkpoint.get("batch", 0)) + 1, int(checkpoint.get("updates", 0))
+
+
+def load_dense_sac_critic_initializer(
+    *,
+    path: Path | None,
+    q1: CanvasStateCritic,
+    q2: CanvasStateCritic,
+    target_q1: CanvasStateCritic,
+    target_q2: CanvasStateCritic,
+) -> None:
+    """Initialize dense SAC critics from a critic-only checkpoint."""
+    if path is None:
+        return
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if "q1" not in checkpoint:
+        raise ValueError(f"Expected critic checkpoint with a q1 key: {path}")
+    # Problem: critic-only IN21k diagnostics save q1/q2 without actor,
+    # optimizers, alpha, replay, or counters. Solution: load only critic
+    # weights into a fresh SAC run and immediately sync target critics. Result:
+    # a supervised top-tail critic can seed SAC without pretending to be a full
+    # resume checkpoint.
+    q1.load_state_dict(checkpoint["q1"])
+    q2.load_state_dict(checkpoint.get("q2", checkpoint["q1"]))
+    target_q1.load_state_dict(q1.state_dict())
+    target_q2.load_state_dict(q2.state_dict())

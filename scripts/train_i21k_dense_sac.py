@@ -79,6 +79,7 @@ from canvit_rl.canvit_precision import resolve_canvit_dtype
 from canvit_rl.env import get_device
 from canvit_rl.greedy import _index_state_batch, _repeat_state_chunks
 from canvit_rl.pretrain_IN21k.checkpoints import (
+    load_dense_sac_critic_initializer,
     load_dense_sac_resume,
     save_dense_sac_checkpoint,
 )
@@ -299,6 +300,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/i21k_dense_sac"))
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument(
+        "--init-critic-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional critic-only checkpoint for a fresh SAC run. Loads q1/q2 "
+            "and syncs target critics; incompatible with --resume."
+        ),
+    )
+    parser.add_argument(
         "--debug-viz-dir",
         type=Path,
         default=None,
@@ -330,6 +340,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.max_history < args.t + 1:
         raise ValueError("--max-history must be at least --t + 1.")
+    if args.resume is not None and args.init_critic_checkpoint is not None:
+        raise ValueError("--resume cannot be combined with --init-critic-checkpoint.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
     if args.debug_viz_images < 0 or args.debug_viz_batches < 0:
@@ -1795,6 +1807,15 @@ def train_once(args: argparse.Namespace) -> None:
         target_q2=target_q2,
         agent=agent,
     )
+    load_dense_sac_critic_initializer(
+        path=args.init_critic_checkpoint,
+        q1=q1,
+        q2=q2,
+        target_q1=target_q1,
+        target_q2=target_q2,
+    )
+    if args.init_critic_checkpoint is not None:
+        print(f"Initialized dense SAC critics from {args.init_critic_checkpoint}")
     replay_bytes = replay_canvas_bytes(
         capacity=args.buffer_size,
         canvas_feature_dim=canvas_feature_dim,
