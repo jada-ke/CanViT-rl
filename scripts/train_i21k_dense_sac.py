@@ -268,8 +268,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--init-alpha", type=float, default=0.1)
     parser.add_argument("--target-entropy", type=float, default=-3.0)
-    parser.add_argument("--buffer-size", type=int, default=512)
-    parser.add_argument("--replay-batch-size", type=int, default=16)
+    parser.add_argument("--buffer-size", type=int, default=2048)
+    parser.add_argument("--replay-batch-size", type=int, default=64)
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--log-interval", type=int, default=20)
@@ -364,6 +364,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--viewpoint-entropy-bins must be positive.")
     if args.eval_interval < 1:
         raise ValueError("--eval-interval must be positive.")
+    if args.replay_batch_size < 1:
+        raise ValueError("--replay-batch-size must be positive.")
     if args.eval_images < 0:
         raise ValueError("--eval-images must be non-negative.")
     if args.eval_batch_size < 0:
@@ -433,6 +435,7 @@ def maybe_save_debug_rollout_viz(
     args: argparse.Namespace,
     comet_exp,
     update_count: int,
+    comet_step: int,
     images: torch.Tensor,
     viewpoints: list[Viewpoint],
     rewards_by_step: list[torch.Tensor],
@@ -498,7 +501,7 @@ def maybe_save_debug_rollout_viz(
             comet_exp.log_image(
                 str(output),
                 name=f"debug/i21k_dense_rollout/{output.name}",
-                step=update_count,
+                step=comet_step,
             )
 
 
@@ -871,6 +874,7 @@ def maybe_save_dense_reward_maps(
     args: argparse.Namespace,
     comet_exp,
     update_count: int,
+    comet_step: int,
     batch_idx: int,
     batch: DenseTrainBatch,
     state,
@@ -1011,7 +1015,7 @@ def maybe_save_dense_reward_maps(
         comet_exp.log_image(
             str(output),
             name=f"reward_maps/i21k_dense/{output.name}",
-            step=update_count,
+            step=comet_step,
         )
     return output
 
@@ -1021,6 +1025,7 @@ def maybe_save_dense_policy_glimpses(
     args: argparse.Namespace,
     comet_exp,
     update_count: int,
+    comet_step: int,
     batch_idx: int,
     batch: DenseTrainBatch,
     state,
@@ -1225,7 +1230,7 @@ def maybe_save_dense_policy_glimpses(
         comet_exp.log_image(
             str(output),
             name=f"glimpses/i21k_dense/{output.name}",
-            step=update_count,
+            step=comet_step,
         )
     return output
 
@@ -1878,6 +1883,8 @@ def train_once(args: argparse.Namespace) -> None:
             non_blocking=True,
         )
         batch_size = batch.images.shape[0]
+        batch_glimpses = batch_size * (args.t + 1)
+        comet_step = glimpses + batch_glimpses
         state = model.init_state(batch_size=batch_size, canvas_grid_size=G)
         coords, lengths = empty_viewpoint_history(
             batch_size=batch_size,
@@ -2021,6 +2028,7 @@ def train_once(args: argparse.Namespace) -> None:
                 args=args,
                 comet_exp=comet_exp,
                 update_count=update_count,
+                comet_step=comet_step,
                 batch_idx=batch_idx,
                 batch=reward_map_batch,
                 state=reward_map_state,
@@ -2043,6 +2051,7 @@ def train_once(args: argparse.Namespace) -> None:
                 args=args,
                 comet_exp=comet_exp,
                 update_count=update_count,
+                comet_step=comet_step,
                 batch_idx=batch_idx,
                 batch=reward_map_batch,
                 state=reward_map_state,
@@ -2165,6 +2174,7 @@ def train_once(args: argparse.Namespace) -> None:
             args=args,
             comet_exp=comet_exp,
             update_count=update_count,
+            comet_step=comet_step,
             images=batch.images,
             viewpoints=rollout_viewpoints,
             rewards_by_step=rollout_rewards,
@@ -2180,7 +2190,7 @@ def train_once(args: argparse.Namespace) -> None:
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - batch_start
-        glimpses += batch_size * (args.t + 1)
+        glimpses = comet_step
         if batch_idx % args.log_interval == 0 or batch_idx == start_batch:
             latest_metrics = {}
             if reward_window:
@@ -2203,7 +2213,7 @@ def train_once(args: argparse.Namespace) -> None:
                     scale_sums[step] / max(scale_counts[step], 1)
                 )
             if comet_exp is not None and latest_metrics:
-                comet_exp.log_metrics(latest_metrics, step=update_count)
+                comet_exp.log_metrics(latest_metrics, step=glimpses)
             reward_window.clear()
             entropy_points.clear()
             scale_sums = [0.0 for _ in range(args.t)]
@@ -2228,7 +2238,7 @@ def train_once(args: argparse.Namespace) -> None:
             )
             latest_metrics.update(eval_metrics)
             if comet_exp is not None and eval_metrics:
-                comet_exp.log_metrics(eval_metrics, step=update_count)
+                comet_exp.log_metrics(eval_metrics, step=glimpses)
             display_loss_name, display_loss_key = _eval_display_loss_for_reward_mode(
                 args.reward_mode
             )
@@ -2283,7 +2293,7 @@ def train_once(args: argparse.Namespace) -> None:
         )
         latest_metrics.update(eval_metrics)
         if comet_exp is not None and eval_metrics:
-            comet_exp.log_metrics(eval_metrics, step=update_count)
+            comet_exp.log_metrics(eval_metrics, step=glimpses)
 
     save_dense_sac_checkpoint(
         path=args.checkpoint_dir / "final.pt",

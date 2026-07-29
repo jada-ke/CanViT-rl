@@ -152,8 +152,6 @@ def _suggest_trial_overrides(args: argparse.Namespace, trial: Any) -> list[str]:
         str(trial.suggest_float("init_alpha", 0.01, 0.10, log=True)),
         "--target-entropy",
         str(trial.suggest_float("target_entropy", -5.0, -2.0)),
-        "--min-scale",
-        str(trial.suggest_float("min_scale", 0.15, 0.40)),
     ]
     if args.search_replay:
         # Problem: the original replay search included tiny debug settings that
@@ -175,7 +173,7 @@ def _suggest_trial_overrides(args: argparse.Namespace, trial: Any) -> list[str]:
     # at SAC dynamics rather than model capacity. Solution: keep
     # --search-architecture accepted for command compatibility, but leave the
     # dimension search disabled until capacity is the active question again.
-    # Result: Optuna focuses on LR/alpha/min-scale/replay without silently
+    # Result: Optuna focuses on LR/alpha/replay without silently
     # changing actor or critic size.
     # if args.search_architecture:
     #     overrides.extend(
