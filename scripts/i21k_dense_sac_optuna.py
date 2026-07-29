@@ -73,7 +73,10 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--search-architecture",
         action="store_true",
-        help="Also tune actor/critic model width and RFF dimensions.",
+        help=(
+            "Currently disabled/no-op. Architecture dimensions are fixed while "
+            "SAC dynamics are being swept."
+        ),
     )
     parser.add_argument(
         "--search-replay",
@@ -140,50 +143,58 @@ def _suggest_trial_overrides(args: argparse.Namespace, trial: Any) -> list[str]:
     """Return CLI overrides for one conservative dense SAC search point."""
     overrides = [
         "--actor-lr",
-        str(trial.suggest_float("actor_lr", 1e-4, 1e-3, log=True)),
+        str(trial.suggest_float("actor_lr", 5e-5, 3e-4, log=True)),
         "--critic-lr",
-        str(trial.suggest_float("critic_lr", 5e-5, 8e-4, log=True)),
+        str(trial.suggest_float("critic_lr", 2e-4, 8e-4, log=True)),
         "--alpha-lr",
-        str(trial.suggest_float("alpha_lr", 5e-5, 8e-4, log=True)),
+        str(trial.suggest_float("alpha_lr", 1e-4, 8e-4, log=True)),
         "--init-alpha",
-        str(trial.suggest_float("init_alpha", 0.01, 0.12, log=True)),
+        str(trial.suggest_float("init_alpha", 0.01, 0.10, log=True)),
         "--target-entropy",
-        str(trial.suggest_float("target_entropy", -6.0, -1.5)),
+        str(trial.suggest_float("target_entropy", -5.0, -2.0)),
         "--min-scale",
         str(trial.suggest_float("min_scale", 0.15, 0.40)),
     ]
     if args.search_replay:
-        # Problem: replay cadence affects SAC stability but also runtime.
-        # Solution: only sweep it when requested instead of changing defaults
-        # for small debugging sweeps. Result: quick searches stay comparable.
+        # Problem: the original replay search included tiny debug settings that
+        # update SAC from little replay diversity. Solution: keep replay search
+        # opt-in, but use warmups/batch sizes appropriate for small 80/20 image
+        # subset sweeps. Result: Optuna spends trials on plausible SAC dynamics
+        # instead of near-immediate updates from a handful of transitions.
         overrides.extend(
             [
                 "--replay-batch-size",
-                str(trial.suggest_categorical("replay_batch_size", [8, 16, 32])),
+                str(trial.suggest_categorical("replay_batch_size", [16, 32, 64])),
                 "--learning-starts",
-                str(trial.suggest_categorical("learning_starts", [1, 64, 128, 256])),
+                str(trial.suggest_categorical("learning_starts", [64, 128, 256])),
                 "--updates-per-batch",
                 str(trial.suggest_categorical("updates_per_batch", [1, 2, 4])),
             ]
         )
-    if args.search_architecture:
-        overrides.extend(
-            [
-                "--d-model",
-                str(trial.suggest_categorical("d_model", [128, 256, 384])),
-                "--rff-dim",
-                str(trial.suggest_categorical("rff_dim", [64, 128, 256])),
-                "--critic-d-model",
-                str(trial.suggest_categorical("critic_d_model", [256, 384, 512])),
-                "--critic-rff-dim",
-                str(trial.suggest_categorical("critic_rff_dim", [128, 256, 384])),
-            ]
-        )
+    # Problem: architecture sweeps add many trials and recent experiments point
+    # at SAC dynamics rather than model capacity. Solution: keep
+    # --search-architecture accepted for command compatibility, but leave the
+    # dimension search disabled until capacity is the active question again.
+    # Result: Optuna focuses on LR/alpha/min-scale/replay without silently
+    # changing actor or critic size.
+    # if args.search_architecture:
+    #     overrides.extend(
+    #         [
+    #             "--d-model",
+    #             str(trial.suggest_categorical("d_model", [128, 256, 384])),
+    #             "--rff-dim",
+    #             str(trial.suggest_categorical("rff_dim", [64, 128, 256])),
+    #             "--critic-d-model",
+    #             str(trial.suggest_categorical("critic_d_model", [256, 384, 512])),
+    #             "--critic-rff-dim",
+    #             str(trial.suggest_categorical("critic_rff_dim", [128, 256, 384])),
+    #         ]
+    #     )
     if args.search_gamma:
         overrides.extend(
             [
                 "--gamma",
-                str(trial.suggest_categorical("gamma", [0.0, 0.25, 0.5, 0.9])),
+                str(trial.suggest_categorical("gamma", [0.0, 0.25, 0.5])),
             ]
         )
     return overrides
