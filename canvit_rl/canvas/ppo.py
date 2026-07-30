@@ -88,6 +88,39 @@ def canvas_actor_log_prob_and_entropy(
     return log_prob, entropy, log_std
 
 
+def normalize_minibatch_advantages(advantages: torch.Tensor) -> torch.Tensor:
+    """Normalize PPO advantages for the gradient batch being optimized."""
+    # Problem: rollout-wide normalization can leave individual minibatches with
+    # all-positive or all-negative advantages after shuffling, which makes one
+    # gradient step push the policy in only one direction. Solution: normalize
+    # the sliced minibatch immediately before the actor loss. Result: each PPO
+    # optimizer step has centered, unit-scale reinforcement signs.
+    if advantages.numel() <= 1:
+        return advantages - advantages.mean()
+    return (advantages - advantages.mean()) / advantages.std(
+        unbiased=False
+    ).clamp_min(1e-8)
+
+
+def clipped_value_loss(
+    values: torch.Tensor,
+    old_values: torch.Tensor,
+    returns: torch.Tensor,
+    *,
+    clip_coef: float,
+) -> torch.Tensor:
+    """Return PPO's clipped value loss around rollout-time predictions."""
+    # Problem: an unbounded critic fit can chase a reward spike so far that the
+    # actor's on-policy batch becomes stale within the same PPO update. Solution:
+    # compare raw return MSE against an MSE whose prediction is clipped around
+    # the value recorded during rollout. Result: the critic cannot move much
+    # faster than the policy trust region on a single batch.
+    value_loss_unclipped = (values - returns).pow(2)
+    values_clipped = old_values + (values - old_values).clamp(-clip_coef, clip_coef)
+    value_loss_clipped = (values_clipped - returns).pow(2)
+    return 0.5 * torch.maximum(value_loss_unclipped, value_loss_clipped).mean()
+
+
 @dataclass
 class CanvasPPORollout:
     """On-policy rollout storage with GAE for Canvas PPO updates."""
@@ -137,7 +170,7 @@ class CanvasPPORollout:
         return tensor.reshape(-1, *tensor.shape[2:])
 
     def to_training_batch(self) -> dict[str, torch.Tensor]:
-        """Flatten rollout tensors and attach normalized GAE advantages."""
+        """Flatten rollout tensors and attach once-computed GAE targets."""
         if not self.rewards:
             raise ValueError("Cannot train PPO from an empty rollout.")
 
@@ -158,10 +191,6 @@ class CanvasPPORollout:
             advantages[step] = last_advantage
             next_value = values[step]
         returns = advantages + values
-        flat_advantages = advantages.reshape(-1)
-        adv_mean = flat_advantages.mean()
-        adv_std = flat_advantages.std(unbiased=False).clamp_min(1e-8)
-        flat_advantages = (flat_advantages - adv_mean) / adv_std
 
         batch = {
             "canvas": self._flatten_time_batch(torch.stack(self.canvas)),
@@ -169,8 +198,9 @@ class CanvasPPORollout:
             "lengths": torch.stack(self.lengths).reshape(-1),
             "actions": self._flatten_time_batch(torch.stack(self.actions)),
             "old_log_probs": torch.stack(self.old_log_probs).reshape(-1),
+            "old_values": values.reshape(-1),
             "returns": returns.reshape(-1),
-            "advantages": flat_advantages,
+            "advantages": advantages.reshape(-1),
         }
         if self.entropy:
             batch["entropy"] = self._flatten_time_batch(torch.stack(self.entropy))
@@ -196,6 +226,7 @@ class CanvasPPO:
         target_kl: float | None = None,
         log_std_min: float = -5.0,
         log_std_max: float = 0.0,
+        value_clip_coef: float | None = None,
     ) -> None:
         self.actor = actor
         self.critic = critic
@@ -210,6 +241,7 @@ class CanvasPPO:
         self.target_kl = target_kl
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
+        self.value_clip_coef = clip_coef if value_clip_coef is None else value_clip_coef
 
     def update(self, rollout: CanvasPPORollout) -> dict[str, float]:
         """Run PPO epochs over one rollout and return averaged metrics."""
@@ -233,8 +265,10 @@ class CanvasPPO:
                     obs["entropy"] = batch["entropy"].index_select(0, idx)
                 actions = batch["actions"].index_select(0, idx)
                 old_log_probs = batch["old_log_probs"].index_select(0, idx)
+                old_values = batch["old_values"].index_select(0, idx)
                 returns = batch["returns"].index_select(0, idx)
-                advantages = batch["advantages"].index_select(0, idx)
+                advantages_raw = batch["advantages"].index_select(0, idx)
+                advantages = normalize_minibatch_advantages(advantages_raw)
 
                 log_probs, policy_entropy, log_std = canvas_actor_log_prob_and_entropy(
                     self.actor,
@@ -252,7 +286,15 @@ class CanvasPPO:
                 actor_loss = -torch.minimum(unclipped, clipped).mean()
                 entropy_bonus = policy_entropy.mean()
                 values = self.critic(obs, actions)
-                value_loss = F.mse_loss(values, returns)
+                if self.value_clip_coef > 0.0:
+                    value_loss = clipped_value_loss(
+                        values,
+                        old_values,
+                        returns,
+                        clip_coef=self.value_clip_coef,
+                    )
+                else:
+                    value_loss = F.mse_loss(values, returns)
                 loss = actor_loss + self.value_coef * value_loss - self.entropy_coef * entropy_bonus
 
                 self.actor_opt.zero_grad(set_to_none=True)

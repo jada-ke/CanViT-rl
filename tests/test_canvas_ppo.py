@@ -1,6 +1,13 @@
 import torch
+import torch.nn.functional as F
 
-from canvit_rl.canvas.ppo import CanvasPPO, CanvasPPORollout, canvas_actor_log_prob
+from canvit_rl.canvas.ppo import (
+    CanvasPPO,
+    CanvasPPORollout,
+    canvas_actor_log_prob,
+    clipped_value_loss,
+    normalize_minibatch_advantages,
+)
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 
@@ -81,3 +88,35 @@ def test_canvas_ppo_update_uses_canvas_actor_and_critic():
     assert "critic/value_loss" in metrics
     assert "ppo/clip_fraction" in metrics
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+
+
+def test_minibatch_advantage_normalization_centers_current_slice():
+    advantages = torch.tensor([10.0, 11.0, 12.0, 13.0])
+
+    normalized = normalize_minibatch_advantages(advantages)
+
+    assert torch.allclose(normalized.mean(), torch.tensor(0.0), atol=1e-6)
+    assert torch.allclose(
+        normalized.std(unbiased=False),
+        torch.tensor(1.0),
+        atol=1e-6,
+    )
+
+
+def test_clipped_value_loss_uses_worse_of_raw_and_clipped_errors():
+    values = torch.tensor([2.0, 0.0])
+    old_values = torch.tensor([0.0, 0.0])
+    returns = torch.tensor([2.0, 1.0])
+
+    loss = clipped_value_loss(
+        values,
+        old_values,
+        returns,
+        clip_coef=0.2,
+    )
+
+    raw = F.mse_loss(values, returns, reduction="none")
+    clipped_values = old_values + (values - old_values).clamp(-0.2, 0.2)
+    clipped = F.mse_loss(clipped_values, returns, reduction="none")
+    expected = 0.5 * torch.maximum(raw, clipped).mean()
+    assert torch.allclose(loss, expected)

@@ -108,7 +108,7 @@ def build_canvas_ppo_trial_args(
     # faster and are easier to interpret.
     trial_args.actor_lr = trial.suggest_float("actor_lr", 5e-5, 5e-4, log=True)
     trial_args.critic_lr = trial.suggest_float("critic_lr", 5e-5, 6e-4, log=True)
-    trial_args.ppo_epochs = trial.suggest_categorical("ppo_epochs", [1, 2, 4])
+    trial_args.ppo_epochs = trial.suggest_categorical("ppo_epochs", [2, 4, 8, 10])
     trial_args.ppo_entropy_coef = trial.suggest_float(
         "ppo_entropy_coef",
         0.01,
