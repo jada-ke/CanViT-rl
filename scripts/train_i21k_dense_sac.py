@@ -283,8 +283,9 @@ def parse_args() -> argparse.Namespace:
         default=11,
         help=(
             "Eval-only diagnostic grid size for ranking the actor's chosen "
-            "true dense reward against same-scale candidate centers. Set 0 "
-            "to skip eval/actor_reward_percentile."
+            "true dense reward against same-scale candidate centers. This "
+            "heavy sampling diagnostic runs at --reward-map-interval during "
+            "eval, not every eval. Set 0 to skip eval/actor_reward_percentile."
         ),
     )
     parser.add_argument(
@@ -1085,12 +1086,6 @@ def maybe_save_dense_policy_glimpses(
                 image_np = _denormalized_uint8_image(sample_batch.images[0])
                 height, width = image_np.shape[:2]
                 full_vp = Viewpoint.full_scene(batch_size=1, device=batch.images.device)
-                # Problem: the dense actor visualizer showed zoomed crop
-                # panels, unlike the ADE Canvas SAC policy contact sheet.
-                # Solution: render every timestep on the full source image,
-                # plus one combined overlay column that shows all rectangles.
-                # Result: dense SAC policy diagnostics use the same scan
-                # pattern as ADE20K while making overlap easy to inspect.
                 viewpoints = [full_vp]
                 titles = [
                     f"batch={batch_idx} sample={sample_idx} t0\n"
@@ -1432,6 +1427,7 @@ def evaluate_dense_sac(
     glimpse_size_px: int,
     canvit_dtype: torch.dtype,
     device: torch.device,
+    compute_actor_reward_percentiles: bool = True,
 ) -> dict[str, float]:
     """Evaluate deterministic dense SAC rollout on a fixed dense-feature subset."""
     if eval_loader is None:
@@ -1460,7 +1456,15 @@ def evaluate_dense_sac(
     entropy_points: list[np.ndarray] = []
     scale_sums = [0.0 for _ in range(args.t)]
     scale_counts = [0 for _ in range(args.t)]
-    diagnostic_scales = parse_reward_map_scales(args.actor_reward_percentile_scales)
+    should_compute_actor_reward_percentiles = (
+        compute_actor_reward_percentiles
+        and args.actor_reward_percentile_grid_size > 0
+    )
+    diagnostic_scales = (
+        parse_reward_map_scales(args.actor_reward_percentile_scales)
+        if should_compute_actor_reward_percentiles
+        else []
+    )
     with torch.inference_mode():
         for _ in range(eval_batches):
             batch = load_dense_train_batch(
@@ -1571,7 +1575,7 @@ def evaluate_dense_sac(
                     tanh_scale=args.reward_tanh_scale,
                 )
                 episode_reward = episode_reward + step_reward
-                if args.actor_reward_percentile_grid_size > 0:
+                if should_compute_actor_reward_percentiles:
                     for sample_idx in range(batch_size):
                         sample_index = torch.tensor([sample_idx], device=device)
                         sample_batch = _slice_dense_batch(batch, sample_idx)
@@ -1868,6 +1872,7 @@ def train_once(args: argparse.Namespace) -> None:
     glimpses = 0
     reward_map_interval = max(args.reward_map_interval or args.log_interval, 1)
     next_reward_map_batch = start_batch
+    next_actor_reward_percentile_batch = start_batch
     next_eval_batch = max(args.eval_interval, start_batch)
     last_eval_batch: int | None = None
     pbar = tqdm(range(start_batch, args.batches + 1), desc="Training IN21k dense SAC")
@@ -2224,6 +2229,10 @@ def train_once(args: argparse.Namespace) -> None:
             )
 
         if eval_loader is not None and batch_idx >= next_eval_batch:
+            should_eval_actor_reward_percentiles = (
+                args.actor_reward_percentile_grid_size > 0
+                and batch_idx >= next_actor_reward_percentile_batch
+            )
             eval_metrics = evaluate_dense_sac(
                 args=args,
                 eval_loader=eval_loader,
@@ -2235,6 +2244,7 @@ def train_once(args: argparse.Namespace) -> None:
                 glimpse_size_px=glimpse_size_px,
                 canvit_dtype=canvit_dtype,
                 device=device,
+                compute_actor_reward_percentiles=should_eval_actor_reward_percentiles,
             )
             latest_metrics.update(eval_metrics)
             if comet_exp is not None and eval_metrics:
@@ -2259,6 +2269,9 @@ def train_once(args: argparse.Namespace) -> None:
                 f"{eval_metrics.get('eval/best_grid_scale', float('nan')):.3f}"
             )
             last_eval_batch = batch_idx
+            if should_eval_actor_reward_percentiles:
+                while next_actor_reward_percentile_batch <= batch_idx:
+                    next_actor_reward_percentile_batch += reward_map_interval
             while next_eval_batch <= batch_idx:
                 next_eval_batch += args.eval_interval
 
