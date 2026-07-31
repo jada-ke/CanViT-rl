@@ -8,6 +8,7 @@ fp32, and standardize them with the model-owned normalizers.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +17,7 @@ import torch
 from canvit_pytorch.preprocess import preprocess
 from PIL import Image
 from torch import Tensor
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 
 class DenseTrainLoader(Protocol):
@@ -50,8 +52,126 @@ def dense_glimpse_images(batch: DenseTrainBatch) -> Tensor:
     return batch.images if batch.glimpse_images is None else batch.glimpse_images
 
 
+class FixedDenseSubsetDataset(Dataset[tuple[Tensor, Tensor, Tensor, int]]):
+    """Map-style fixed subset that streams records from mmap-backed shards."""
+
+    def __init__(
+        self,
+        *,
+        selected: list[tuple[Path, int]],
+        image_size: int,
+        image_root: Path | None,
+        tar_dir: Path | None,
+    ) -> None:
+        self.selected = selected
+        self.image_root = image_root
+        self.tar_dir = tar_dir
+        self.transform = preprocess(image_size)
+        self._shard_cache: dict[Path, dict] = {}
+        self._tar_readers: dict[Path, object] = {}
+
+    def __len__(self) -> int:
+        return len(self.selected)
+
+    @staticmethod
+    def _open_tar_reader(tar_dir: Path, shard_path: Path):
+        """Open the tar reader matching one dense-feature shard."""
+        from canvit_rl.pretrain_IN21k.pretrain_modules import install_pretrain_train_shim
+
+        install_pretrain_train_shim()
+        from canvit_pretrain.train.data.tar_images import TarImageReader, load_tar_index
+
+        tar_path = tar_dir / f"{shard_path.stem}.tar"
+        return TarImageReader(tar_path, index=load_tar_index(tar_path))
+
+    def _shard_for(self, shard_path: Path) -> dict:
+        """Return an mmapped shard payload cached for repeated subset reads."""
+        shard = self._shard_cache.get(shard_path)
+        if shard is None:
+            shard = torch.load(
+                shard_path,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
+            self._shard_cache[shard_path] = shard
+        return shard
+
+    def _tar_reader_for(self, shard_path: Path):
+        """Return the tar reader for one shard when tar-backed pixels are used."""
+        if self.tar_dir is None:
+            return None
+        reader = self._tar_readers.get(shard_path)
+        if reader is None:
+            reader = self._open_tar_reader(self.tar_dir, shard_path)
+            self._tar_readers[shard_path] = reader
+        return reader
+
+    def __getitem__(self, selection_idx: int) -> tuple[Tensor, Tensor, Tensor, int]:
+        """Materialize one selected sample like canvit-pretrain shard workers."""
+        shard_path, sample_idx = self.selected[selection_idx]
+        shard = self._shard_for(shard_path)
+        rel_path = shard["paths"][sample_idx]
+        tar_reader = self._tar_reader_for(shard_path)
+        if tar_reader is not None:
+            image = tar_reader.read_image(rel_path)
+        else:
+            assert self.image_root is not None
+            with Image.open(self.image_root / rel_path) as image_file:
+                image = image_file.convert("RGB")
+        return (
+            self.transform(image),
+            shard["patches"][sample_idx].clone(),
+            shard["cls"][sample_idx].clone(),
+            int(shard["class_idxs"][sample_idx]),
+        )
+
+    def close(self) -> None:
+        """Close tar readers opened for streaming fixed-subset batches."""
+        for reader in self._tar_readers.values():
+            close = getattr(reader, "close", None)
+            if close is not None:
+                close()
+        self._tar_readers.clear()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for tar-backed fixed subset loaders."""
+        if hasattr(self, "_tar_readers"):
+            self.close()
+
+
+class FixedDenseSubsetSampler(Sampler[int]):
+    """Infinite deterministic subset sampler with resettable eval order."""
+
+    def __init__(
+        self,
+        *,
+        subset_size: int,
+        initial_order: Tensor,
+        generator: torch.Generator,
+    ) -> None:
+        self.subset_size = subset_size
+        self.initial_order = initial_order.clone()
+        self.order = self.initial_order.clone()
+        self.generator = torch.Generator()
+        self.generator.set_state(generator.get_state())
+
+    def __iter__(self) -> Iterator[int]:
+        while True:
+            for idx in self.order.tolist():
+                yield int(idx)
+            self.order = torch.randperm(self.subset_size, generator=self.generator)
+
+    def __len__(self) -> int:
+        return self.subset_size
+
+    def reset(self) -> None:
+        """Restart from the same fixed order selected by --eval-subset-seed."""
+        self.order = self.initial_order.clone()
+
+
 class FixedDenseSubsetLoader:
-    """Small deterministic dense-feature subset loader for smoke experiments."""
+    """CanViT-pretrain-style DataLoader over deterministic dense subset rows."""
 
     def __init__(
         self,
@@ -64,6 +184,7 @@ class FixedDenseSubsetLoader:
         subset_shards: int,
         image_root: Path | None,
         tar_dir: Path | None,
+        num_workers: int = 0,
     ) -> None:
         if subset_size <= 0:
             raise ValueError("subset_size must be positive.")
@@ -71,7 +192,8 @@ class FixedDenseSubsetLoader:
             raise ValueError("subset_shards must be positive.")
         validate_dense_feature_source(feature_image_root=image_root, tar_dir=tar_dir)
         self.batch_size = batch_size
-        self.generator = torch.Generator().manual_seed(subset_seed)
+        self.num_workers = num_workers
+        generator = torch.Generator().manual_seed(subset_seed)
         shard_files = sorted(Path(shards_dir).glob("*.pt"))[:subset_shards]
         if not shard_files:
             raise FileNotFoundError(f"No dense-feature shards found in {shards_dir}")
@@ -92,17 +214,33 @@ class FixedDenseSubsetLoader:
                 "--subset-size/--eval-images, or point --eval-feature-base-dir "
                 "at split-specific feature shards."
             )
-        chosen = torch.randperm(len(candidates), generator=self.generator)[:subset_size]
+        chosen = torch.randperm(len(candidates), generator=generator)[:subset_size]
         selected = [candidates[int(i)] for i in chosen.tolist()]
-        self.images, self.patches, self.cls, self.labels = self._load_selected(
-            selected,
+        initial_order = torch.randperm(subset_size, generator=generator)
+        # Problem: fixed-subset SAC runs need CanViT-pretrain's worker-backed
+        # streaming behavior while preserving the exact seed-selected eval
+        # image set. Solution: store deterministic shard row references in a
+        # map-style Dataset and drive it with an infinite resettable sampler.
+        # Result: train and baseline eval use the same selected images for the
+        # same seeds while --num-workers can parallelize image decode/preprocess.
+        self.dataset = FixedDenseSubsetDataset(
+            selected=selected,
             image_size=image_size,
             image_root=image_root,
             tar_dir=tar_dir,
         )
-        self.initial_order = torch.randperm(subset_size, generator=self.generator)
-        self.order = self.initial_order.clone()
-        self.pos = 0
+        self.sampler = FixedDenseSubsetSampler(
+            subset_size=subset_size,
+            initial_order=initial_order,
+            generator=generator,
+        )
+        self.loader: DataLoader | None = None
+        self.loader_iter: Iterator | None = None
+
+    @staticmethod
+    def _open_tar_reader(tar_dir: Path, shard_path: Path):
+        """Open the tar reader matching one dense-feature shard."""
+        return FixedDenseSubsetDataset._open_tar_reader(tar_dir, shard_path)
 
     @staticmethod
     def _collect_candidates(
@@ -135,107 +273,44 @@ class FixedDenseSubsetLoader:
             del shard
         return candidates
 
-    @staticmethod
-    def _open_tar_reader(tar_dir: Path, shard_path: Path):
-        """Open the tar reader matching one dense-feature shard."""
-        from canvit_rl.pretrain_IN21k.pretrain_modules import install_pretrain_train_shim
-
-        install_pretrain_train_shim()
-        from canvit_pretrain.train.data.tar_images import TarImageReader, load_tar_index
-
-        tar_path = tar_dir / f"{shard_path.stem}.tar"
-        return TarImageReader(tar_path, index=load_tar_index(tar_path))
-
-    @staticmethod
-    def _load_selected(
-        selected: list[tuple[Path, int]],
-        *,
-        image_size: int,
-        image_root: Path | None,
-        tar_dir: Path | None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Materialize a small selected subset into memory."""
-        transform = preprocess(image_size)
-        images: list[Tensor] = []
-        patches: list[Tensor] = []
-        cls_tokens: list[Tensor] = []
-        labels: list[int] = []
-        current_shard_path: Path | None = None
-        current_shard = None
-        tar_reader = None
-        try:
-            for shard_path, sample_idx in selected:
-                if current_shard_path != shard_path:
-                    if tar_reader is not None:
-                        tar_reader.close()
-                    current_shard_path = shard_path
-                    current_shard = torch.load(
-                        shard_path,
-                        map_location="cpu",
-                        weights_only=False,
-                        mmap=True,
-                    )
-                    tar_reader = (
-                        FixedDenseSubsetLoader._open_tar_reader(tar_dir, shard_path)
-                        if tar_dir is not None
-                        else None
-                    )
-                assert current_shard is not None
-                rel_path = current_shard["paths"][sample_idx]
-                if tar_reader is not None:
-                    image = tar_reader.read_image(rel_path)
-                else:
-                    assert image_root is not None
-                    with Image.open(image_root / rel_path) as image_file:
-                        image = image_file.convert("RGB")
-                # Problem: small-subset experiments should exercise the same
-                # student image preprocessing as shard training. Solution:
-                # load images through CanViT-pretrain's preprocess transform
-                # while materializing only the selected records. Result: tiny
-                # runs use realistic pixels/features without scanning the full
-                # dataset every batch.
-                images.append(transform(image))
-                patches.append(current_shard["patches"][sample_idx].clone())
-                cls_tokens.append(current_shard["cls"][sample_idx].clone())
-                labels.append(int(current_shard["class_idxs"][sample_idx]))
-        finally:
-            if tar_reader is not None:
-                tar_reader.close()
-        return (
-            torch.stack(images),
-            torch.stack(patches),
-            torch.stack(cls_tokens),
-            torch.tensor(labels, dtype=torch.long),
+    def _create_loader(self) -> DataLoader:
+        """Create a worker-backed DataLoader matching canvit-pretrain defaults."""
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            sampler=self.sampler,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=self.num_workers > 0,
         )
 
-    def _next_indices(self) -> Tensor:
-        """Return a reshuffled mini-batch of subset indices."""
-        pieces: list[Tensor] = []
-        remaining = self.batch_size
-        while remaining > 0:
-            if self.pos >= len(self.order):
-                self.order = torch.randperm(len(self.order), generator=self.generator)
-                self.pos = 0
-            take = min(remaining, len(self.order) - self.pos)
-            pieces.append(self.order[self.pos : self.pos + take])
-            self.pos += take
-            remaining -= take
-        return torch.cat(pieces)
+    @property
+    def selected(self) -> list[tuple[Path, int]]:
+        """Expose deterministic selected rows for tests and diagnostics."""
+        return self.dataset.selected
 
     def reset(self) -> None:
-        """Replay the same materialized subset order for deterministic eval."""
-        self.order = self.initial_order.clone()
-        self.pos = 0
+        """Replay the same fixed subset order for deterministic eval/baselines."""
+        self.sampler.reset()
+        self.loader_iter = None
 
     def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        """Return the next reshuffled batch from the fixed subset."""
-        idx = self._next_indices()
-        return (
-            self.images.index_select(0, idx),
-            self.patches.index_select(0, idx),
-            self.cls.index_select(0, idx),
-            self.labels.index_select(0, idx),
-        )
+        """Return the next DataLoader batch from the fixed subset."""
+        if self.loader is None:
+            self.loader = self._create_loader()
+        if self.loader_iter is None:
+            self.loader_iter = iter(self.loader)
+        return next(self.loader_iter)
+
+    def close(self) -> None:
+        """Close main-process dataset readers if no workers were used."""
+        self.dataset.close()
+
+    def __del__(self) -> None:
+        """Best-effort cleanup for main-process fixed subset readers."""
+        if hasattr(self, "dataset"):
+            self.close()
 
 
 class PairedDenseShardLoader:

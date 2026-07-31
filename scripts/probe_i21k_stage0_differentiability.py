@@ -141,6 +141,7 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules):
             subset_shards=args.subset_shards,
             image_root=cfg.feature_image_root,
             tar_dir=cfg.tar_dir,
+            num_workers=args.num_workers,
         )
     return modules.ShardedFeatureLoader(
         shards_dir=shards_dir,

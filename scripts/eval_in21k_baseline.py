@@ -197,6 +197,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene-resolution", type=int, default=512)
     parser.add_argument("--glimpse-grid-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--subset-shards", type=int, default=1)
     parser.add_argument("--t", type=int, default=1)
     parser.add_argument("--max-history", type=int, default=5)
@@ -338,7 +339,6 @@ def parse_comet_steps(args: argparse.Namespace) -> list[int]:
 def main() -> None:
     args = parse_args()
     args.batches = 1
-    args.num_workers = 0
     args.canvas_entropy_state = args.policy == "egc2f"
     random.seed(args.seed)
     np.random.seed(args.seed)
