@@ -223,6 +223,7 @@ class CanvasPPO:
         max_grad_norm: float,
         epochs: int,
         minibatch_size: int,
+        critic_epochs: int = 0,
         target_kl: float | None = None,
         log_std_min: float = -5.0,
         log_std_max: float = 0.0,
@@ -238,6 +239,7 @@ class CanvasPPO:
         self.max_grad_norm = max_grad_norm
         self.epochs = epochs
         self.minibatch_size = minibatch_size
+        self.critic_epochs = critic_epochs
         self.target_kl = target_kl
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
@@ -346,4 +348,48 @@ class CanvasPPO:
             if early_stop:
                 break
 
-        return {key: value / max(updates, 1) for key, value in metric_sums.items()}
+        critic_only_sums: dict[str, float] = {}
+        critic_only_updates = 0
+        for _ in range(self.critic_epochs):
+            order = torch.randperm(total, device=device)
+            for start in range(0, total, self.minibatch_size):
+                idx = order[start : start + self.minibatch_size]
+                obs = {
+                    "canvas": batch["canvas"].index_select(0, idx),
+                    "coords": batch["coords"].index_select(0, idx),
+                    "lengths": batch["lengths"].index_select(0, idx),
+                }
+                if "entropy" in batch:
+                    obs["entropy"] = batch["entropy"].index_select(0, idx)
+                actions = batch["actions"].index_select(0, idx)
+                returns = batch["returns"].index_select(0, idx)
+
+                values = self.critic(obs, actions)
+                # Problem: more full PPO epochs can over-update the actor and
+                # explode KL, but the critic may still lag the fixed rollout
+                # targets. Solution: run optional critic-only passes after the
+                # actor update with plain supervised return MSE. Result: the
+                # baseline can catch up without replaying stale actor gradients.
+                value_loss = F.mse_loss(values, returns)
+
+                self.critic_opt.zero_grad(set_to_none=True)
+                value_loss.backward()
+                if self.max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.critic.parameters(),
+                        self.max_grad_norm,
+                    )
+                self.critic_opt.step()
+
+                metrics = {"critic_extra/value_loss": float(value_loss.item())}
+                for key, value in metrics.items():
+                    critic_only_sums[key] = critic_only_sums.get(key, 0.0) + value
+                critic_only_updates += 1
+
+        metrics_out = {
+            key: value / max(updates, 1) for key, value in metric_sums.items()
+        }
+        for key, value in critic_only_sums.items():
+            metrics_out[key] = value / max(critic_only_updates, 1)
+
+        return metrics_out

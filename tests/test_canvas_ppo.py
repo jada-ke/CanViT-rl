@@ -60,6 +60,7 @@ def test_canvas_ppo_update_uses_canvas_actor_and_critic():
         max_grad_norm=0.5,
         epochs=2,
         minibatch_size=3,
+        critic_epochs=1,
     )
     rollout = CanvasPPORollout(gamma=0.9, gae_lambda=0.95)
     for step in range(2):
@@ -86,6 +87,7 @@ def test_canvas_ppo_update_uses_canvas_actor_and_critic():
 
     assert "actor/loss" in metrics
     assert "critic/value_loss" in metrics
+    assert "critic_extra/value_loss" in metrics
     assert "ppo/clip_fraction" in metrics
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
 

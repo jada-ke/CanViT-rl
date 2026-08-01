@@ -111,6 +111,7 @@ IMPORTANT_TRAIN_METRICS = {
     "actor/std_mean",
     "actor/std_max",
     "critic/value_loss",
+    "critic_extra/value_loss",
     "ppo/approx_kl",
     "ppo/clip_fraction",
     "train/online_reward/mean",
@@ -257,6 +258,8 @@ def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
         raise ValueError("Canvas PPO requires --t >= 1 so each rollout has actions.")
     if args.ppo_epochs < 1:
         raise ValueError("--ppo-epochs must be positive.")
+    if args.ppo_critic_epochs < 0:
+        raise ValueError("--ppo-critic-epochs must be non-negative.")
     if args.ppo_minibatch_size < 1:
         raise ValueError("--ppo-minibatch-size must be positive.")
     if not 0.0 <= args.ppo_clip_coef <= 1.0:
@@ -449,6 +452,7 @@ def train_once(args: argparse.Namespace) -> float:
         max_grad_norm=args.max_grad_norm,
         epochs=args.ppo_epochs,
         minibatch_size=args.ppo_minibatch_size,
+        critic_epochs=args.ppo_critic_epochs,
         target_kl=args.ppo_target_kl,
         log_std_min=args.ppo_log_std_min,
         log_std_max=args.ppo_log_std_max,
@@ -781,6 +785,7 @@ def train_once(args: argparse.Namespace) -> float:
                 f"reward={batch_reward_mean:+.4f} "
                 f"actor_loss={metrics.get('actor/loss', float('nan')):+.4f} "
                 f"value_loss={metrics.get('critic/value_loss', float('nan')):.4f} "
+                f"critic_extra_loss={metrics.get('critic_extra/value_loss', float('nan')):.4f} "
                 f"entropy={metrics.get('actor/entropy', float('nan')):.4f} "
                 f"std={metrics.get('actor/std_mean', float('nan')):.4f} "
                 f"std_max={metrics.get('actor/std_max', float('nan')):.4f} "
@@ -1027,6 +1032,16 @@ def parse_args() -> argparse.Namespace:
         comet_tags="canvas-ppo",
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument(
+        "--ppo-critic-epochs",
+        type=int,
+        default=0,
+        help=(
+            "Extra critic-only epochs over fixed PPO rollout returns after "
+            "the actor update. Use this to let the value baseline catch up "
+            "without replaying actor updates."
+        ),
+    )
     parser.add_argument("--ppo-minibatch-size", type=int, default=16)
     parser.add_argument("--ppo-clip-coef", type=float, default=0.2)
     parser.add_argument("--ppo-value-coef", type=float, default=0.5)
