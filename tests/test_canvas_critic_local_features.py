@@ -1,6 +1,7 @@
 import torch
 
 from canvit_rl.canvas.sac import CanvasReplayBuffer
+from canvit_rl.canvas.state import scale_aware_detail_debt
 from canvit_rl.pretrain_IN21k.checkpoints import load_dense_sac_critic_initializer
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
@@ -154,6 +155,30 @@ def test_canvas_replay_buffer_samples_optional_entropy_state():
 
     assert sample["entropy"].shape == (2, 1, 5, 5)
     assert sample["next_entropy"].shape == (2, 1, 5, 5)
+
+
+def test_scale_aware_detail_debt_allows_finer_revisits():
+    coords = torch.tensor(
+        [
+            [
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 0.25],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    lengths = torch.tensor([2])
+
+    debt = scale_aware_detail_debt(
+        coords=coords,
+        lengths=lengths,
+        canvas_grid_size=5,
+        min_scale=0.25,
+    )
+
+    assert debt.shape == (1, 1, 5, 5)
+    assert torch.isclose(debt[0, 0, 0, 0], torch.tensor(0.75))
+    assert torch.isclose(debt[0, 0, 2, 2], torch.tensor(0.0))
 
 
 def test_dense_sac_critic_initializer_loads_q_weights_and_syncs_targets(tmp_path):

@@ -74,6 +74,7 @@ from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
     empty_viewpoint_history,
+    scale_aware_detail_debt,
 )
 from canvit_rl.canvit_precision import resolve_canvit_dtype
 from canvit_rl.env import get_device
@@ -258,6 +259,14 @@ def parse_args() -> argparse.Namespace:
             "the CanvasStateActor/Critic state under the existing entropy key."
         ),
     )
+    parser.add_argument(
+        "--detail-debt",
+        dest="detail_debt",
+        action="store_true",
+        help=(
+            "Append a scale-aware coverage/detail-debt map to the Canvas SAC state."
+        ),
+    )
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument("--disable-canvas-avg-pool", action="store_true")
     parser.add_argument("--disable-canvas-max-pool", action="store_true")
@@ -345,6 +354,10 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--resume cannot be combined with --init-critic-checkpoint.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
+    if args.canvas_entropy_state and args.detail_debt:
+        raise ValueError(
+            "--canvas-entropy-state and --detail-debt are mutually exclusive."
+        )
     if args.debug_viz_images < 0 or args.debug_viz_batches < 0:
         raise ValueError("--debug-viz-images and --debug-viz-batches must be non-negative.")
     if args.reward_map_images < 0:
@@ -655,6 +668,39 @@ def dense_canvas_entropy_map(
     min_val = flat.min(dim=1).values[:, None, None, None]
     max_val = flat.max(dim=1).values[:, None, None, None]
     return ((error_map - min_val) / (max_val - min_val).clamp_min(eps)).contiguous()
+
+
+def uses_canvas_aux_state(args: argparse.Namespace) -> bool:
+    """Return whether the single-channel Canvas actor auxiliary branch is active."""
+    return bool(args.canvas_entropy_state or args.detail_debt)
+
+
+def canvas_aux_state_map(
+    *,
+    args: argparse.Namespace,
+    model,
+    state,
+    batch: DenseTrainBatch,
+    coords: torch.Tensor,
+    lengths: torch.Tensor,
+    canvas_grid_size: int,
+) -> torch.Tensor | None:
+    """Build the configured single-channel Canvas actor auxiliary map."""
+    if args.detail_debt:
+        return scale_aware_detail_debt(
+            coords=coords,
+            lengths=lengths,
+            canvas_grid_size=canvas_grid_size,
+            min_scale=args.min_scale,
+        )
+    if args.canvas_entropy_state:
+        return dense_canvas_entropy_map(
+            model=model,
+            state=state,
+            batch=batch,
+            canvas_grid_size=canvas_grid_size,
+        )
+    return None
 
 
 def _evaluate_dense_reward_grid(
@@ -1145,21 +1191,20 @@ def maybe_save_dense_policy_glimpses(
                         state=sample_state,
                         canvas_grid_size=canvas_grid_size,
                     )
-                    sample_entropy = (
-                        dense_canvas_entropy_map(
-                            model=model,
-                            state=sample_state,
-                            batch=sample_batch,
-                            canvas_grid_size=canvas_grid_size,
-                        )
-                        if args.canvas_entropy_state
-                        else None
-                    )
                     sample_coords, sample_lengths = append_viewpoint_history(
                         coords=sample_coords,
                         lengths=sample_lengths,
                         viewpoint=vp,
                         step=actor_step_idx + 1,
+                    )
+                    sample_entropy = canvas_aux_state_map(
+                        args=args,
+                        model=model,
+                        state=sample_state,
+                        batch=sample_batch,
+                        coords=sample_coords,
+                        lengths=sample_lengths,
+                        canvas_grid_size=canvas_grid_size,
                     )
                 overview_ax = axes[sample_idx, 0]
                 overview_ax.imshow(image_np)
@@ -1379,7 +1424,7 @@ def build_agent(args: argparse.Namespace, canvas_feature_dim: int, device: torch
         d_model=args.d_model,
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
-        use_entropy_state=args.canvas_entropy_state,
+        use_entropy_state=uses_canvas_aux_state(args),
         use_canvas_avg_pool=not args.disable_canvas_avg_pool,
         use_canvas_max_pool=not args.disable_canvas_max_pool,
     )
@@ -1517,21 +1562,20 @@ def evaluate_dense_sac(
                 state=state,
                 canvas_grid_size=canvas_grid_size,
             )
-            canvas_entropy = (
-                dense_canvas_entropy_map(
-                    model=model,
-                    state=state,
-                    batch=batch,
-                    canvas_grid_size=canvas_grid_size,
-                )
-                if args.canvas_entropy_state
-                else None
-            )
             coords, lengths = append_viewpoint_history(
                 coords=coords,
                 lengths=lengths,
                 viewpoint=full_vp,
                 step=0,
+            )
+            canvas_entropy = canvas_aux_state_map(
+                args=args,
+                model=model,
+                state=state,
+                batch=batch,
+                coords=coords,
+                lengths=lengths,
+                canvas_grid_size=canvas_grid_size,
             )
             episode_reward = torch.zeros(batch_size, device=device)
             for step_idx in range(args.t):
@@ -1699,21 +1743,20 @@ def evaluate_dense_sac(
                     state=state,
                     canvas_grid_size=canvas_grid_size,
                 )
-                canvas_entropy = (
-                    dense_canvas_entropy_map(
-                        model=model,
-                        state=state,
-                        batch=batch,
-                        canvas_grid_size=canvas_grid_size,
-                    )
-                    if args.canvas_entropy_state
-                    else None
-                )
                 coords, lengths = append_viewpoint_history(
                     coords=coords,
                     lengths=lengths,
                     viewpoint=vp,
                     step=step_idx + 1,
+                )
+                canvas_entropy = canvas_aux_state_map(
+                    args=args,
+                    model=model,
+                    state=state,
+                    batch=batch,
+                    coords=coords,
+                    lengths=lengths,
+                    canvas_grid_size=canvas_grid_size,
                 )
             initial_norm.append(initial_metrics.loss_norm.detach().cpu())
             final_norm.append(current_metrics.loss_norm.detach().cpu())
@@ -1831,7 +1874,7 @@ def train_once(args: argparse.Namespace) -> None:
         capacity=args.buffer_size,
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=G,
-        include_entropy=args.canvas_entropy_state,
+        include_entropy=uses_canvas_aux_state(args),
     )
     replay_device = resolve_replay_device(train_device=device, replay_bytes=replay_bytes)
     validate_replay_memory(storage_device=replay_device, replay_bytes=replay_bytes)
@@ -1852,7 +1895,7 @@ def train_once(args: argparse.Namespace) -> None:
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=G,
         storage_device=replay_device,
-        store_entropy=args.canvas_entropy_state,
+        store_entropy=uses_canvas_aux_state(args),
         pin_memory=replay_pin_memory,
     )
     print(
@@ -1929,21 +1972,20 @@ def train_once(args: argparse.Namespace) -> None:
                 state=state,
                 canvas_grid_size=G,
             )
-            canvas_entropy = (
-                dense_canvas_entropy_map(
-                    model=model,
-                    state=state,
-                    batch=batch,
-                    canvas_grid_size=G,
-                )
-                if args.canvas_entropy_state
-                else None
-            )
         coords, lengths = append_viewpoint_history(
             coords=coords,
             lengths=lengths,
             viewpoint=full_vp,
             step=0,
+        )
+        canvas_entropy = canvas_aux_state_map(
+            args=args,
+            model=model,
+            state=state,
+            batch=batch,
+            coords=coords,
+            lengths=lengths,
+            canvas_grid_size=G,
         )
         should_log_reward_maps = args.reward_map_images > 0 and batch_idx >= next_reward_map_batch
         if should_log_reward_maps:
@@ -2015,21 +2057,20 @@ def train_once(args: argparse.Namespace) -> None:
                         state=reward_map_state,
                         canvas_grid_size=G,
                     )
-                    reward_map_entropy = (
-                        dense_canvas_entropy_map(
-                            model=model,
-                            state=reward_map_state,
-                            batch=reward_map_batch,
-                            canvas_grid_size=G,
-                        )
-                        if args.canvas_entropy_state
-                        else None
-                    )
                 reward_map_coords, reward_map_lengths = append_viewpoint_history(
                     coords=reward_map_coords,
                     lengths=reward_map_lengths,
                     viewpoint=reward_map_full_vp,
                     step=0,
+                )
+                reward_map_entropy = canvas_aux_state_map(
+                    args=args,
+                    model=model,
+                    state=reward_map_state,
+                    batch=reward_map_batch,
+                    coords=reward_map_coords,
+                    lengths=reward_map_lengths,
+                    canvas_grid_size=G,
                 )
             maybe_save_dense_reward_maps(
                 args=args,
@@ -2120,16 +2161,6 @@ def train_once(args: argparse.Namespace) -> None:
                     state=out.state,
                     canvas_grid_size=G,
                 )
-                next_canvas_entropy = (
-                    dense_canvas_entropy_map(
-                        model=model,
-                        state=out.state,
-                        batch=batch,
-                        canvas_grid_size=G,
-                    )
-                    if args.canvas_entropy_state
-                    else None
-                )
             reward = dense_reward(
                 mode=args.reward_mode,
                 before=current_metrics,
@@ -2152,6 +2183,15 @@ def train_once(args: argparse.Namespace) -> None:
                 lengths=lengths,
                 viewpoint=vp,
                 step=step_idx + 1,
+            )
+            next_canvas_entropy = canvas_aux_state_map(
+                args=args,
+                model=model,
+                state=out.state,
+                batch=batch,
+                coords=coords,
+                lengths=lengths,
+                canvas_grid_size=G,
             )
             done = torch.full(
                 (batch_size,),

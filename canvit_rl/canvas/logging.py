@@ -14,7 +14,7 @@ except ImportError:
 
 def add_canvas_sac_comet_args(parser: argparse.ArgumentParser) -> None:
     """Register Comet options used by the Canvas SAC trainer."""
-    parser.add_argument("--comet-log-interval", type=int, default=20)
+    parser.add_argument("--comet-log-interval", type=int, default=50)
     parser.add_argument("--no-comet", action="store_true")
     parser.add_argument("--comet-workspace", type=str, default=None)
     parser.add_argument("--comet-project", type=str, default="canvas-sac")
@@ -120,12 +120,6 @@ def log_final_full_validation_miou_curve(
     # not shift just because different jobs trained for different update counts.
     curve_step = 0
     if hasattr(comet_exp, "log_curve"):
-        # Problem: Comet's native log_curve path is single-series here; replacing
-        # it with a figure made the historical curve artifact disappear.
-        # Solution: always keep the final-only native curve, and log the
-        # multi-line comparison as a separate figure/image artifact.
-        # Result: final_full_validation_miou_by_timestep remains available while
-        # initialized/EG-C2F/final can still be compared in one plot.
         comet_exp.log_curve(
             "final_full_validation_miou_by_timestep",
             x=timesteps,

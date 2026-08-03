@@ -43,6 +43,7 @@ from canvit_rl.canvas.state import (
     canvas_layernorm_spatial,
     canvas_segmentation_entropy,
     empty_viewpoint_history,
+    scale_aware_detail_debt,
 )
 from canvit_rl.greedy import miou_from_state
 from canvit_rl.sac_models import (
@@ -110,7 +111,33 @@ def _is_canvas_checkpoint(payload: dict[str, Any]) -> bool:
     return state_representation in {
         "current_canvas_layernorm_with_viewpoint_history",
         "current_canvas_layernorm_entropy_with_viewpoint_history",
+        "current_canvas_layernorm_detail_debt_with_viewpoint_history",
     }
+
+
+def _canvas_aux_state_kind(
+    payload: dict[str, Any],
+    checkpoint_args: dict[str, Any],
+) -> str | None:
+    """Return the single-channel canvas aux map kind expected by the actor."""
+    state_representation = str(
+        payload.get(
+            "state_representation",
+            payload.get("metadata", {}).get("state_representation", ""),
+        )
+    )
+    if state_representation == "current_canvas_layernorm_detail_debt_with_viewpoint_history":
+        return "detail_debt"
+    if state_representation == "current_canvas_layernorm_entropy_with_viewpoint_history":
+        return "segmentation_entropy"
+    if checkpoint_args.get("detail_debt", False) or checkpoint_args.get(
+        "canvas_detail_debt_state",
+        False,
+    ):
+        return "detail_debt"
+    if checkpoint_args.get("canvas_entropy_state", False):
+        return "segmentation_entropy"
+    return None
 
 
 def _build_actor(
@@ -174,8 +201,7 @@ def _build_canvas_actor(
                 "canvas-entropy-state",
                 checkpoint_args.get("canvas_entropy_state", False),
             )
-            or payload.get("state_representation")
-            == "current_canvas_layernorm_entropy_with_viewpoint_history"
+            or _canvas_aux_state_kind(payload, checkpoint_args) is not None
         ),
         use_canvas_avg_pool=not bool(
             _checkpoint_value(checkpoint_args, "disable-canvas-avg-pool", False)
@@ -263,6 +289,7 @@ def main() -> None:
 
     actor_state, checkpoint_args, checkpoint_payload = _load_checkpoint(args.checkpoint)
     is_canvas_policy = _is_canvas_checkpoint(checkpoint_payload)
+    canvas_aux_kind = _canvas_aux_state_kind(checkpoint_payload, checkpoint_args)
     checkpoint_t = int(_checkpoint_value(checkpoint_args, "t", args.t))
     if args.t != checkpoint_t:
         print(
@@ -399,17 +426,22 @@ def main() -> None:
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
-            canvas_entropy = (
-                canvas_segmentation_entropy(
-                    model=model,
-                    probe=probe,
-                    state=state,
-                    canvas_grid_size=cfg.canvas_grid_size,
-                )
-                if is_canvas_policy
-                and getattr(actor.encoder, "use_entropy_state", False)
-                else None
-            )
+            canvas_entropy = None
+            if is_canvas_policy and getattr(actor.encoder, "use_entropy_state", False):
+                if canvas_aux_kind == "detail_debt":
+                    canvas_entropy = scale_aware_detail_debt(
+                        coords=coords,
+                        lengths=lengths,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                        min_scale=min_scale,
+                    )
+                else:
+                    canvas_entropy = canvas_segmentation_entropy(
+                        model=model,
+                        probe=probe,
+                        state=state,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                    )
 
             step_states = [state]
             step_scales = [1.0]
@@ -464,16 +496,22 @@ def main() -> None:
                         state=state,
                         canvas_grid_size=cfg.canvas_grid_size,
                     )
-                    canvas_entropy = (
-                        canvas_segmentation_entropy(
-                            model=model,
-                            probe=probe,
-                            state=state,
-                            canvas_grid_size=cfg.canvas_grid_size,
-                        )
-                        if getattr(actor.encoder, "use_entropy_state", False)
-                        else None
-                    )
+                    canvas_entropy = None
+                    if getattr(actor.encoder, "use_entropy_state", False):
+                        if canvas_aux_kind == "detail_debt":
+                            canvas_entropy = scale_aware_detail_debt(
+                                coords=coords,
+                                lengths=lengths,
+                                canvas_grid_size=cfg.canvas_grid_size,
+                                min_scale=min_scale,
+                            )
+                        else:
+                            canvas_entropy = canvas_segmentation_entropy(
+                                model=model,
+                                probe=probe,
+                                state=state,
+                                canvas_grid_size=cfg.canvas_grid_size,
+                            )
                 step_states.append(state)
                 step_scales.append(float(vp.scales[0].detach().cpu().item()))
 

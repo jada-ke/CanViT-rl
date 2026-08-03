@@ -121,7 +121,7 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--buffer-size", type=int, default=256)
     parser.add_argument("--learning-starts", type=int, default=1)
     parser.add_argument("--updates-per-batch", type=int, default=1)
-    parser.add_argument("--eval-interval", type=int, default=20)
+    parser.add_argument("--eval-interval", type=int, default=50)
     parser.add_argument(
         "--skip-final-full-validation-miou",
         action="store_true",

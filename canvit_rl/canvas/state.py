@@ -52,6 +52,45 @@ def canvas_segmentation_entropy(
     return entropy.contiguous()
 
 
+def scale_aware_detail_debt(
+    *,
+    coords: torch.Tensor,
+    lengths: torch.Tensor,
+    canvas_grid_size: int,
+    min_scale: float,
+) -> torch.Tensor:
+    """Return viewpoint-history detail debt as [B, 1, G, G]."""
+    if min_scale <= 0.0 or min_scale > 1.0:
+        raise ValueError("Require 0 < min_scale <= 1 for detail-debt state.")
+    batch_size = coords.shape[0]
+    device = coords.device
+    grid = torch.linspace(-1.0, 1.0, canvas_grid_size, device=device)
+    yy, xx = torch.meshgrid(grid, grid, indexing="ij")
+    coverage = torch.zeros(
+        batch_size,
+        canvas_grid_size,
+        canvas_grid_size,
+        device=device,
+        dtype=torch.float32,
+    )
+    for step_idx in range(coords.shape[1]):
+        valid = step_idx < lengths
+        if not bool(valid.any()):
+            continue
+        center_y = coords[:, step_idx, 0].float()[:, None, None]
+        center_x = coords[:, step_idx, 1].float()[:, None, None]
+        scale = coords[:, step_idx, 2].float().clamp(min=min_scale, max=1.0)
+        half_extent = scale[:, None, None]
+        in_footprint = (
+            valid[:, None, None]
+            & ((yy[None] - center_y).abs() <= half_extent)
+            & ((xx[None] - center_x).abs() <= half_extent)
+        )
+        detail = (min_scale / scale).view(batch_size, 1, 1)
+        coverage = torch.maximum(coverage, torch.where(in_footprint, detail, coverage))
+    return (1.0 - coverage.clamp(0.0, 1.0))[:, None].contiguous()
+
+
 def empty_viewpoint_history(
     *,
     batch_size: int,
