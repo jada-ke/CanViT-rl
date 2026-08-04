@@ -133,14 +133,20 @@ class CanvasStateEncoder(nn.Module):
         rff_dim: int,
         rff_seed: int,
         use_entropy_state: bool = False,
+        aux_state_channels: int | None = None,
         use_canvas_avg_pool: bool = True,
         use_canvas_max_pool: bool = True,
     ) -> None:
         super().__init__()
         if not use_canvas_avg_pool and not use_canvas_max_pool:
             raise ValueError("At least one canvas pooling branch must be enabled.")
+        if aux_state_channels is None:
+            aux_state_channels = 1 if use_entropy_state else 0
+        if aux_state_channels < 0:
+            raise ValueError("aux_state_channels must be non-negative.")
         self.canvas_feature_dim = canvas_feature_dim
         self.use_entropy_state = use_entropy_state
+        self.aux_state_channels = aux_state_channels
         self.use_canvas_avg_pool = use_canvas_avg_pool
         self.use_canvas_max_pool = use_canvas_max_pool
         self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
@@ -167,9 +173,9 @@ class CanvasStateEncoder(nn.Module):
             hidden_size=d_model,
             batch_first=True,
         )
-        if use_entropy_state:
+        if aux_state_channels > 0:
             self.entropy_stem = nn.Sequential(
-                nn.Conv2d(1, d_model, kernel_size=1),
+                nn.Conv2d(aux_state_channels, d_model, kernel_size=1),
                 nn.GELU(),
                 nn.Conv2d(d_model, d_model, kernel_size=3, padding=1),
                 nn.GELU(),
@@ -182,7 +188,7 @@ class CanvasStateEncoder(nn.Module):
                 nn.GELU(),
                 nn.LayerNorm(d_model),
             )
-        self.out_norm = nn.LayerNorm((3 if use_entropy_state else 2) * d_model)
+        self.out_norm = nn.LayerNorm((3 if aux_state_channels > 0 else 2) * d_model)
 
     @property
     def output_dim(self) -> int:
@@ -223,9 +229,15 @@ class CanvasStateEncoder(nn.Module):
         history_z = history_seq[batch_ids, last_step]
         history_z = history_z * (lengths > 0).float()[:, None]
         state_parts = [canvas_z, history_z]
-        if self.use_entropy_state:
+        if self.aux_state_channels > 0:
             if "entropy" not in batch:
                 raise KeyError("CanvasStateEncoder requires batch['entropy'].")
+            if batch["entropy"].shape[1] != self.aux_state_channels:
+                raise ValueError(
+                    "CanvasStateEncoder expected "
+                    f"{self.aux_state_channels} aux channel(s), got "
+                    f"{batch['entropy'].shape[1]}."
+                )
             entropy_features = self.entropy_stem(batch["entropy"].float())
             entropy_z = self.entropy_proj(self.entropy_pool(entropy_features))
             state_parts.append(entropy_z)
@@ -246,6 +258,7 @@ class CanvasStateActor(nn.Module):
         rff_dim: int,
         rff_seed: int,
         use_entropy_state: bool = False,
+        aux_state_channels: int | None = None,
         use_canvas_avg_pool: bool = True,
         use_canvas_max_pool: bool = True,
     ) -> None:
@@ -256,6 +269,7 @@ class CanvasStateActor(nn.Module):
             rff_dim=rff_dim,
             rff_seed=rff_seed,
             use_entropy_state=use_entropy_state,
+            aux_state_channels=aux_state_channels,
             use_canvas_avg_pool=use_canvas_avg_pool,
             use_canvas_max_pool=use_canvas_max_pool,
         )
@@ -300,6 +314,7 @@ class CanvasStateCritic(nn.Module):
         rff_seed: int,
         use_action_location_features: bool = False,
         use_entropy_state: bool = False,
+        aux_state_channels: int | None = None,
         use_canvas_avg_pool: bool = True,
         use_canvas_max_pool: bool = True,
     ) -> None:
@@ -311,6 +326,7 @@ class CanvasStateCritic(nn.Module):
             rff_dim=rff_dim,
             rff_seed=rff_seed,
             use_entropy_state=use_entropy_state,
+            aux_state_channels=aux_state_channels,
             use_canvas_avg_pool=use_canvas_avg_pool,
             use_canvas_max_pool=use_canvas_max_pool,
         )

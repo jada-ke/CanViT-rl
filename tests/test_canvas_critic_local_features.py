@@ -1,7 +1,7 @@
 import torch
 
 from canvit_rl.canvas.sac import CanvasReplayBuffer
-from canvit_rl.canvas.state import scale_aware_detail_debt
+from canvit_rl.canvas.state import canvas_cosine_dissimilarity, scale_aware_detail_debt
 from canvit_rl.pretrain_IN21k.checkpoints import load_dense_sac_critic_initializer
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
@@ -84,6 +84,36 @@ def test_canvas_entropy_state_is_opt_in_for_actor_and_critic():
     assert q.shape == (2,)
 
 
+def test_canvas_aux_state_can_use_two_channels():
+    actor = CanvasStateActor(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_entropy_state=True,
+        aux_state_channels=2,
+    )
+    critic = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_entropy_state=True,
+        aux_state_channels=2,
+    )
+    batch = _batch()
+    batch["entropy"] = torch.rand(2, 2, 5, 5)
+
+    mean, log_std = actor(batch)
+    q = critic(batch, torch.zeros(2, 3))
+
+    assert actor.encoder.entropy_stem[0].in_channels == 2
+    assert critic.encoder.entropy_stem[0].in_channels == 2
+    assert mean.shape == (2, 3)
+    assert log_std.shape == (2, 3)
+    assert q.shape == (2,)
+
+
 def test_canvas_pooling_branches_are_optional_but_not_both_disabled():
     base = CanvasStateActor(
         canvas_feature_dim=4,
@@ -157,6 +187,37 @@ def test_canvas_replay_buffer_samples_optional_entropy_state():
     assert sample["next_entropy"].shape == (2, 1, 5, 5)
 
 
+def test_canvas_replay_buffer_samples_two_channel_aux_state():
+    replay = CanvasReplayBuffer(
+        capacity=4,
+        max_history=3,
+        canvas_feature_dim=4,
+        canvas_grid_size=5,
+        storage_device=torch.device("cpu"),
+        store_entropy=True,
+        entropy_channels=2,
+    )
+    batch = _batch()
+
+    replay.add_batch(
+        canvas=batch["canvas"],
+        coords=batch["coords"],
+        lengths=batch["lengths"],
+        actions=torch.zeros(2, 3),
+        rewards=torch.ones(2),
+        next_canvas=batch["canvas"] + 1.0,
+        next_coords=batch["coords"],
+        next_lengths=batch["lengths"],
+        dones=torch.zeros(2),
+        entropy=torch.rand(2, 2, 5, 5),
+        next_entropy=torch.rand(2, 2, 5, 5),
+    )
+    sample = replay.sample(2, torch.device("cpu"))
+
+    assert sample["entropy"].shape == (2, 2, 5, 5)
+    assert sample["next_entropy"].shape == (2, 2, 5, 5)
+
+
 def test_scale_aware_detail_debt_allows_finer_revisits():
     coords = torch.tensor(
         [
@@ -179,6 +240,18 @@ def test_scale_aware_detail_debt_allows_finer_revisits():
     assert debt.shape == (1, 1, 5, 5)
     assert torch.isclose(debt[0, 0, 0, 0], torch.tensor(0.75))
     assert torch.isclose(debt[0, 0, 2, 2], torch.tensor(0.0))
+
+
+def test_canvas_cosine_dissimilarity_is_zero_for_matching_maps():
+    current = torch.randn(2, 4, 5, 5)
+
+    dissimilarity = canvas_cosine_dissimilarity(
+        current=current,
+        previous=current.clone(),
+    )
+
+    assert dissimilarity.shape == (2, 1, 5, 5)
+    assert torch.allclose(dissimilarity, torch.zeros_like(dissimilarity), atol=1e-6)
 
 
 def test_dense_sac_critic_initializer_loads_q_weights_and_syncs_targets(tmp_path):

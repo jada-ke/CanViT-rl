@@ -91,6 +91,26 @@ def scale_aware_detail_debt(
     return (1.0 - coverage.clamp(0.0, 1.0))[:, None].contiguous()
 
 
+def canvas_cosine_dissimilarity(
+    *,
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Return per-cell cosine dissimilarity between two canvas feature maps."""
+    if current.shape != previous.shape:
+        raise ValueError(
+            f"Canvas maps must have matching shapes, got {current.shape} and {previous.shape}."
+        )
+    # Problem: detail debt says where resolution is still owed, but not whether
+    # the last glimpse changed the representation. Solution: add a label-free
+    # per-cell feature-change map from current-vs-previous cosine distance.
+    # Result: policies can separately learn planned coverage and observed novelty.
+    return (1.0 - F.cosine_similarity(current.float(), previous.float(), dim=1, eps=eps))[
+        :, None
+    ].contiguous()
+
+
 def empty_viewpoint_history(
     *,
     batch_size: int,

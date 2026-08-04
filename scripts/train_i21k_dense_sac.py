@@ -72,6 +72,7 @@ from canvit_rl.canvas.sac import (
 from canvit_rl.canvas.eval import viewpoint_entropy
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
+    canvas_cosine_dissimilarity,
     canvas_layernorm_spatial,
     empty_viewpoint_history,
     scale_aware_detail_debt,
@@ -267,6 +268,11 @@ def parse_args() -> argparse.Namespace:
             "Append a scale-aware coverage/detail-debt map to the Canvas SAC state."
         ),
     )
+    parser.add_argument(
+        "--cos-prev",
+        action="store_true",
+        help="Append current-vs-previous canvas cosine dissimilarity to the Canvas SAC state.",
+    )
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument("--disable-canvas-avg-pool", action="store_true")
     parser.add_argument("--disable-canvas-max-pool", action="store_true")
@@ -354,9 +360,9 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--resume cannot be combined with --init-critic-checkpoint.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
-    if args.canvas_entropy_state and args.detail_debt:
+    if args.canvas_entropy_state and (args.detail_debt or args.cos_prev):
         raise ValueError(
-            "--canvas-entropy-state and --detail-debt are mutually exclusive."
+            "--canvas-entropy-state cannot be combined with --detail-debt or --cos-prev."
         )
     if args.debug_viz_images < 0 or args.debug_viz_batches < 0:
         raise ValueError("--debug-viz-images and --debug-viz-batches must be non-negative.")
@@ -672,7 +678,14 @@ def dense_canvas_entropy_map(
 
 def uses_canvas_aux_state(args: argparse.Namespace) -> bool:
     """Return whether the single-channel Canvas actor auxiliary branch is active."""
-    return bool(args.canvas_entropy_state or args.detail_debt)
+    return bool(args.canvas_entropy_state or args.detail_debt or args.cos_prev)
+
+
+def canvas_aux_channels(args: argparse.Namespace) -> int:
+    """Return the number of aux-state channels selected by CLI flags."""
+    if args.canvas_entropy_state:
+        return 1
+    return int(args.detail_debt) + int(args.cos_prev)
 
 
 def canvas_aux_state_map(
@@ -684,15 +697,31 @@ def canvas_aux_state_map(
     coords: torch.Tensor,
     lengths: torch.Tensor,
     canvas_grid_size: int,
+    canvas_summary: torch.Tensor | None = None,
+    prev_canvas_summary: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    """Build the configured single-channel Canvas actor auxiliary map."""
+    """Build the configured Canvas actor auxiliary map."""
+    parts: list[torch.Tensor] = []
     if args.detail_debt:
-        return scale_aware_detail_debt(
-            coords=coords,
-            lengths=lengths,
-            canvas_grid_size=canvas_grid_size,
-            min_scale=args.min_scale,
+        parts.append(
+            scale_aware_detail_debt(
+                coords=coords,
+                lengths=lengths,
+                canvas_grid_size=canvas_grid_size,
+                min_scale=args.min_scale,
+            )
         )
+    if args.cos_prev:
+        if canvas_summary is None or prev_canvas_summary is None:
+            raise ValueError("--cos-prev requires current and previous canvas summaries.")
+        parts.append(
+            canvas_cosine_dissimilarity(
+                current=canvas_summary,
+                previous=prev_canvas_summary,
+            )
+        )
+    if parts:
+        return torch.cat(parts, dim=1).contiguous()
     if args.canvas_entropy_state:
         return dense_canvas_entropy_map(
             model=model,
@@ -1186,6 +1215,7 @@ def maybe_save_dense_policy_glimpses(
                     )
                     sample_state = out.state
                     sample_metrics = next_metrics
+                    sample_prev_canvas = sample_canvas
                     sample_canvas = canvas_layernorm_spatial(
                         model=model,
                         state=sample_state,
@@ -1205,6 +1235,8 @@ def maybe_save_dense_policy_glimpses(
                         coords=sample_coords,
                         lengths=sample_lengths,
                         canvas_grid_size=canvas_grid_size,
+                        canvas_summary=sample_canvas,
+                        prev_canvas_summary=sample_prev_canvas,
                     )
                 overview_ax = axes[sample_idx, 0]
                 overview_ax.imshow(image_np)
@@ -1425,6 +1457,7 @@ def build_agent(args: argparse.Namespace, canvas_feature_dim: int, device: torch
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
         use_entropy_state=uses_canvas_aux_state(args),
+        aux_state_channels=canvas_aux_channels(args),
         use_canvas_avg_pool=not args.disable_canvas_avg_pool,
         use_canvas_max_pool=not args.disable_canvas_max_pool,
     )
@@ -1532,6 +1565,11 @@ def evaluate_dense_sac(
                 device=device,
             )
             full_vp = Viewpoint.full_scene(batch_size=batch_size, device=device)
+            initial_canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=canvas_grid_size,
+            )
             full_glimpse = sample_at_viewpoint(
                 spatial=batch.images,
                 viewpoint=full_vp,
@@ -1576,6 +1614,8 @@ def evaluate_dense_sac(
                 coords=coords,
                 lengths=lengths,
                 canvas_grid_size=canvas_grid_size,
+                canvas_summary=canvas_summary,
+                prev_canvas_summary=initial_canvas_summary,
             )
             episode_reward = torch.zeros(batch_size, device=device)
             for step_idx in range(args.t):
@@ -1738,6 +1778,7 @@ def evaluate_dense_sac(
                                     scale_percentile.detach().cpu().reshape(1)
                                 )
                 current_metrics = next_metrics
+                prev_canvas_summary = canvas_summary
                 canvas_summary = canvas_layernorm_spatial(
                     model=model,
                     state=state,
@@ -1757,6 +1798,8 @@ def evaluate_dense_sac(
                     coords=coords,
                     lengths=lengths,
                     canvas_grid_size=canvas_grid_size,
+                    canvas_summary=canvas_summary,
+                    prev_canvas_summary=prev_canvas_summary,
                 )
             initial_norm.append(initial_metrics.loss_norm.detach().cpu())
             final_norm.append(current_metrics.loss_norm.detach().cpu())
@@ -1875,6 +1918,7 @@ def train_once(args: argparse.Namespace) -> None:
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=G,
         include_entropy=uses_canvas_aux_state(args),
+        entropy_channels=canvas_aux_channels(args),
     )
     replay_device = resolve_replay_device(train_device=device, replay_bytes=replay_bytes)
     validate_replay_memory(storage_device=replay_device, replay_bytes=replay_bytes)
@@ -1896,6 +1940,7 @@ def train_once(args: argparse.Namespace) -> None:
         canvas_grid_size=G,
         storage_device=replay_device,
         store_entropy=uses_canvas_aux_state(args),
+        entropy_channels=canvas_aux_channels(args),
         pin_memory=replay_pin_memory,
     )
     print(
@@ -1943,6 +1988,11 @@ def train_once(args: argparse.Namespace) -> None:
         )
         full_vp = Viewpoint.full_scene(batch_size=batch_size, device=device)
         with torch.inference_mode():
+            initial_canvas_summary = canvas_layernorm_spatial(
+                model=model,
+                state=state,
+                canvas_grid_size=G,
+            )
             full_glimpse = sample_at_viewpoint(
                 spatial=batch.images,
                 viewpoint=full_vp,
@@ -1986,6 +2036,8 @@ def train_once(args: argparse.Namespace) -> None:
             coords=coords,
             lengths=lengths,
             canvas_grid_size=G,
+            canvas_summary=canvas_summary,
+            prev_canvas_summary=initial_canvas_summary,
         )
         should_log_reward_maps = args.reward_map_images > 0 and batch_idx >= next_reward_map_batch
         if should_log_reward_maps:
@@ -2010,6 +2062,11 @@ def train_once(args: argparse.Namespace) -> None:
                 reward_map_batch_size = reward_map_batch.images.shape[0]
                 reward_map_state = model.init_state(
                     batch_size=reward_map_batch_size,
+                    canvas_grid_size=G,
+                )
+                reward_map_initial_canvas = canvas_layernorm_spatial(
+                    model=model,
+                    state=reward_map_state,
                     canvas_grid_size=G,
                 )
                 reward_map_coords, reward_map_lengths = empty_viewpoint_history(
@@ -2071,6 +2128,8 @@ def train_once(args: argparse.Namespace) -> None:
                     coords=reward_map_coords,
                     lengths=reward_map_lengths,
                     canvas_grid_size=G,
+                    canvas_summary=reward_map_canvas,
+                    prev_canvas_summary=reward_map_initial_canvas,
                 )
             maybe_save_dense_reward_maps(
                 args=args,
@@ -2192,6 +2251,8 @@ def train_once(args: argparse.Namespace) -> None:
                 coords=coords,
                 lengths=lengths,
                 canvas_grid_size=G,
+                canvas_summary=next_canvas_summary,
+                prev_canvas_summary=prev_canvas,
             )
             done = torch.full(
                 (batch_size,),

@@ -28,6 +28,7 @@ def replay_canvas_bytes(
     canvas_feature_dim: int,
     canvas_grid_size: int,
     include_entropy: bool = False,
+    entropy_channels: int = 1,
 ) -> int:
     """Return bytes for current + next canvas/entropy replay tensors."""
     canvas_bytes = (
@@ -40,9 +41,12 @@ def replay_canvas_bytes(
     )
     if not include_entropy:
         return canvas_bytes
+    if entropy_channels < 1:
+        raise ValueError("entropy_channels must be positive when entropy is stored.")
     entropy_bytes = (
         2
         * capacity
+        * entropy_channels
         * canvas_grid_size
         * canvas_grid_size
         * REPLAY_STORAGE_DTYPE_BYTES
@@ -97,13 +101,17 @@ class CanvasReplayBuffer:
         canvas_grid_size: int,
         storage_device: torch.device,
         store_entropy: bool = False,
+        entropy_channels: int = 1,
         pin_memory: bool = False,
     ) -> None:
         self.capacity = capacity
         self.storage_device = storage_device
         self.store_entropy = store_entropy
+        self.entropy_channels = entropy_channels
         self.pin_memory = pin_memory and storage_device.type == "cpu"
         self._sample_staging: dict[tuple[int, int], torch.Tensor] = {}
+        if store_entropy and entropy_channels < 1:
+            raise ValueError("entropy_channels must be positive when entropy is stored.")
 
         # Problem: CPU replay avoids VRAM pressure but pageable host tensors
         # make every sampled mini-batch copy block the trainer.
@@ -118,7 +126,7 @@ class CanvasReplayBuffer:
         self.next_canvas = self._zeros_like(self.canvas)
         if store_entropy:
             self.entropy = self._zeros(
-                (capacity, 1, canvas_grid_size, canvas_grid_size),
+                (capacity, entropy_channels, canvas_grid_size, canvas_grid_size),
                 dtype=REPLAY_STORAGE_DTYPE,
             )
             self.next_entropy = self._zeros_like(self.entropy)
@@ -230,6 +238,16 @@ class CanvasReplayBuffer:
             if entropy is None or next_entropy is None:
                 raise ValueError(
                     "Entropy replay is enabled but entropy tensors are missing."
+                )
+            if entropy.shape[1] != self.entropy_channels:
+                raise ValueError(
+                    f"Expected entropy with {self.entropy_channels} channel(s), "
+                    f"got {entropy.shape[1]}."
+                )
+            if next_entropy.shape[1] != self.entropy_channels:
+                raise ValueError(
+                    f"Expected next_entropy with {self.entropy_channels} channel(s), "
+                    f"got {next_entropy.shape[1]}."
                 )
             assert self.entropy is not None and self.next_entropy is not None
             # Problem: entropy-state runs need Bellman updates from replay, not

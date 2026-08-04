@@ -11,6 +11,26 @@ from canvit_rl.canvas.sac import CanvasSAC
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 
+def _dense_state_representation(args: argparse.Namespace) -> str:
+    """Return the Canvas state representation label stored in dense SAC checkpoints."""
+    if getattr(args, "detail_debt", False) and getattr(args, "cos_prev", False):
+        return "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history"
+    if getattr(args, "detail_debt", False):
+        return "current_canvas_layernorm_detail_debt_with_viewpoint_history"
+    if getattr(args, "cos_prev", False):
+        return "current_canvas_layernorm_cos_prev_with_viewpoint_history"
+    if getattr(args, "canvas_entropy_state", False):
+        return "current_canvas_layernorm_entropy_with_viewpoint_history"
+    return "current_canvas_layernorm_with_viewpoint_history"
+
+
+def _dense_aux_state_channels(args: argparse.Namespace) -> int:
+    """Return the optional aux-state channel count for checkpoint reconstruction."""
+    if getattr(args, "canvas_entropy_state", False):
+        return 1
+    return int(getattr(args, "detail_debt", False)) + int(getattr(args, "cos_prev", False))
+
+
 def save_dense_sac_checkpoint(
     *,
     path: Path,
@@ -44,15 +64,12 @@ def save_dense_sac_checkpoint(
             "batch": batch,
             "updates": updates,
             "metrics": metrics,
-            "state_representation": (
-                "current_canvas_layernorm_detail_debt_with_viewpoint_history"
-                if getattr(args, "detail_debt", False)
-                else (
-                    "current_canvas_layernorm_entropy_with_viewpoint_history"
-                    if getattr(args, "canvas_entropy_state", False)
-                    else "current_canvas_layernorm_with_viewpoint_history"
-                )
-            ),
+            # Problem: dense SAC now has several aux-map ablations that share
+            # the legacy replay key. Solution: persist both a descriptive state
+            # label and the channel count. Result: ADE eval can rebuild the
+            # actor shape and aux map order without relying on CLI guesses.
+            "state_representation": _dense_state_representation(args),
+            "aux_state_channels": _dense_aux_state_channels(args),
             "reward": getattr(args, "reward_mode", "raw_mse_l0_delta"),
         },
         path,
