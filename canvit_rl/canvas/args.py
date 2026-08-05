@@ -84,6 +84,14 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--disable-viewpoint-history-state",
+        action="store_true",
+        help=(
+            "Remove the explicit VPE/GRU viewpoint-history embedding from "
+            "CanvasStateActor/Critic inputs for canvas-only state ablations."
+        ),
+    )
+    parser.add_argument(
         "--disable-canvas-avg-pool",
         action="store_true",
         help="Remove the adaptive-average canvas pooling branch from CanvasStateEncoder.",

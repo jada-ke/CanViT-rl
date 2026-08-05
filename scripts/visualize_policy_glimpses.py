@@ -547,6 +547,8 @@ def _build_learned_actor_from_checkpoint(
     )
     canvas_state_representations = {
         "current_canvas",
+        "current_canvas_layernorm",
+        "current_canvas_layernorm_entropy",
         "current_canvas_layernorm_with_viewpoint_history",
         "current_canvas_layernorm_entropy_with_viewpoint_history",
     }
@@ -575,13 +577,28 @@ def _build_learned_actor_from_checkpoint(
             use_entropy_state=bool(
                 checkpoint_args.get("canvas_entropy_state", False)
                 or state_representation
-                == "current_canvas_layernorm_entropy_with_viewpoint_history"
+                in {
+                    "current_canvas_layernorm_entropy",
+                    "current_canvas_layernorm_entropy_with_viewpoint_history",
+                }
             ),
             use_canvas_avg_pool=not bool(
                 checkpoint_args.get("disable_canvas_avg_pool", False)
             ),
             use_canvas_max_pool=not bool(
                 checkpoint_args.get("disable_canvas_max_pool", False)
+            ),
+            use_viewpoint_history=(
+                state_representation.endswith("_with_viewpoint_history")
+                or (
+                    state_representation == "current_canvas"
+                    and not bool(
+                        checkpoint_args.get(
+                            "disable_viewpoint_history_state",
+                            False,
+                        )
+                    )
+                )
             ),
         ).to(device).eval()
         actor.load_state_dict(payload["actor"])
@@ -591,6 +608,8 @@ def _build_learned_actor_from_checkpoint(
             in {
                 "current_canvas_layernorm_with_viewpoint_history",
                 "current_canvas_layernorm_entropy_with_viewpoint_history",
+                "current_canvas_layernorm",
+                "current_canvas_layernorm_entropy",
             }
             else "canvas-bc"
         )

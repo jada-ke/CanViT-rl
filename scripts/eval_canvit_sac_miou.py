@@ -110,12 +110,33 @@ def _is_canvas_checkpoint(payload: dict[str, Any]) -> bool:
         )
     )
     return state_representation in {
+        "current_canvas_layernorm",
+        "current_canvas_layernorm_entropy",
+        "current_canvas_layernorm_detail_debt",
+        "current_canvas_layernorm_cos_prev",
+        "current_canvas_layernorm_detail_debt_cos_prev",
         "current_canvas_layernorm_with_viewpoint_history",
         "current_canvas_layernorm_entropy_with_viewpoint_history",
         "current_canvas_layernorm_detail_debt_with_viewpoint_history",
         "current_canvas_layernorm_cos_prev_with_viewpoint_history",
         "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history",
     }
+
+
+def _canvas_uses_viewpoint_history(
+    payload: dict[str, Any],
+    checkpoint_args: dict[str, Any],
+) -> bool:
+    """Return whether a Canvas checkpoint encoded explicit viewpoint history."""
+    state_representation = str(
+        payload.get(
+            "state_representation",
+            payload.get("metadata", {}).get("state_representation", ""),
+        )
+    )
+    if state_representation.startswith("current_canvas_layernorm"):
+        return state_representation.endswith("_with_viewpoint_history")
+    return not bool(checkpoint_args.get("disable_viewpoint_history_state", False))
 
 
 def _canvas_aux_state_kind(
@@ -129,15 +150,25 @@ def _canvas_aux_state_kind(
             payload.get("metadata", {}).get("state_representation", ""),
         )
     )
-    if state_representation == (
-        "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history"
-    ):
+    if state_representation in {
+        "current_canvas_layernorm_detail_debt_cos_prev",
+        "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history",
+    }:
         return ("detail_debt", "cos_prev")
-    if state_representation == "current_canvas_layernorm_detail_debt_with_viewpoint_history":
+    if state_representation in {
+        "current_canvas_layernorm_detail_debt",
+        "current_canvas_layernorm_detail_debt_with_viewpoint_history",
+    }:
         return ("detail_debt",)
-    if state_representation == "current_canvas_layernorm_cos_prev_with_viewpoint_history":
+    if state_representation in {
+        "current_canvas_layernorm_cos_prev",
+        "current_canvas_layernorm_cos_prev_with_viewpoint_history",
+    }:
         return ("cos_prev",)
-    if state_representation == "current_canvas_layernorm_entropy_with_viewpoint_history":
+    if state_representation in {
+        "current_canvas_layernorm_entropy",
+        "current_canvas_layernorm_entropy_with_viewpoint_history",
+    }:
         return ("segmentation_entropy",)
     if checkpoint_args.get("detail_debt", False) or checkpoint_args.get(
         "canvas_detail_debt_state",
@@ -278,6 +309,14 @@ def _build_canvas_actor(
         ),
         use_canvas_max_pool=not bool(
             _checkpoint_value(checkpoint_args, "disable-canvas-max-pool", False)
+        ),
+        # Problem: canvas-only checkpoints have smaller actor heads than the
+        # default canvas+history architecture. Solution: derive the history
+        # branch from saved state metadata. Result: mIoU eval can load both core
+        # state ablations without extra manual architecture flags.
+        use_viewpoint_history=_canvas_uses_viewpoint_history(
+            payload,
+            checkpoint_args,
         ),
     ).to(device).eval()
     actor.load_state_dict(actor_state)

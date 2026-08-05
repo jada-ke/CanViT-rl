@@ -13,15 +13,20 @@ from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 def _dense_state_representation(args: argparse.Namespace) -> str:
     """Return the Canvas state representation label stored in dense SAC checkpoints."""
+    history_suffix = (
+        "_with_viewpoint_history"
+        if not getattr(args, "disable_viewpoint_history_state", False)
+        else ""
+    )
     if getattr(args, "detail_debt", False) and getattr(args, "cos_prev", False):
-        return "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history"
+        return f"current_canvas_layernorm_detail_debt_cos_prev{history_suffix}"
     if getattr(args, "detail_debt", False):
-        return "current_canvas_layernorm_detail_debt_with_viewpoint_history"
+        return f"current_canvas_layernorm_detail_debt{history_suffix}"
     if getattr(args, "cos_prev", False):
-        return "current_canvas_layernorm_cos_prev_with_viewpoint_history"
+        return f"current_canvas_layernorm_cos_prev{history_suffix}"
     if getattr(args, "canvas_entropy_state", False):
-        return "current_canvas_layernorm_entropy_with_viewpoint_history"
-    return "current_canvas_layernorm_with_viewpoint_history"
+        return f"current_canvas_layernorm_entropy{history_suffix}"
+    return f"current_canvas_layernorm{history_suffix}"
 
 
 def _dense_aux_state_channels(args: argparse.Namespace) -> int:

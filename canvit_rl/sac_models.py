@@ -123,7 +123,7 @@ class ContinuousCritic(nn.Module):
 
 
 class CanvasStateEncoder(nn.Module):
-    """Encode current CanViT canvas plus compact viewpoint history."""
+    """Encode current CanViT canvas plus optional compact viewpoint history."""
 
     def __init__(
         self,
@@ -136,6 +136,7 @@ class CanvasStateEncoder(nn.Module):
         aux_state_channels: int | None = None,
         use_canvas_avg_pool: bool = True,
         use_canvas_max_pool: bool = True,
+        use_viewpoint_history: bool = True,
     ) -> None:
         super().__init__()
         if not use_canvas_avg_pool and not use_canvas_max_pool:
@@ -149,7 +150,7 @@ class CanvasStateEncoder(nn.Module):
         self.aux_state_channels = aux_state_channels
         self.use_canvas_avg_pool = use_canvas_avg_pool
         self.use_canvas_max_pool = use_canvas_max_pool
-        self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
+        self.use_viewpoint_history = use_viewpoint_history
         self.canvas_stem = nn.Sequential(
             nn.Conv2d(canvas_feature_dim, d_model, kernel_size=1),
             nn.GELU(),
@@ -168,11 +169,13 @@ class CanvasStateEncoder(nn.Module):
             nn.GELU(),
             nn.LayerNorm(d_model),
         )
-        self.history_gru = nn.GRU(
-            input_size=self.vpe.output_dim,
-            hidden_size=d_model,
-            batch_first=True,
-        )
+        if use_viewpoint_history:
+            self.vpe = VPEEncoder(rff_dim=rff_dim, seed=rff_seed)
+            self.history_gru = nn.GRU(
+                input_size=self.vpe.output_dim,
+                hidden_size=d_model,
+                batch_first=True,
+            )
         if aux_state_channels > 0:
             self.entropy_stem = nn.Sequential(
                 nn.Conv2d(aux_state_channels, d_model, kernel_size=1),
@@ -188,7 +191,8 @@ class CanvasStateEncoder(nn.Module):
                 nn.GELU(),
                 nn.LayerNorm(d_model),
             )
-        self.out_norm = nn.LayerNorm((3 if aux_state_channels > 0 else 2) * d_model)
+        state_part_count = 1 + int(use_viewpoint_history) + int(aux_state_channels > 0)
+        self.out_norm = nn.LayerNorm(state_part_count * d_model)
 
     @property
     def output_dim(self) -> int:
@@ -200,9 +204,6 @@ class CanvasStateEncoder(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return pooled state features plus the pre-pool canvas feature map."""
         canvas = batch["canvas"]
-        coords = batch["coords"]
-        lengths = batch["lengths"]
-        _, seq_len, _ = coords.shape
         canvas_features = self.canvas_stem(canvas.float())
         # Problem: avg and max pooling emphasize different canvas evidence,
         # but ablations sometimes need one branch removed. Solution: build the
@@ -215,20 +216,30 @@ class CanvasStateEncoder(nn.Module):
             canvas_pool_parts.append(self.canvas_max_pool(canvas_features))
         canvas_pooled = torch.cat(canvas_pool_parts, dim=1)
         canvas_z = self.canvas_proj(canvas_pooled)
-        vpe = self.vpe(
-            y=coords[..., 0].float(),
-            x=coords[..., 1].float(),
-            s=coords[..., 2].float().clamp_min(1e-6),
-        )
-        step_ids = torch.arange(seq_len, device=canvas.device)[None, :]
-        valid_steps = step_ids < lengths[:, None]
-        vpe = vpe * valid_steps[..., None].float()
-        history_seq, _ = self.history_gru(vpe)
-        last_step = lengths.clamp_min(1).sub(1).clamp_max(seq_len - 1)
-        batch_ids = torch.arange(coords.shape[0], device=coords.device)
-        history_z = history_seq[batch_ids, last_step]
-        history_z = history_z * (lengths > 0).float()[:, None]
-        state_parts = [canvas_z, history_z]
+        state_parts = [canvas_z]
+        if self.use_viewpoint_history:
+            coords = batch["coords"]
+            lengths = batch["lengths"]
+            _, seq_len, _ = coords.shape
+            # Problem: core-state ablations need the current canvas without an
+            # explicit Viewpoint-history embedding. Solution: gate the VPE/GRU
+            # branch behind use_viewpoint_history. Result: rollouts can still
+            # maintain history for CanViT bookkeeping while actor/critic state
+            # can be canvas-only when requested.
+            vpe = self.vpe(
+                y=coords[..., 0].float(),
+                x=coords[..., 1].float(),
+                s=coords[..., 2].float().clamp_min(1e-6),
+            )
+            step_ids = torch.arange(seq_len, device=canvas.device)[None, :]
+            valid_steps = step_ids < lengths[:, None]
+            vpe = vpe * valid_steps[..., None].float()
+            history_seq, _ = self.history_gru(vpe)
+            last_step = lengths.clamp_min(1).sub(1).clamp_max(seq_len - 1)
+            batch_ids = torch.arange(coords.shape[0], device=coords.device)
+            history_z = history_seq[batch_ids, last_step]
+            history_z = history_z * (lengths > 0).float()[:, None]
+            state_parts.append(history_z)
         if self.aux_state_channels > 0:
             if "entropy" not in batch:
                 raise KeyError("CanvasStateEncoder requires batch['entropy'].")
@@ -261,6 +272,7 @@ class CanvasStateActor(nn.Module):
         aux_state_channels: int | None = None,
         use_canvas_avg_pool: bool = True,
         use_canvas_max_pool: bool = True,
+        use_viewpoint_history: bool = True,
     ) -> None:
         super().__init__()
         self.encoder = CanvasStateEncoder(
@@ -272,6 +284,7 @@ class CanvasStateActor(nn.Module):
             aux_state_channels=aux_state_channels,
             use_canvas_avg_pool=use_canvas_avg_pool,
             use_canvas_max_pool=use_canvas_max_pool,
+            use_viewpoint_history=use_viewpoint_history,
         )
         self.head = nn.Sequential(
             nn.Linear(self.encoder.output_dim, d_model),
@@ -317,6 +330,7 @@ class CanvasStateCritic(nn.Module):
         aux_state_channels: int | None = None,
         use_canvas_avg_pool: bool = True,
         use_canvas_max_pool: bool = True,
+        use_viewpoint_history: bool = True,
     ) -> None:
         super().__init__()
         self.use_action_location_features = use_action_location_features
@@ -329,6 +343,7 @@ class CanvasStateCritic(nn.Module):
             aux_state_channels=aux_state_channels,
             use_canvas_avg_pool=use_canvas_avg_pool,
             use_canvas_max_pool=use_canvas_max_pool,
+            use_viewpoint_history=use_viewpoint_history,
         )
         q_input_dim = self.encoder.output_dim + 3
         if use_action_location_features:

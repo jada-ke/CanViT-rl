@@ -11,6 +11,17 @@ from canvit_rl.canvas.sac import CanvasSAC
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
 
+def canvas_state_representation(args: argparse.Namespace) -> str:
+    """Return the saved label for Canvas SAC actor/critic state inputs."""
+    history_suffix = (
+        "_with_viewpoint_history"
+        if not getattr(args, "disable_viewpoint_history_state", False)
+        else ""
+    )
+    aux_suffix = "_entropy" if getattr(args, "canvas_entropy_state", False) else ""
+    return f"current_canvas_layernorm{aux_suffix}{history_suffix}"
+
+
 def save_canvas_sac_checkpoint(
     *,
     path: Path,
@@ -48,11 +59,11 @@ def save_canvas_sac_checkpoint(
             "selection_metric": "eval/final_ce",
             "selection_mode": "min",
             "eval_metrics": eval_metrics or {},
-            "state_representation": (
-                "current_canvas_layernorm_entropy_with_viewpoint_history"
-                if getattr(args, "canvas_entropy_state", False)
-                else "current_canvas_layernorm_with_viewpoint_history"
-            ),
+            # Problem: core-state ablations now alter actor/critic input shape.
+            # Solution: persist a state label that records whether explicit
+            # Viewpoint history was encoded. Result: eval/visualization can
+            # rebuild the matching CanvasStateActor without CLI guesswork.
+            "state_representation": canvas_state_representation(args),
         },
         path,
     )

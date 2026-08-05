@@ -276,6 +276,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--viewpoint-entropy-bins", type=int, default=8)
     parser.add_argument("--disable-canvas-avg-pool", action="store_true")
     parser.add_argument("--disable-canvas-max-pool", action="store_true")
+    parser.add_argument(
+        "--disable-viewpoint-history-state",
+        action="store_true",
+        help=(
+            "Remove the explicit VPE/GRU viewpoint-history embedding from "
+            "CanvasStateActor/Critic inputs for canvas-only state ablations."
+        ),
+    )
     parser.add_argument("--actor-lr", type=float, default=3e-4)
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
@@ -1460,6 +1468,11 @@ def build_agent(args: argparse.Namespace, canvas_feature_dim: int, device: torch
         aux_state_channels=canvas_aux_channels(args),
         use_canvas_avg_pool=not args.disable_canvas_avg_pool,
         use_canvas_max_pool=not args.disable_canvas_max_pool,
+        # Problem: dense Canvas SAC shared the same hardwired history branch as
+        # ADE Canvas SAC. Solution: expose the same ablation switch here so the
+        # actor/critics can consume canvas and optional aux maps without VPE
+        # history. Result: dense runs can match the core state-ablation matrix.
+        use_viewpoint_history=not args.disable_viewpoint_history_state,
     )
     actor = CanvasStateActor(**actor_common).to(device)
     critic_common = dict(

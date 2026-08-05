@@ -151,6 +151,11 @@ def build_canvas_sac_networks(
         use_entropy_state=getattr(args, "canvas_entropy_state", False),
         use_canvas_avg_pool=not getattr(args, "disable_canvas_avg_pool", False),
         use_canvas_max_pool=not getattr(args, "disable_canvas_max_pool", False),
+        use_viewpoint_history=not getattr(
+            args,
+            "disable_viewpoint_history_state",
+            False,
+        ),
     )
     actor = CanvasStateActor(**kwargs).to(device)
     if (

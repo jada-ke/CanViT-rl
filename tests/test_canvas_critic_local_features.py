@@ -84,6 +84,63 @@ def test_canvas_entropy_state_is_opt_in_for_actor_and_critic():
     assert q.shape == (2,)
 
 
+def test_canvas_viewpoint_history_state_can_be_disabled():
+    actor = CanvasStateActor(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_viewpoint_history=False,
+    )
+    critic = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_viewpoint_history=False,
+    )
+
+    mean, log_std = actor(_batch())
+    q = critic(_batch(), torch.zeros(2, 3))
+
+    assert actor.encoder.output_dim == 8
+    assert not hasattr(actor.encoder, "history_gru")
+    assert critic.q[0].normalized_shape == (11,)
+    assert mean.shape == (2, 3)
+    assert log_std.shape == (2, 3)
+    assert q.shape == (2,)
+
+
+def test_canvas_entropy_state_without_viewpoint_history():
+    actor = CanvasStateActor(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_entropy_state=True,
+        use_viewpoint_history=False,
+    )
+    critic = CanvasStateCritic(
+        canvas_feature_dim=4,
+        d_model=8,
+        rff_dim=4,
+        rff_seed=0,
+        use_entropy_state=True,
+        use_viewpoint_history=False,
+    )
+    batch = _batch()
+    batch["entropy"] = torch.rand(2, 1, 5, 5)
+
+    mean, log_std = actor(batch)
+    q = critic(batch, torch.zeros(2, 3))
+
+    assert actor.encoder.output_dim == 16
+    assert critic.q[0].normalized_shape == (19,)
+    assert mean.shape == (2, 3)
+    assert log_std.shape == (2, 3)
+    assert q.shape == (2,)
+
+
 def test_canvas_aux_state_can_use_two_channels():
     actor = CanvasStateActor(
         canvas_feature_dim=4,

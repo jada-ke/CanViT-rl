@@ -290,6 +290,8 @@ def _build_actor_and_critics(
         payload.get("target", payload.get("metadata", {}).get("target", "raw_ce_gain"))
     )
     if state_representation in {
+        "current_canvas_layernorm",
+        "current_canvas_layernorm_entropy",
         "current_canvas_layernorm_with_viewpoint_history",
         "current_canvas_layernorm_entropy_with_viewpoint_history",
     }:
@@ -307,13 +309,29 @@ def _build_actor_and_critics(
             use_entropy_state=bool(
                 saved_args.get("canvas_entropy_state", False)
                 or state_representation
-                == "current_canvas_layernorm_entropy_with_viewpoint_history"
+                in {
+                    "current_canvas_layernorm_entropy",
+                    "current_canvas_layernorm_entropy_with_viewpoint_history",
+                }
             ),
             use_canvas_avg_pool=not bool(
                 saved_args.get("disable_canvas_avg_pool", False)
             ),
             use_canvas_max_pool=not bool(
                 saved_args.get("disable_canvas_max_pool", False)
+            ),
+            # Problem: reward-map tools need the same CanvasStateEncoder shape
+            # as training. Solution: reconstruct the optional VPE-history
+            # branch from the saved state label or legacy args. Result:
+            # canvas-only reward maps can load actor and critic checkpoints.
+            use_viewpoint_history=(
+                state_representation.endswith("_with_viewpoint_history")
+                or (
+                    state_representation == "current_canvas"
+                    and not bool(
+                        saved_args.get("disable_viewpoint_history_state", False)
+                    )
+                )
             ),
         )
         actor = CanvasStateActor(**kwargs).to(device).eval() if "actor" in payload else None
