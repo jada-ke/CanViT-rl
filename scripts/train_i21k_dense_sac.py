@@ -1540,6 +1540,7 @@ def evaluate_dense_sac(
     final_norm: list[torch.Tensor] = []
     initial_raw: list[torch.Tensor] = []
     final_raw: list[torch.Tensor] = []
+    pretrain_objective_norm_sums: list[torch.Tensor] = []
     rewards: list[torch.Tensor] = []
     actor_reward_percentiles: list[torch.Tensor] = []
     actor_scale_percentiles: list[torch.Tensor] = []
@@ -1631,6 +1632,16 @@ def evaluate_dense_sac(
                 prev_canvas_summary=initial_canvas_summary,
             )
             episode_reward = torch.zeros(batch_size, device=device)
+            # Problem: final_loss_norm only measures the last rollout state,
+            # while the original CanViT pretraining objective averages the
+            # standardized scene+CLS MSE over all processed glimpses.
+            # Solution: accumulate the same normalized scene+CLS state loss
+            # after the full-scene warmup and each policy-selected glimpse.
+            # Result: future evals log a pretraining-objective-style episode
+            # mean without changing the existing final-state diagnostics.
+            pretrain_objective_norm_sum = (
+                initial_metrics.scene_loss_norm + initial_metrics.cls_loss_norm
+            )
             for step_idx in range(args.t):
                 obs = {"canvas": canvas_summary, "coords": coords, "lengths": lengths}
                 if canvas_entropy is not None:
@@ -1662,6 +1673,9 @@ def evaluate_dense_sac(
                     cls_denorm=cls_norm.destandardize,
                     scene_weight=args.scene_reward_weight,
                     cls_weight=args.cls_reward_weight,
+                )
+                pretrain_objective_norm_sum = pretrain_objective_norm_sum + (
+                    next_metrics.scene_loss_norm + next_metrics.cls_loss_norm
                 )
                 step_reward = dense_reward(
                     mode=args.reward_mode,
@@ -1818,6 +1832,9 @@ def evaluate_dense_sac(
             final_norm.append(current_metrics.loss_norm.detach().cpu())
             initial_raw.append(initial_metrics.loss_raw.detach().cpu())
             final_raw.append(current_metrics.loss_raw.detach().cpu())
+            pretrain_objective_norm_sums.append(
+                (pretrain_objective_norm_sum / (args.t + 1)).detach().cpu()
+            )
             rewards.append(episode_reward.detach().cpu())
     if actor_was_training:
         actor.train()
@@ -1825,6 +1842,7 @@ def evaluate_dense_sac(
     final_norm_t = torch.cat(final_norm)
     initial_raw_t = torch.cat(initial_raw)
     final_raw_t = torch.cat(final_raw)
+    pretrain_objective_norm_t = torch.cat(pretrain_objective_norm_sums)
     reward_t = torch.cat(rewards)
     metrics = {
         "eval/reward": float(reward_t.mean().item()),
@@ -1838,6 +1856,9 @@ def evaluate_dense_sac(
         "eval/final_loss_raw": float(final_raw_t.mean().item()),
         "eval/loss_raw_reduction": float(
             (initial_raw_t.mean() - final_raw_t.mean()).item()
+        ),
+        "eval/pretrain_objective_norm_mean": float(
+            pretrain_objective_norm_t.mean().item()
         ),
         "eval/viewpoint_entropy": viewpoint_entropy(
             entropy_points,
