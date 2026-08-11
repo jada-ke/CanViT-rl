@@ -1580,7 +1580,7 @@ def evaluate_dense_sac(
     final_norm: list[torch.Tensor] = []
     initial_raw: list[torch.Tensor] = []
     final_raw: list[torch.Tensor] = []
-    pretrain_objective_norm_sums: list[torch.Tensor] = []
+    norm_mean_sums: list[torch.Tensor] = []
     rewards: list[torch.Tensor] = []
     step_rewards: list[torch.Tensor] = []
     reward_denominators: list[torch.Tensor] = []
@@ -1675,13 +1675,13 @@ def evaluate_dense_sac(
             )
             episode_reward = torch.zeros(batch_size, device=device)
             # Problem: final_loss_norm only measures the last rollout state,
-            # while the original CanViT pretraining objective averages the
-            # standardized scene+CLS MSE over all processed glimpses.
+            # while norm_mean should track standardized scene+CLS MSE averaged
+            # over all processed glimpses.
             # Solution: accumulate the same normalized scene+CLS state loss
             # after the full-scene warmup and each policy-selected glimpse.
-            # Result: future evals log a pretraining-objective-style episode
-            # mean without changing the existing final-state diagnostics.
-            pretrain_objective_norm_sum = (
+            # Result: evals log norm_mean without changing the existing
+            # final-state diagnostics.
+            norm_mean_sum = (
                 initial_metrics.scene_loss_norm + initial_metrics.cls_loss_norm
             )
             for step_idx in range(args.t):
@@ -1716,7 +1716,7 @@ def evaluate_dense_sac(
                     scene_weight=args.scene_reward_weight,
                     cls_weight=args.cls_reward_weight,
                 )
-                pretrain_objective_norm_sum = pretrain_objective_norm_sum + (
+                norm_mean_sum = norm_mean_sum + (
                     next_metrics.scene_loss_norm + next_metrics.cls_loss_norm
                 )
                 step_reward = dense_reward(
@@ -1885,8 +1885,8 @@ def evaluate_dense_sac(
             final_norm.append(current_metrics.loss_norm.detach().cpu())
             initial_raw.append(initial_metrics.loss_raw.detach().cpu())
             final_raw.append(current_metrics.loss_raw.detach().cpu())
-            pretrain_objective_norm_sums.append(
-                (pretrain_objective_norm_sum / (args.t + 1)).detach().cpu()
+            norm_mean_sums.append(
+                (norm_mean_sum / (args.t + 1)).detach().cpu()
             )
             rewards.append(episode_reward.detach().cpu())
     if actor_was_training:
@@ -1895,7 +1895,7 @@ def evaluate_dense_sac(
     final_norm_t = torch.cat(final_norm)
     initial_raw_t = torch.cat(initial_raw)
     final_raw_t = torch.cat(final_raw)
-    pretrain_objective_norm_t = torch.cat(pretrain_objective_norm_sums)
+    norm_mean_t = torch.cat(norm_mean_sums)
     reward_t = torch.cat(rewards)
     step_reward_t = torch.cat(step_rewards)
     metrics = {
@@ -1913,8 +1913,8 @@ def evaluate_dense_sac(
         "eval/loss_raw_reduction": float(
             (initial_raw_t.mean() - final_raw_t.mean()).item()
         ),
-        "eval/pretrain_objective_norm_mean": float(
-            pretrain_objective_norm_t.mean().item()
+        "eval/norm_mean": float(
+            norm_mean_t.mean().item()
         ),
         "eval/viewpoint_entropy": viewpoint_entropy(
             entropy_points,
@@ -2063,6 +2063,11 @@ def train_once(args: argparse.Namespace) -> None:
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     reward_window: list[float] = []
     reward_denominator_window: list[float] = []
+    train_final_loss_windows: dict[str, list[float]] = {
+        "final_loss_norm": [],
+        "norm_mean": [],
+        "final_loss_raw": [],
+    }
     entropy_points: list[np.ndarray] = []
     scale_sums = [0.0 for _ in range(args.t)]
     scale_counts = [0 for _ in range(args.t)]
@@ -2399,6 +2404,27 @@ def train_once(args: argparse.Namespace) -> None:
             canvas_summary = next_canvas_summary
             canvas_entropy = next_canvas_entropy
 
+        # Problem: train tracking did not mirror the eval endpoint losses.
+        # Solution: collect the same final_loss_norm, norm_mean, and
+        # final_loss_raw values over each train log window. Result: train and
+        # eval curves use matching metric names with different prefixes.
+        train_final_loss_windows["final_loss_norm"].extend(
+            current_metrics.loss_norm.detach().cpu().numpy().astype(float).tolist()
+        )
+        train_final_loss_windows["norm_mean"].extend(
+            (
+                current_metrics.scene_loss_norm + current_metrics.cls_loss_norm
+            )
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(float)
+            .tolist()
+        )
+        train_final_loss_windows["final_loss_raw"].extend(
+            current_metrics.loss_raw.detach().cpu().numpy().astype(float).tolist()
+        )
+
         maybe_save_debug_rollout_viz(
             args=args,
             comet_exp=comet_exp,
@@ -2442,6 +2468,10 @@ def train_once(args: argparse.Namespace) -> None:
                         "train/reward_denominator/min": float(denominator_np.min()),
                     }
                 )
+            for loss_name, values in train_final_loss_windows.items():
+                if values:
+                    loss_np = np.asarray(values, dtype=np.float64)
+                    latest_metrics[f"train/{loss_name}"] = float(loss_np.mean())
             latest_metrics["throughput/glimpses_per_sec"] = glimpses / max(elapsed, 1e-12)
             latest_metrics["train/viewpoint_entropy"] = viewpoint_entropy(
                 entropy_points,
@@ -2455,6 +2485,8 @@ def train_once(args: argparse.Namespace) -> None:
                 comet_exp.log_metrics(latest_metrics, step=glimpses)
             reward_window.clear()
             reward_denominator_window.clear()
+            for values in train_final_loss_windows.values():
+                values.clear()
             entropy_points.clear()
             scale_sums = [0.0 for _ in range(args.t)]
             scale_counts = [0 for _ in range(args.t)]
