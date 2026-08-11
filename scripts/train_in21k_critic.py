@@ -81,6 +81,7 @@ REWARD_MODES = [
     "norm_loss_log_delta_clipped",
     "norm_loss_log_delta_tanh",
     "norm_loss_reduction",
+    "norm_loss_eps_reduction",
     "norm_loss_tanh_reduction",
     "norm_loss_l0_delta",
     "norm_loss_clipped_l0_delta",
@@ -199,6 +200,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-scale", type=float, default=0.25)
     parser.add_argument("--reward-mode", choices=REWARD_MODES, default="raw_mse_log_delta")
     parser.add_argument("--reward-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--reward-reduction-eps",
+        type=float,
+        default=0.0,
+        help="Additive denominator epsilon for norm_loss_eps_reduction.",
+    )
     parser.add_argument("--reward-log-clip", type=float, default=1.0)
     parser.add_argument("--reward-l0-clip", type=float, default=1.0)
     parser.add_argument("--reward-tanh-scale", type=float, default=1.0)
@@ -303,6 +310,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--critic-pairwise-margin must be positive.")
     if args.critic_listwise_temperature <= 0.0:
         raise ValueError("--critic-listwise-temperature must be positive.")
+    if args.reward_reduction_eps < 0.0:
+        raise ValueError("--reward-reduction-eps must be non-negative.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
     return args
@@ -470,6 +479,7 @@ def _candidate_rewards_and_next(
             after=after_metrics,
             l0=episode_l0.repeat(k),
             eps=args.reward_eps,
+            reduction_eps=args.reward_reduction_eps,
             log_clip=args.reward_log_clip,
             l0_clip=args.reward_l0_clip,
             tanh_scale=args.reward_tanh_scale,

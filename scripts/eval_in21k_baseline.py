@@ -220,6 +220,7 @@ def parse_args() -> argparse.Namespace:
             "norm_loss_log_delta_clipped",
             "norm_loss_log_delta_tanh",
             "norm_loss_reduction",
+            "norm_loss_eps_reduction",
             "norm_loss_tanh_reduction",
             "norm_loss_l0_delta",
             "norm_loss_clipped_l0_delta",
@@ -228,6 +229,12 @@ def parse_args() -> argparse.Namespace:
         default="raw_mse_log_delta",
     )
     parser.add_argument("--reward-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--reward-reduction-eps",
+        type=float,
+        default=0.0,
+        help="Additive denominator epsilon for norm_loss_eps_reduction.",
+    )
     parser.add_argument("--reward-log-clip", type=float, default=1.0)
     parser.add_argument("--reward-l0-clip", type=float, default=1.0)
     parser.add_argument("--reward-tanh-scale", type=float, default=1.0)
@@ -275,6 +282,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--reward-map-chunk-size must be positive.")
     if args.viewpoint_entropy_bins < 1:
         raise ValueError("--viewpoint-entropy-bins must be positive.")
+    if args.reward_reduction_eps < 0.0:
+        raise ValueError("--reward-reduction-eps must be non-negative.")
     if args.reward_log_clip <= 0.0:
         raise ValueError("--reward-log-clip must be positive.")
     if args.reward_l0_clip <= 0.0:

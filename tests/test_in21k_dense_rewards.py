@@ -2,6 +2,8 @@ import torch
 
 from canvit_rl.pretrain_IN21k.reward import (
     DenseDistillationMetrics,
+    dense_loss_eps_reduction_reward,
+    dense_loss_reduction_reward,
     dense_loss_tanh_reduction_reward,
     dense_reward,
 )
@@ -47,3 +49,45 @@ def test_dense_reward_dispatches_norm_loss_tanh_reduction() -> None:
     )
 
     torch.testing.assert_close(actual, torch.tanh(torch.tensor([0.5])))
+
+
+def test_dense_loss_eps_reduction_adds_tunable_denominator_epsilon() -> None:
+    before = _metrics(norm=[2.0, 0.5])
+    after = _metrics(norm=[1.0, 0.75])
+
+    expected = torch.tensor([1.0, -0.5]) / torch.tensor([2.5, 1.0])
+
+    actual = dense_loss_eps_reduction_reward(
+        before,
+        after,
+        reduction_eps=0.5,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dense_loss_eps_reduction_matches_reduction_when_regularizer_is_zero() -> None:
+    before = _metrics(norm=[2.0, 0.5])
+    after = _metrics(norm=[1.0, 0.75])
+
+    actual = dense_loss_eps_reduction_reward(
+        before,
+        after,
+        reduction_eps=0.0,
+    )
+
+    torch.testing.assert_close(actual, dense_loss_reduction_reward(before, after))
+
+
+def test_dense_reward_dispatches_norm_loss_eps_reduction() -> None:
+    before = _metrics(norm=[4.0])
+    after = _metrics(norm=[3.0])
+
+    actual = dense_reward(
+        mode="norm_loss_eps_reduction",
+        before=before,
+        after=after,
+        reduction_eps=1.0,
+    )
+
+    torch.testing.assert_close(actual, torch.tensor([0.2]))

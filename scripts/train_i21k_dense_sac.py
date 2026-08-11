@@ -234,6 +234,7 @@ def parse_args() -> argparse.Namespace:
             "norm_loss_log_delta_clipped",
             "norm_loss_log_delta_tanh",
             "norm_loss_reduction",
+            "norm_loss_eps_reduction",
             "norm_loss_tanh_reduction",
             "norm_loss_l0_delta",
             "norm_loss_clipped_l0_delta",
@@ -242,6 +243,12 @@ def parse_args() -> argparse.Namespace:
         default="raw_mse_l0_delta",
     )
     parser.add_argument("--reward-eps", type=float, default=1e-6)
+    parser.add_argument(
+        "--reward-reduction-eps",
+        type=float,
+        default=0.0,
+        help="Additive denominator epsilon for norm_loss_eps_reduction.",
+    )
     parser.add_argument("--reward-log-clip", type=float, default=1.0)
     parser.add_argument("--reward-l0-clip", type=float, default=1.0)
     parser.add_argument("--reward-tanh-scale", type=float, default=1.0)
@@ -383,6 +390,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--reward-map-chunk-size must be positive.")
     if args.reward_map_interval is not None and args.reward_map_interval < 1:
         raise ValueError("--reward-map-interval must be positive.")
+    if args.reward_reduction_eps < 0.0:
+        raise ValueError("--reward-reduction-eps must be non-negative.")
     if args.reward_log_clip <= 0.0:
         raise ValueError("--reward-log-clip must be positive.")
     if args.reward_l0_clip <= 0.0:
@@ -630,6 +639,33 @@ def _eval_display_loss_for_reward_mode(mode: str) -> tuple[str, str]:
     return "final_loss_raw", "eval/final_loss_raw"
 
 
+def _reward_denominator_for_logging(
+    *,
+    mode: str,
+    metrics: DenseDistillationMetrics,
+    l0: torch.Tensor,
+    reward_eps: float,
+    reward_reduction_eps: float,
+) -> torch.Tensor | None:
+    """Return the active reward denominator when a mode has one worth auditing."""
+    # Problem: reward smoothness comparisons need to verify whether denominator
+    # regularization actually damps the late-training scale. Solution: expose
+    # the denominator used by reduction/l0-style rewards as a scalar diagnostic.
+    # Result: Comet can show reward variance together with the scale that
+    # produced it, without changing replay rewards.
+    if mode == "norm_loss_eps_reduction":
+        return (metrics.loss_norm + reward_reduction_eps).clamp_min(reward_eps)
+    if mode in {"norm_loss_reduction", "norm_loss_tanh_reduction"}:
+        return metrics.loss_norm.clamp_min(reward_eps)
+    if mode in {
+        "norm_loss_l0_delta",
+        "norm_loss_clipped_l0_delta",
+        "norm_loss_tanh_l0_delta",
+    }:
+        return l0.clamp_min(reward_eps)
+    return None
+
+
 def _corr(x: np.ndarray, y: np.ndarray) -> float:
     """Pearson correlation for flattened maps, or nan for constant maps."""
     finite = np.isfinite(x) & np.isfinite(y)
@@ -810,6 +846,7 @@ def _evaluate_dense_reward_grid(
                 after=after_metrics,
                 l0=l0.expand(repeats),
                 eps=args.reward_eps,
+                reduction_eps=args.reward_reduction_eps,
                 log_clip=args.reward_log_clip,
                 l0_clip=args.reward_l0_clip,
                 tanh_scale=args.reward_tanh_scale,
@@ -931,6 +968,7 @@ def _evaluate_dense_reward_viewpoints(
                 after=after_metrics,
                 l0=l0.expand(repeats),
                 eps=args.reward_eps,
+                reduction_eps=args.reward_reduction_eps,
                 log_clip=args.reward_log_clip,
                 l0_clip=args.reward_l0_clip,
                 tanh_scale=args.reward_tanh_scale,
@@ -1210,6 +1248,7 @@ def maybe_save_dense_policy_glimpses(
                         after=next_metrics,
                         l0=sample_l0,
                         eps=args.reward_eps,
+                        reduction_eps=args.reward_reduction_eps,
                         log_clip=args.reward_log_clip,
                         l0_clip=args.reward_l0_clip,
                         tanh_scale=args.reward_tanh_scale,
@@ -1543,6 +1582,8 @@ def evaluate_dense_sac(
     final_raw: list[torch.Tensor] = []
     pretrain_objective_norm_sums: list[torch.Tensor] = []
     rewards: list[torch.Tensor] = []
+    step_rewards: list[torch.Tensor] = []
+    reward_denominators: list[torch.Tensor] = []
     actor_reward_percentiles: list[torch.Tensor] = []
     actor_scale_percentiles: list[torch.Tensor] = []
     actor_reward_gaps: list[torch.Tensor] = []
@@ -1684,10 +1725,21 @@ def evaluate_dense_sac(
                     after=next_metrics,
                     l0=episode_l0,
                     eps=args.reward_eps,
+                    reduction_eps=args.reward_reduction_eps,
                     log_clip=args.reward_log_clip,
                     l0_clip=args.reward_l0_clip,
                     tanh_scale=args.reward_tanh_scale,
                 )
+                step_rewards.append(step_reward.detach().cpu())
+                reward_denominator = _reward_denominator_for_logging(
+                    mode=args.reward_mode,
+                    metrics=metrics_before_step,
+                    l0=episode_l0,
+                    reward_eps=args.reward_eps,
+                    reward_reduction_eps=args.reward_reduction_eps,
+                )
+                if reward_denominator is not None:
+                    reward_denominators.append(reward_denominator.detach().cpu())
                 episode_reward = episode_reward + step_reward
                 if should_compute_actor_reward_percentiles:
                     for sample_idx in range(batch_size):
@@ -1845,9 +1897,12 @@ def evaluate_dense_sac(
     final_raw_t = torch.cat(final_raw)
     pretrain_objective_norm_t = torch.cat(pretrain_objective_norm_sums)
     reward_t = torch.cat(rewards)
+    step_reward_t = torch.cat(step_rewards)
     metrics = {
         "eval/reward": float(reward_t.mean().item()),
         "eval/reward_std": float(reward_t.std(unbiased=False).item()),
+        "eval/step_reward_mean": float(step_reward_t.mean().item()),
+        "eval/step_reward_std": float(step_reward_t.std(unbiased=False).item()),
         "eval/initial_loss_norm": float(initial_norm_t.mean().item()),
         "eval/final_loss_norm": float(final_norm_t.mean().item()),
         "eval/loss_norm_reduction": float(
@@ -1866,6 +1921,24 @@ def evaluate_dense_sac(
             bins=args.viewpoint_entropy_bins,
         ),
     }
+    if reward_denominators:
+        reward_denominator_t = torch.cat(reward_denominators)
+        metrics.update(
+            {
+                "eval/reward_denominator_mean": float(
+                    reward_denominator_t.mean().item()
+                ),
+                "eval/reward_denominator_std": float(
+                    reward_denominator_t.std(unbiased=False).item()
+                ),
+                "eval/reward_denominator_min": float(
+                    reward_denominator_t.min().item()
+                ),
+                "eval/reward_denominator_max": float(
+                    reward_denominator_t.max().item()
+                ),
+            }
+        )
     if actor_reward_percentiles:
         actor_reward_percentile_t = torch.cat(actor_reward_percentiles)
         metrics["eval/actor_reward_percentile"] = float(
@@ -1989,6 +2062,7 @@ def train_once(args: argparse.Namespace) -> None:
     comet_exp = make_dense_comet_experiment(args)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     reward_window: list[float] = []
+    reward_denominator_window: list[float] = []
     entropy_points: list[np.ndarray] = []
     scale_sums = [0.0 for _ in range(args.t)]
     scale_counts = [0 for _ in range(args.t)]
@@ -2261,9 +2335,17 @@ def train_once(args: argparse.Namespace) -> None:
                 after=next_metrics,
                 l0=episode_l0,
                 eps=args.reward_eps,
+                reduction_eps=args.reward_reduction_eps,
                 log_clip=args.reward_log_clip,
                 l0_clip=args.reward_l0_clip,
                 tanh_scale=args.reward_tanh_scale,
+            )
+            reward_denominator = _reward_denominator_for_logging(
+                mode=args.reward_mode,
+                metrics=current_metrics,
+                l0=episode_l0,
+                reward_eps=args.reward_eps,
+                reward_reduction_eps=args.reward_reduction_eps,
             )
             rollout_viewpoints.append(
                 Viewpoint(
@@ -2308,6 +2390,10 @@ def train_once(args: argparse.Namespace) -> None:
                 next_entropy=next_canvas_entropy,
             )
             reward_window.extend(reward.detach().cpu().numpy().astype(float).tolist())
+            if reward_denominator is not None:
+                reward_denominator_window.extend(
+                    reward_denominator.detach().cpu().numpy().astype(float).tolist()
+                )
             state = out.state
             current_metrics = next_metrics
             canvas_summary = next_canvas_summary
@@ -2346,6 +2432,16 @@ def train_once(args: argparse.Namespace) -> None:
                         "train/online_reward/min": float(reward_np.min()),
                     }
                 )
+            if reward_denominator_window:
+                denominator_np = np.asarray(reward_denominator_window, dtype=np.float64)
+                latest_metrics.update(
+                    {
+                        "train/reward_denominator/mean": float(denominator_np.mean()),
+                        "train/reward_denominator/std": float(denominator_np.std()),
+                        "train/reward_denominator/max": float(denominator_np.max()),
+                        "train/reward_denominator/min": float(denominator_np.min()),
+                    }
+                )
             latest_metrics["throughput/glimpses_per_sec"] = glimpses / max(elapsed, 1e-12)
             latest_metrics["train/viewpoint_entropy"] = viewpoint_entropy(
                 entropy_points,
@@ -2358,6 +2454,7 @@ def train_once(args: argparse.Namespace) -> None:
             if comet_exp is not None and latest_metrics:
                 comet_exp.log_metrics(latest_metrics, step=glimpses)
             reward_window.clear()
+            reward_denominator_window.clear()
             entropy_points.clear()
             scale_sums = [0.0 for _ in range(args.t)]
             scale_counts = [0 for _ in range(args.t)]

@@ -101,6 +101,23 @@ def dense_loss_reduction_reward(
     return (before.loss_norm - after.loss_norm) / before.loss_norm.clamp_min(eps)
 
 
+def dense_loss_eps_reduction_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+    reduction_eps: float = 0.0,
+) -> Tensor:
+    """Epsilon-regularized normalized reduction: delta / (L[t-1] + epsilon)."""
+    # Problem: norm_loss_reduction can amplify tiny late-stage loss changes
+    # because its denominator tracks the current loss exactly. Solution: add a
+    # tunable denominator epsilon while still flooring the result for numerical
+    # safety. Result: epsilon=0 recovers norm_loss_reduction, and larger values
+    # smoothly damp reward variance without switching to an l0 denominator.
+    denominator = (before.loss_norm + reduction_eps).clamp_min(eps)
+    return (before.loss_norm - after.loss_norm) / denominator
+
+
 def dense_loss_tanh_reduction_reward(
     before: DenseDistillationMetrics,
     after: DenseDistillationMetrics,
@@ -312,6 +329,7 @@ def dense_reward(
     after: DenseDistillationMetrics,
     l0: Tensor | None = None,
     eps: float = 1e-6,
+    reduction_eps: float = 0.0,
     log_clip: float = 1.0,
     l0_clip: float = 1.0,
     tanh_scale: float = 1.0,
@@ -357,6 +375,13 @@ def dense_reward(
         return dense_raw_mse_reduction_reward(before, after, eps=eps)
     if mode == "norm_loss_reduction":
         return dense_loss_reduction_reward(before, after, eps=eps)
+    if mode == "norm_loss_eps_reduction":
+        return dense_loss_eps_reduction_reward(
+            before,
+            after,
+            eps=eps,
+            reduction_eps=reduction_eps,
+        )
     if mode == "norm_loss_tanh_reduction":
         return dense_loss_tanh_reduction_reward(
             before,
