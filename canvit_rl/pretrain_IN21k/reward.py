@@ -101,6 +101,23 @@ def dense_loss_reduction_reward(
     return (before.loss_norm - after.loss_norm) / before.loss_norm.clamp_min(eps)
 
 
+def dense_loss_tanh_reduction_reward(
+    before: DenseDistillationMetrics,
+    after: DenseDistillationMetrics,
+    *,
+    eps: float = 1e-6,
+    scale: float = 1.0,
+) -> Tensor:
+    """Tanh-bounded step-relative normalized-space reduction."""
+    # Problem: norm_loss_reduction matched the myopic gamma=0 objective but had
+    # the noisiest curves in the reward-mode screen. Solution: keep the
+    # current-loss denominator and bound the proportional improvement with
+    # tanh(scale * reduction). Result: the reward tests whether smoothing the
+    # best current-state objective improves stability without switching to l0.
+    reward = dense_loss_reduction_reward(before, after, eps=eps)
+    return (scale * reward).tanh()
+
+
 def dense_loss_delta_reward(
     before: DenseDistillationMetrics,
     after: DenseDistillationMetrics,
@@ -340,6 +357,13 @@ def dense_reward(
         return dense_raw_mse_reduction_reward(before, after, eps=eps)
     if mode == "norm_loss_reduction":
         return dense_loss_reduction_reward(before, after, eps=eps)
+    if mode == "norm_loss_tanh_reduction":
+        return dense_loss_tanh_reduction_reward(
+            before,
+            after,
+            eps=eps,
+            scale=tanh_scale,
+        )
     if mode == "raw_mse_l0_delta":
         if l0 is None:
             raise ValueError(

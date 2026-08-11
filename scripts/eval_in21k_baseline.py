@@ -220,6 +220,7 @@ def parse_args() -> argparse.Namespace:
             "norm_loss_log_delta_clipped",
             "norm_loss_log_delta_tanh",
             "norm_loss_reduction",
+            "norm_loss_tanh_reduction",
             "norm_loss_l0_delta",
             "norm_loss_clipped_l0_delta",
             "norm_loss_tanh_l0_delta",

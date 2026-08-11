@@ -1,0 +1,49 @@
+import torch
+
+from canvit_rl.pretrain_IN21k.reward import (
+    DenseDistillationMetrics,
+    dense_loss_tanh_reduction_reward,
+    dense_reward,
+)
+
+
+def _metrics(*, norm: list[float], raw: list[float] | None = None) -> DenseDistillationMetrics:
+    values = torch.tensor(norm, dtype=torch.float32)
+    raw_values = torch.tensor(raw if raw is not None else norm, dtype=torch.float32)
+    return DenseDistillationMetrics(
+        scene_loss_norm=values,
+        cls_loss_norm=values,
+        loss_norm=values,
+        scene_loss_raw=raw_values,
+        cls_loss_raw=raw_values,
+        loss_raw=raw_values,
+    )
+
+
+def test_dense_loss_tanh_reduction_bounds_step_relative_reward() -> None:
+    before = _metrics(norm=[2.0, 0.5])
+    after = _metrics(norm=[1.0, 0.75])
+
+    # Problem: norm_loss_reduction is useful for gamma=0 myopic training but can
+    # expose SAC to large proportional rewards. Solution: tanh-bound the same
+    # step-relative reduction with the existing reward scale. Result: the mode
+    # preserves the current-state denominator while keeping rewards bounded.
+    expected = torch.tanh(torch.tensor([1.0, 1.0]) * torch.tensor([0.5, -0.5]))
+
+    actual = dense_loss_tanh_reduction_reward(before, after, scale=1.0)
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dense_reward_dispatches_norm_loss_tanh_reduction() -> None:
+    before = _metrics(norm=[4.0])
+    after = _metrics(norm=[3.0])
+
+    actual = dense_reward(
+        mode="norm_loss_tanh_reduction",
+        before=before,
+        after=after,
+        tanh_scale=2.0,
+    )
+
+    torch.testing.assert_close(actual, torch.tanh(torch.tensor([0.5])))
