@@ -24,14 +24,28 @@ def _dense_state_representation(args: argparse.Namespace) -> str:
         return f"current_canvas_layernorm_detail_debt{history_suffix}"
     if getattr(args, "cos_prev", False):
         return f"current_canvas_layernorm_cos_prev{history_suffix}"
-    if getattr(args, "canvas_entropy_state", False):
-        return f"current_canvas_layernorm_entropy{history_suffix}"
+    if getattr(args, "reconstruction_norm_state", False) or getattr(
+        args,
+        "canvas_entropy_state",
+        False,
+    ):
+        return f"current_canvas_layernorm_reconstruction_norm{history_suffix}"
+    if getattr(args, "teacher_reconstruction_error_state", False):
+        return f"current_canvas_layernorm_teacher_reconstruction_error{history_suffix}"
     return f"current_canvas_layernorm{history_suffix}"
 
 
 def _dense_aux_state_channels(args: argparse.Namespace) -> int:
     """Return the optional aux-state channel count for checkpoint reconstruction."""
-    if getattr(args, "canvas_entropy_state", False):
+    if getattr(args, "canvas_entropy_state", False) or getattr(
+        args,
+        "reconstruction_norm_state",
+        False,
+    ) or getattr(
+        args,
+        "teacher_reconstruction_error_state",
+        False,
+    ):
         return 1
     return int(getattr(args, "detail_debt", False)) + int(getattr(args, "cos_prev", False))
 

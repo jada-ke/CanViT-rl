@@ -41,6 +41,7 @@ from canvit_rl.env import CanViTEnvConfig, get_device
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_cosine_dissimilarity,
+    canvas_dinov3_reconstruction_norm,
     canvas_layernorm_spatial,
     canvas_segmentation_entropy,
     empty_viewpoint_history,
@@ -170,6 +171,16 @@ def _canvas_aux_state_kind(
         "current_canvas_layernorm_entropy_with_viewpoint_history",
     }:
         return ("segmentation_entropy",)
+    if state_representation in {
+        "current_canvas_layernorm_reconstruction_norm",
+        "current_canvas_layernorm_reconstruction_norm_with_viewpoint_history",
+    }:
+        return ("reconstruction_norm",)
+    if state_representation in {
+        "current_canvas_layernorm_teacher_reconstruction_error",
+        "current_canvas_layernorm_teacher_reconstruction_error_with_viewpoint_history",
+    }:
+        return ("teacher_reconstruction_error",)
     if checkpoint_args.get("detail_debt", False) or checkpoint_args.get(
         "canvas_detail_debt_state",
         False,
@@ -182,6 +193,10 @@ def _canvas_aux_state_kind(
         return ("cos_prev",)
     if checkpoint_args.get("canvas_entropy_state", False):
         return ("segmentation_entropy",)
+    if checkpoint_args.get("reconstruction_norm_state", False):
+        return ("reconstruction_norm",)
+    if checkpoint_args.get("teacher_reconstruction_error_state", False):
+        return ("teacher_reconstruction_error",)
     return ()
 
 
@@ -232,6 +247,20 @@ def _build_canvas_aux_state(
                     state=state,
                     canvas_grid_size=canvas_grid_size,
                 )
+            )
+        elif kind == "reconstruction_norm":
+            parts.append(
+                canvas_dinov3_reconstruction_norm(
+                    model=model,
+                    state=state,
+                    canvas_grid_size=canvas_grid_size,
+                )
+            )
+        elif kind == "teacher_reconstruction_error":
+            raise ValueError(
+                "Checkpoint uses teacher-reconstruction-error aux state, "
+                "which requires dense teacher targets and cannot be rebuilt "
+                "by ADE mIoU eval."
             )
         else:
             raise ValueError(f"Unknown canvas aux state kind: {kind}")

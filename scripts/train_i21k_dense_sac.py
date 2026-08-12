@@ -73,7 +73,9 @@ from canvit_rl.canvas.eval import viewpoint_entropy
 from canvit_rl.canvas.state import (
     append_viewpoint_history,
     canvas_cosine_dissimilarity,
+    canvas_dinov3_reconstruction_norm,
     canvas_layernorm_spatial,
+    canvas_teacher_reconstruction_error,
     empty_viewpoint_history,
     scale_aware_detail_debt,
 )
@@ -264,8 +266,24 @@ def parse_args() -> argparse.Namespace:
         "--canvas-entropy-state",
         action="store_true",
         help=(
-            "Append a normalized dense-feature reconstruction-error map to "
-            "the CanvasStateActor/Critic state under the existing entropy key."
+            "Legacy alias: append the normalized DINOv3 reconstructed-feature "
+            "norm map under the existing entropy replay key."
+        ),
+    )
+    parser.add_argument(
+        "--reconstruction-norm-state",
+        action="store_true",
+        help=(
+            "Append a normalized DINOv3 reconstructed-feature norm map to "
+            "the CanvasStateActor/Critic state."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-reconstruction-error-state",
+        action="store_true",
+        help=(
+            "Append a normalized per-patch MSE map between reconstructed "
+            "DINOv3 features and dense teacher targets."
         ),
     )
     parser.add_argument(
@@ -376,9 +394,22 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--resume cannot be combined with --init-critic-checkpoint.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
-    if args.canvas_entropy_state and (args.detail_debt or args.cos_prev):
+    if (
+        args.canvas_entropy_state
+        or args.reconstruction_norm_state
+        or args.teacher_reconstruction_error_state
+    ) and (args.detail_debt or args.cos_prev):
         raise ValueError(
-            "--canvas-entropy-state cannot be combined with --detail-debt or --cos-prev."
+            "--canvas-entropy-state/--reconstruction-norm-state/"
+            "--teacher-reconstruction-error-state cannot be combined with "
+            "--detail-debt or --cos-prev."
+        )
+    if args.teacher_reconstruction_error_state and (
+        args.canvas_entropy_state or args.reconstruction_norm_state
+    ):
+        raise ValueError(
+            "--teacher-reconstruction-error-state cannot be combined with "
+            "--canvas-entropy-state or --reconstruction-norm-state."
         )
     if args.debug_viz_images < 0 or args.debug_viz_batches < 0:
         raise ValueError("--debug-viz-images and --debug-viz-batches must be non-negative.")
@@ -701,34 +732,51 @@ def dense_canvas_entropy_map(
     canvas_grid_size: int,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Return normalized dense-feature error as [B, 1, G, G] uncertainty."""
-    scene_pred = model.predict_teacher_scene(state.canvas).float()
-    scene_target = batch.scene_target.float()
-    per_patch_error = (scene_pred - scene_target).pow(2).mean(dim=-1)
-    # Problem: IN21k dense SAC has no segmentation probe entropy Solution: feed a
-    # per-image min/max-normalized teacher-feature reconstruction error map
-    # through that branch. Result: the actor/critics receive spatial
-    # uncertainty
-    error_map = per_patch_error.reshape(
-        per_patch_error.shape[0],
-        1,
-        canvas_grid_size,
-        canvas_grid_size,
+    """Return reconstructed DINOv3 feature norm through the legacy entropy name."""
+    return canvas_dinov3_reconstruction_norm(
+        model=model,
+        state=state,
+        canvas_grid_size=canvas_grid_size,
+        eps=eps,
     )
-    flat = error_map.flatten(1)
-    min_val = flat.min(dim=1).values[:, None, None, None]
-    max_val = flat.max(dim=1).values[:, None, None, None]
-    return ((error_map - min_val) / (max_val - min_val).clamp_min(eps)).contiguous()
+
+
+def dense_teacher_reconstruction_error_map(
+    *,
+    model,
+    state,
+    batch: DenseTrainBatch,
+    canvas_grid_size: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Return normalized dense teacher-feature reconstruction MSE as [B, 1, G, G]."""
+    return canvas_teacher_reconstruction_error(
+        model=model,
+        state=state,
+        scene_target=batch.scene_target,
+        canvas_grid_size=canvas_grid_size,
+        eps=eps,
+    )
 
 
 def uses_canvas_aux_state(args: argparse.Namespace) -> bool:
     """Return whether the single-channel Canvas actor auxiliary branch is active."""
-    return bool(args.canvas_entropy_state or args.detail_debt or args.cos_prev)
+    return bool(
+        args.canvas_entropy_state
+        or args.reconstruction_norm_state
+        or args.teacher_reconstruction_error_state
+        or args.detail_debt
+        or args.cos_prev
+    )
 
 
 def canvas_aux_channels(args: argparse.Namespace) -> int:
     """Return the number of aux-state channels selected by CLI flags."""
-    if args.canvas_entropy_state:
+    if (
+        args.canvas_entropy_state
+        or args.reconstruction_norm_state
+        or args.teacher_reconstruction_error_state
+    ):
         return 1
     return int(args.detail_debt) + int(args.cos_prev)
 
@@ -767,8 +815,15 @@ def canvas_aux_state_map(
         )
     if parts:
         return torch.cat(parts, dim=1).contiguous()
-    if args.canvas_entropy_state:
+    if args.canvas_entropy_state or args.reconstruction_norm_state:
         return dense_canvas_entropy_map(
+            model=model,
+            state=state,
+            batch=batch,
+            canvas_grid_size=canvas_grid_size,
+        )
+    if args.teacher_reconstruction_error_state:
+        return dense_teacher_reconstruction_error_map(
             model=model,
             state=state,
             batch=batch,

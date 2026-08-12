@@ -1,7 +1,12 @@
 import torch
 
 from canvit_rl.canvas.sac import CanvasReplayBuffer
-from canvit_rl.canvas.state import canvas_cosine_dissimilarity, scale_aware_detail_debt
+from canvit_rl.canvas.state import (
+    canvas_cosine_dissimilarity,
+    canvas_dinov3_reconstruction_norm,
+    canvas_teacher_reconstruction_error,
+    scale_aware_detail_debt,
+)
 from canvit_rl.pretrain_IN21k.checkpoints import load_dense_sac_critic_initializer
 from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
 
@@ -139,6 +144,73 @@ def test_canvas_entropy_state_without_viewpoint_history():
     assert mean.shape == (2, 3)
     assert log_std.shape == (2, 3)
     assert q.shape == (2,)
+
+
+def test_canvas_dinov3_reconstruction_norm_is_target_free():
+    class DummyModel:
+        def predict_teacher_scene(self, canvas: torch.Tensor) -> torch.Tensor:
+            return canvas
+
+    class DummyState:
+        canvas = torch.tensor(
+            [
+                [
+                    [3.0, 4.0],
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [0.0, 2.0],
+                ]
+            ]
+        )
+
+    norm_map = canvas_dinov3_reconstruction_norm(
+        model=DummyModel(),
+        state=DummyState(),
+        canvas_grid_size=2,
+    )
+
+    expected = torch.tensor([[[[1.0, 0.0], [0.2, 0.4]]]])
+    assert torch.allclose(norm_map, expected)
+
+
+def test_dense_teacher_reconstruction_error_map_uses_targets():
+    class DummyModel:
+        def predict_teacher_scene(self, canvas: torch.Tensor) -> torch.Tensor:
+            return canvas
+
+    class DummyState:
+        canvas = torch.tensor(
+            [
+                [
+                    [3.0, 4.0],
+                    [1.0, 1.0],
+                    [2.0, 2.0],
+                    [0.0, 0.0],
+                ]
+            ]
+        )
+
+    class DummyBatch:
+        scene_target = torch.tensor(
+            [
+                [
+                    [3.0, 4.0],
+                    [0.0, 1.0],
+                    [0.0, 0.0],
+                    [0.0, 4.0],
+                ]
+            ]
+        )
+
+    error_map = canvas_teacher_reconstruction_error(
+        model=DummyModel(),
+        state=DummyState(),
+        scene_target=DummyBatch.scene_target,
+        canvas_grid_size=2,
+    )
+
+    expected = torch.tensor([[[[0.0, 0.125], [0.5, 1.0]]]])
+    assert torch.allclose(error_map, expected)
 
 
 def test_canvas_aux_state_can_use_two_channels():
