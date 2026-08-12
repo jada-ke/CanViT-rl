@@ -84,10 +84,6 @@ def canvas_teacher_reconstruction_error(
     """Return normalized teacher-feature reconstruction MSE as [B, 1, G, G]."""
     scene_pred = model.predict_teacher_scene(state.canvas).float()
     per_patch_error = (scene_pred - scene_target.float()).pow(2).mean(dim=-1)
-    # Problem: direct dense distillation error is useful as an aux state, but it
-    # requires teacher targets unlike reconstruction norm. Solution: keep this
-    # target-based map in its own helper and flag. Result: experiments can
-    # choose supervised error explicitly without changing the target-free path.
     error_map = per_patch_error.reshape(
         per_patch_error.shape[0],
         1,
