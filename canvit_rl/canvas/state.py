@@ -52,6 +52,54 @@ def canvas_segmentation_entropy(
     return entropy.contiguous()
 
 
+def canvas_dinov3_reconstruction_norm(
+    *,
+    model,
+    state,
+    canvas_grid_size: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Return normalized reconstructed DINOv3 feature norms as [B, 1, G, G]."""
+    scene_pred = model.predict_teacher_scene(state.canvas).float()
+    norm_map = scene_pred.norm(dim=-1).reshape(
+        scene_pred.shape[0],
+        1,
+        canvas_grid_size,
+        canvas_grid_size,
+    )
+    flat = norm_map.flatten(1)
+    min_val = flat.min(dim=1).values[:, None, None, None]
+    max_val = flat.max(dim=1).values[:, None, None, None]
+    return ((norm_map - min_val) / (max_val - min_val).clamp_min(eps)).contiguous()
+
+
+def canvas_teacher_reconstruction_error(
+    *,
+    model,
+    state,
+    scene_target: torch.Tensor,
+    canvas_grid_size: int,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Return normalized teacher-feature reconstruction MSE as [B, 1, G, G]."""
+    scene_pred = model.predict_teacher_scene(state.canvas).float()
+    per_patch_error = (scene_pred - scene_target.float()).pow(2).mean(dim=-1)
+    # Problem: direct dense distillation error is useful as an aux state, but it
+    # requires teacher targets unlike reconstruction norm. Solution: keep this
+    # target-based map in its own helper and flag. Result: experiments can
+    # choose supervised error explicitly without changing the target-free path.
+    error_map = per_patch_error.reshape(
+        per_patch_error.shape[0],
+        1,
+        canvas_grid_size,
+        canvas_grid_size,
+    )
+    flat = error_map.flatten(1)
+    min_val = flat.min(dim=1).values[:, None, None, None]
+    max_val = flat.max(dim=1).values[:, None, None, None]
+    return ((error_map - min_val) / (max_val - min_val).clamp_min(eps)).contiguous()
+
+
 def scale_aware_detail_debt(
     *,
     coords: torch.Tensor,
