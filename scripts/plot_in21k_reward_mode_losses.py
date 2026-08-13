@@ -545,6 +545,29 @@ def format_paired_difference_section(
     return lines
 
 
+def format_selected_reward_section() -> list[str]:
+    """Render the final reward-choice conclusion at the top of the report."""
+    # Problem: the ranking tables are regenerated as new JSON exports arrive,
+    # but the experimental conclusion lives in the discussion unless we write it
+    # into the artifact. Solution: emit a concise selected-reward section before
+    # the detailed tables. Result: the Markdown report preserves the final
+    # decision and the reason for choosing it.
+    return [
+        "## Selected Reward Formulation",
+        "",
+        "Final decision: use `norm_loss_reduction` as the default dense IN21k reward formulation.",
+        "",
+        "This mode is selected because training uses `gamma=0`, so the myopic objective should reward the glimpse that gives the largest fractional improvement from the current canvas state:",
+        "",
+        "```text",
+        "r_t = (L_{t-1} - L_t) / max(L_{t-1}, reward_eps)",
+        "```",
+        "",
+        "The epsilon-regularized variant `norm_loss_eps_reduction` is still useful as a stability ablation, especially `--reward-reduction-eps 0.005`, but the current paired full-seed sweep did not beat exact `norm_loss_reduction` on endpoint metrics. Treat incomplete-seed rows in the global ranking as reference only; the main decision is based on same-seed comparisons across seeds 42/43/44.",
+        "",
+    ]
+
+
 def format_robustness_section(
     *,
     norm_traces: list[LossTrace],
@@ -624,6 +647,8 @@ def write_rankings(
         "Lower is better. Primary rankings use the mean of the final evaluation window, not a single final point.",
         "",
     ]
+    lines.extend(format_selected_reward_section())
+    lines.extend([""])
     lines.extend(format_consensus_section(norm=norm, raw=raw, eval_norm_mean=eval_norm_mean))
     lines.extend(["", ""])
     lines.extend(
