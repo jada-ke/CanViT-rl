@@ -394,23 +394,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--resume cannot be combined with --init-critic-checkpoint.")
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError("At least one canvas pooling branch must remain enabled.")
-    if (
-        args.canvas_entropy_state
-        or args.reconstruction_norm_state
-        or args.teacher_reconstruction_error_state
-    ) and (args.detail_debt or args.cos_prev):
-        raise ValueError(
-            "--canvas-entropy-state/--reconstruction-norm-state/"
-            "--teacher-reconstruction-error-state cannot be combined with "
-            "--detail-debt or --cos-prev."
-        )
-    if args.teacher_reconstruction_error_state and (
-        args.canvas_entropy_state or args.reconstruction_norm_state
-    ):
-        raise ValueError(
-            "--teacher-reconstruction-error-state cannot be combined with "
-            "--canvas-entropy-state or --reconstruction-norm-state."
-        )
+    # Problem: earlier state ablations treated dense aux maps as mutually
+    # exclusive, which prevented testing combined hypotheses such as
+    # reconstruction norm + cos-prev. Solution: allow all selected aux maps to
+    # concatenate in canvas_aux_state_map. Result: the actor/critic input
+    # channel count reflects the exact ablation flags instead of one exclusive
+    # state mode.
     if args.debug_viz_images < 0 or args.debug_viz_batches < 0:
         raise ValueError("--debug-viz-images and --debug-viz-batches must be non-negative.")
     if args.reward_map_images < 0:
@@ -745,13 +734,12 @@ def uses_canvas_aux_state(args: argparse.Namespace) -> bool:
 
 def canvas_aux_channels(args: argparse.Namespace) -> int:
     """Return the number of aux-state channels selected by CLI flags."""
-    if (
-        args.canvas_entropy_state
-        or args.reconstruction_norm_state
-        or args.teacher_reconstruction_error_state
-    ):
-        return 1
-    return int(args.detail_debt) + int(args.cos_prev)
+    return (
+        int(args.canvas_entropy_state or args.reconstruction_norm_state)
+        + int(args.teacher_reconstruction_error_state)
+        + int(args.detail_debt)
+        + int(args.cos_prev)
+    )
 
 
 def canvas_aux_state_map(
@@ -768,6 +756,24 @@ def canvas_aux_state_map(
 ) -> torch.Tensor | None:
     """Build the configured Canvas actor auxiliary map."""
     parts: list[torch.Tensor] = []
+    if args.canvas_entropy_state or args.reconstruction_norm_state:
+        parts.append(
+            dense_canvas_entropy_map(
+                model=model,
+                state=state,
+                batch=batch,
+                canvas_grid_size=canvas_grid_size,
+            )
+        )
+    if args.teacher_reconstruction_error_state:
+        parts.append(
+            dense_teacher_reconstruction_error_map(
+                model=model,
+                state=state,
+                batch=batch,
+                canvas_grid_size=canvas_grid_size,
+            )
+        )
     if args.detail_debt:
         parts.append(
             scale_aware_detail_debt(
@@ -788,20 +794,6 @@ def canvas_aux_state_map(
         )
     if parts:
         return torch.cat(parts, dim=1).contiguous()
-    if args.canvas_entropy_state or args.reconstruction_norm_state:
-        return dense_canvas_entropy_map(
-            model=model,
-            state=state,
-            batch=batch,
-            canvas_grid_size=canvas_grid_size,
-        )
-    if args.teacher_reconstruction_error_state:
-        return dense_teacher_reconstruction_error_map(
-            model=model,
-            state=state,
-            batch=batch,
-            canvas_grid_size=canvas_grid_size,
-        )
     return None
 
 
@@ -2501,6 +2493,7 @@ def train_once(args: argparse.Namespace) -> None:
                 f"batch={batch_idx} update={update_count} "
                 f"reward={eval_metrics.get('eval/reward', 0.0):+.4f} "
                 f"{display_loss_name}={eval_metrics.get(display_loss_key, 0.0):.4f} "
+                f"norm_mean={eval_metrics.get('eval/norm_mean', float('nan')):.4f} "
                 "actor_reward_pct="
                 f"{eval_metrics.get('eval/actor_reward_percentile', float('nan')):.3f} "
                 "actor_scale_pct="

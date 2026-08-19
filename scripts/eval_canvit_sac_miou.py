@@ -110,18 +110,7 @@ def _is_canvas_checkpoint(payload: dict[str, Any]) -> bool:
             payload.get("metadata", {}).get("state_representation", ""),
         )
     )
-    return state_representation in {
-        "current_canvas_layernorm",
-        "current_canvas_layernorm_entropy",
-        "current_canvas_layernorm_detail_debt",
-        "current_canvas_layernorm_cos_prev",
-        "current_canvas_layernorm_detail_debt_cos_prev",
-        "current_canvas_layernorm_with_viewpoint_history",
-        "current_canvas_layernorm_entropy_with_viewpoint_history",
-        "current_canvas_layernorm_detail_debt_with_viewpoint_history",
-        "current_canvas_layernorm_cos_prev_with_viewpoint_history",
-        "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history",
-    }
+    return state_representation.startswith("current_canvas_layernorm")
 
 
 def _canvas_uses_viewpoint_history(
@@ -151,53 +140,51 @@ def _canvas_aux_state_kind(
             payload.get("metadata", {}).get("state_representation", ""),
         )
     )
-    if state_representation in {
-        "current_canvas_layernorm_detail_debt_cos_prev",
-        "current_canvas_layernorm_detail_debt_cos_prev_with_viewpoint_history",
-    }:
-        return ("detail_debt", "cos_prev")
-    if state_representation in {
-        "current_canvas_layernorm_detail_debt",
-        "current_canvas_layernorm_detail_debt_with_viewpoint_history",
-    }:
-        return ("detail_debt",)
-    if state_representation in {
-        "current_canvas_layernorm_cos_prev",
-        "current_canvas_layernorm_cos_prev_with_viewpoint_history",
-    }:
-        return ("cos_prev",)
-    if state_representation in {
-        "current_canvas_layernorm_entropy",
-        "current_canvas_layernorm_entropy_with_viewpoint_history",
-    }:
-        return ("segmentation_entropy",)
-    if state_representation in {
-        "current_canvas_layernorm_reconstruction_norm",
-        "current_canvas_layernorm_reconstruction_norm_with_viewpoint_history",
-    }:
-        return ("reconstruction_norm",)
-    if state_representation in {
-        "current_canvas_layernorm_teacher_reconstruction_error",
-        "current_canvas_layernorm_teacher_reconstruction_error_with_viewpoint_history",
-    }:
-        return ("teacher_reconstruction_error",)
+    if state_representation.startswith("current_canvas_layernorm"):
+        suffix = state_representation.removeprefix("current_canvas_layernorm")
+        suffix = suffix.removesuffix("_with_viewpoint_history")
+        suffix = suffix.removeprefix("_")
+        if not suffix:
+            return ()
+        # Problem: combined checkpoint names are underscore-joined, while aux
+        # map names themselves contain underscores. Solution: parse known
+        # tokens greedily in the same order used by dense checkpoint saving.
+        # Result: ADE eval can rebuild reconstruction_norm + cos_prev style
+        # states from metadata instead of relying on the original CLI flags.
+        kinds: list[str] = []
+        remaining = suffix
+        token_map = (
+            ("reconstruction_norm", "reconstruction_norm"),
+            ("teacher_reconstruction_error", "teacher_reconstruction_error"),
+            ("detail_debt", "detail_debt"),
+            ("cos_prev", "cos_prev"),
+            ("entropy", "segmentation_entropy"),
+        )
+        while remaining:
+            for token, kind in token_map:
+                if remaining == token or remaining.startswith(f"{token}_"):
+                    kinds.append(kind)
+                    remaining = remaining[len(token) :].removeprefix("_")
+                    break
+            else:
+                raise ValueError(f"Unknown canvas state representation: {state_representation}")
+        return tuple(kinds)
+
+    kinds = []
+    if checkpoint_args.get("canvas_entropy_state", False):
+        kinds.append("segmentation_entropy")
+    if checkpoint_args.get("reconstruction_norm_state", False):
+        kinds.append("reconstruction_norm")
+    if checkpoint_args.get("teacher_reconstruction_error_state", False):
+        kinds.append("teacher_reconstruction_error")
     if checkpoint_args.get("detail_debt", False) or checkpoint_args.get(
         "canvas_detail_debt_state",
         False,
     ):
-        kinds = ["detail_debt"]
-        if checkpoint_args.get("cos_prev", False):
-            kinds.append("cos_prev")
-        return tuple(kinds)
+        kinds.append("detail_debt")
     if checkpoint_args.get("cos_prev", False):
-        return ("cos_prev",)
-    if checkpoint_args.get("canvas_entropy_state", False):
-        return ("segmentation_entropy",)
-    if checkpoint_args.get("reconstruction_norm_state", False):
-        return ("reconstruction_norm",)
-    if checkpoint_args.get("teacher_reconstruction_error_state", False):
-        return ("teacher_reconstruction_error",)
-    return ()
+        kinds.append("cos_prev")
+    return tuple(kinds)
 
 
 def _canvas_aux_channels(kinds: tuple[str, ...]) -> int:

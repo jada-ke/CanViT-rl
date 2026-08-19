@@ -18,36 +18,38 @@ def _dense_state_representation(args: argparse.Namespace) -> str:
         if not getattr(args, "disable_viewpoint_history_state", False)
         else ""
     )
-    if getattr(args, "detail_debt", False) and getattr(args, "cos_prev", False):
-        return f"current_canvas_layernorm_detail_debt_cos_prev{history_suffix}"
-    if getattr(args, "detail_debt", False):
-        return f"current_canvas_layernorm_detail_debt{history_suffix}"
-    if getattr(args, "cos_prev", False):
-        return f"current_canvas_layernorm_cos_prev{history_suffix}"
+    aux_parts: list[str] = []
     if getattr(args, "reconstruction_norm_state", False) or getattr(
         args,
         "canvas_entropy_state",
         False,
     ):
-        return f"current_canvas_layernorm_reconstruction_norm{history_suffix}"
+        aux_parts.append("reconstruction_norm")
     if getattr(args, "teacher_reconstruction_error_state", False):
-        return f"current_canvas_layernorm_teacher_reconstruction_error{history_suffix}"
-    return f"current_canvas_layernorm{history_suffix}"
+        aux_parts.append("teacher_reconstruction_error")
+    if getattr(args, "detail_debt", False):
+        aux_parts.append("detail_debt")
+    if getattr(args, "cos_prev", False):
+        aux_parts.append("cos_prev")
+    # Problem: combined dense aux-state ablations need to be reloadable from
+    # checkpoint metadata. Solution: encode all selected aux maps in the same
+    # order used by canvas_aux_state_map. Result: eval scripts can reconstruct
+    # both the channel count and semantic map order without CLI guesses.
+    aux_suffix = "" if not aux_parts else "_" + "_".join(aux_parts)
+    return f"current_canvas_layernorm{aux_suffix}{history_suffix}"
 
 
 def _dense_aux_state_channels(args: argparse.Namespace) -> int:
     """Return the optional aux-state channel count for checkpoint reconstruction."""
-    if getattr(args, "canvas_entropy_state", False) or getattr(
-        args,
-        "reconstruction_norm_state",
-        False,
-    ) or getattr(
-        args,
-        "teacher_reconstruction_error_state",
-        False,
-    ):
-        return 1
-    return int(getattr(args, "detail_debt", False)) + int(getattr(args, "cos_prev", False))
+    return (
+        int(
+            getattr(args, "canvas_entropy_state", False)
+            or getattr(args, "reconstruction_norm_state", False)
+        )
+        + int(getattr(args, "teacher_reconstruction_error_state", False))
+        + int(getattr(args, "detail_debt", False))
+        + int(getattr(args, "cos_prev", False))
+    )
 
 
 def save_dense_sac_checkpoint(
