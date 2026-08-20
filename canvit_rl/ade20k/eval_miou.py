@@ -38,7 +38,8 @@ from tqdm import tqdm
 from canvit_rl.policies.mlp import MLPPolicy
 from canvit_rl.policies.viewpoint import action_to_viewpoint
 
-EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
+# Resolve an optional local CanViT-eval checkout from the repository root.
+EVAL_REPO = Path(__file__).resolve().parents[2] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
     sys.path.insert(0, str(EVAL_REPO))
 

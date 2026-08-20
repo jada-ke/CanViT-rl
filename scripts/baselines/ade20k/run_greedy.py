@@ -21,9 +21,18 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from pathlib import Path
-from comet_ml import Experiment
+
+# Problem: Comet warns if imported after torch, but importing it during --help
+# can crash in some local IPython/readline stacks. Solution: pre-import Comet
+# only for real Comet-enabled runs before any torch imports are reached.
+if "-h" not in sys.argv and "--help" not in sys.argv and "--no-comet" not in sys.argv:
+    try:
+        import comet_ml as _comet_ml  # noqa: F401
+    except ImportError:
+        pass
 
 import torch
 import torch.nn.functional as F
@@ -50,11 +59,15 @@ def _make_comet_experiment(args: argparse.Namespace):
     if args.no_comet:
         return None
 
-    if Experiment is None:
+    try:
+        # Import Comet only when logging is enabled; importing it during --help
+        # can load IPython integrations that crash in some Python stacks.
+        from comet_ml import Experiment
+    except ImportError:
         raise RuntimeError(
             "Comet logging is enabled by default, but comet_ml is not installed. "
             "Install comet-ml or run with --no-comet."
-        )
+        ) from None
 
     experiment_name = args.experiment_name or args.comet_experiment_name
     comet_kwargs = {

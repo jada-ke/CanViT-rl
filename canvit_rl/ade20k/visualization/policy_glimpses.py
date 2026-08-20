@@ -58,7 +58,7 @@ from canvit_rl.policies.viewpoint import (
 # probing must start from the repository root instead of the old scripts tree.
 # Solution: derive the repo root from the package path before adding the local
 # CanViT-eval checkout, keeping the reusable module independent of scripts/.
-EVAL_REPO = Path(__file__).resolve().parents[3].parent / "CanViT-eval"
+EVAL_REPO = Path(__file__).resolve().parents[3] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
     sys.path.insert(0, str(EVAL_REPO))
 

@@ -40,9 +40,9 @@ from pathlib import Path
 
 # Problem: Comet's framework integrations warn when comet_ml is imported after
 # torch. Solution: pre-scan argv and import Comet before torch only for enabled
-# Comet runs. Result: --comet runs get clean integration ordering while
+# Comet runs. Result: normal Comet runs get clean integration ordering while
 # --no-comet/help paths do not pay the import cost.
-if "--no-comet" not in sys.argv:
+if "-h" not in sys.argv and "--help" not in sys.argv and "--no-comet" not in sys.argv:
     try:
         import comet_ml as _comet_ml  # noqa: F401
     except ImportError:

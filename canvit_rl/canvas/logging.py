@@ -6,11 +6,6 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-try:
-    from comet_ml import Experiment
-except ImportError:
-    Experiment = None
-
 
 def add_canvas_sac_comet_args(parser: argparse.ArgumentParser) -> None:
     """Register Comet options used by the Canvas SAC trainer."""
@@ -26,11 +21,17 @@ def make_comet_experiment(args: argparse.Namespace):
     """Create a Comet experiment unless disabled for local dry runs."""
     if args.no_comet:
         return None
-    if Experiment is None:
+    try:
+        # Problem: importing comet_ml at module import time can trigger native
+        # crashes in some Python/IPython stacks, even for --help and tests.
+        # Solution: import Comet only when a run actually enables logging.
+        # Result: script import and argparse smoke tests stay side-effect-light.
+        from comet_ml import Experiment
+    except ImportError:
         raise RuntimeError(
             "Comet logging is enabled by default, but comet_ml is not installed. "
             "Install comet-ml or run with --no-comet."
-        )
+        ) from None
     kwargs: dict[str, Any] = {
         "project_name": args.comet_project,
         "auto_param_logging": True,

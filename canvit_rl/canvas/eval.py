@@ -34,7 +34,8 @@ from canvit_rl.canvas.models import CanvasStateActor
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
 from canvit_rl.policies.viewpoint import action_to_viewpoint
 
-EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
+# Resolve an optional local CanViT-eval checkout from the repository root.
+EVAL_REPO = Path(__file__).resolve().parents[2] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
     sys.path.insert(0, str(EVAL_REPO))
 

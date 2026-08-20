@@ -20,16 +20,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
-if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
-    sys.path.insert(0, str(EVAL_REPO))
-
-from canvit_eval.episode import run_episode  # noqa: E402
-from canvit_eval.policies import make_policy  # noqa: E402
 from canvit_pytorch import CanViTForSemanticSegmentation, resolve_canvit_repo
 from canvit_specialize.datasets.ade20k import (
     IGNORE_LABEL,
@@ -38,8 +28,22 @@ from canvit_specialize.datasets.ade20k import (
     make_val_transforms,
 )
 from canvit_specialize.metrics import mIoUAccumulator
+from torch import Tensor
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from canvit_rl.environment import CanViTEnvConfig, get_device
+
+# Problem: this script now lives under scripts/evaluation/ade20k, so the old
+# relative CanViT-eval lookup pointed inside scripts/ instead of the repo root.
+# Solution: resolve the optional local checkout from the repository root while
+# keeping only canvit-eval imports behind this path shim.
+EVAL_REPO = Path(__file__).resolve().parents[3] / "CanViT-eval"
+if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
+    sys.path.insert(0, str(EVAL_REPO))
+
+from canvit_eval.episode import run_episode  # noqa: E402
+from canvit_eval.policies import make_policy  # noqa: E402
 
 
 def _update_miou(

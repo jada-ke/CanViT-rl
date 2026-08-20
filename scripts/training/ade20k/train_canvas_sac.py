@@ -28,8 +28,18 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 import time
 from collections import defaultdict
+
+# Problem: Comet warns if imported after torch, but importing it during --help
+# can crash in some local IPython/readline stacks. Solution: pre-import Comet
+# only for real Comet-enabled runs before any torch imports are reached.
+if "-h" not in sys.argv and "--help" not in sys.argv and "--no-comet" not in sys.argv:
+    try:
+        import comet_ml as _comet_ml  # noqa: F401
+    except ImportError:
+        pass
 
 from canvit_rl.canvas.logging import (
     log_canvas_sac_final_metrics,

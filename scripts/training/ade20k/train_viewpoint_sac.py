@@ -37,10 +37,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-try:
-    from comet_ml import Experiment
-except ImportError:
-    Experiment = None
+# Problem: Comet warns if imported after torch, but importing it during --help
+# can crash in some local IPython/readline stacks. Solution: pre-import Comet
+# only for real Comet-enabled runs before any torch imports are reached.
+if "-h" not in sys.argv and "--help" not in sys.argv and "--no-comet" not in sys.argv:
+    try:
+        import comet_ml as _comet_ml  # noqa: F401
+    except ImportError:
+        pass
 
 import numpy as np
 import torch
@@ -72,7 +76,8 @@ from canvit_rl.policies.viewpoint import (
     randomize_actor_mean_viewpoint_prior,
 )
 
-EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
+# Resolve an optional local CanViT-eval checkout from the repository root.
+EVAL_REPO = Path(__file__).resolve().parents[3] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
     sys.path.insert(0, str(EVAL_REPO))
 
@@ -94,11 +99,15 @@ def _make_comet_experiment(args: argparse.Namespace):
     """Create a Comet experiment unless disabled for local dry runs."""
     if args.no_comet:
         return None
-    if Experiment is None:
+    try:
+        # Import Comet only for real logging runs so --help/import smoke tests
+        # do not load IPython integrations or crash in native dependencies.
+        from comet_ml import Experiment
+    except ImportError:
         raise RuntimeError(
             "Comet logging is enabled by default, but comet_ml is not installed. "
             "Install comet-ml or run with --no-comet."
-        )
+        ) from None
     comet_kwargs = dict(
         project_name=args.comet_project,
         auto_param_logging=True,

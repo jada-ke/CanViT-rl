@@ -55,7 +55,7 @@ def test_dense_loss_eps_reduction_adds_tunable_denominator_epsilon() -> None:
     before = _metrics(norm=[2.0, 0.5])
     after = _metrics(norm=[1.0, 0.75])
 
-    expected = torch.tensor([1.0, -0.5]) / torch.tensor([2.5, 1.0])
+    expected = torch.tensor([1.0, -0.25]) / torch.tensor([2.5, 1.0])
 
     actual = dense_loss_eps_reduction_reward(
         before,

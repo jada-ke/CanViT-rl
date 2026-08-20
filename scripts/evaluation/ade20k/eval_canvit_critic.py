@@ -28,13 +28,12 @@ from canvit_specialize.datasets.ade20k import ADE20kDataset, make_val_transforms
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
+from canvit_rl.canvas.state import empty_viewpoint_history
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.policies.viewpoint import ViewpointHistoryCritic
 from scripts.training.ade20k.pretrain_canvit_critic import (
     _append_history,
-    _batch_from_history,
-    _empty_history,
-    _segmentation_ce,
     _viewpoint_to_action,
 )
 
@@ -260,7 +259,11 @@ def main() -> None:
                 batch_size=1,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
-            history = _empty_history(max_steps=dims["max_steps"])
+            coords, lengths = empty_viewpoint_history(
+                batch_size=1,
+                max_steps=dims["max_steps"],
+                device=device,
+            )
 
             full_vp = Viewpoint.full_scene(batch_size=1, device=device)
             full_glimpse = sample_at_viewpoint(
@@ -270,23 +273,27 @@ def main() -> None:
             )
             out = model(glimpse=full_glimpse, state=state, viewpoint=full_vp)
             state = out.state
-            history = _append_history(
-                history=history,
+            coords, lengths = _append_history(
+                coords=coords,
+                lengths=lengths,
                 viewpoint=full_vp,
-                max_steps=dims["max_steps"],
+                step=0,
             )
-            current_ce = _segmentation_ce(
-                model=model,
-                state=state,
-                probe=probe,
-                mask=mask,
-                canvas_grid_size=cfg.canvas_grid_size,
+            current_ce = float(
+                _segmentation_cross_entropy_losses(
+                    model=model,
+                    state=state,
+                    probe=probe,
+                    mask=mask,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                    batch_size=1,
+                ).item()
             )
             ce_sums[0] += current_ce
             scale_sums[0] += 1.0
 
             for step_idx in range(args.t):
-                batch = _batch_from_history(history, device=device)
+                batch = {"coords": coords, "lengths": lengths}
                 candidates = random_viewpoints(
                     batch_size=1,
                     device=device,
@@ -305,12 +312,15 @@ def main() -> None:
                         glimpse_size_px=cfg.glimpse_size_px,
                     )
                     out = model(glimpse=glimpse, state=state, viewpoint=vp)
-                    ce_after = _segmentation_ce(
-                        model=model,
-                        state=out.state,
-                        probe=probe,
-                        mask=mask,
-                        canvas_grid_size=cfg.canvas_grid_size,
+                    ce_after = float(
+                        _segmentation_cross_entropy_losses(
+                            model=model,
+                            state=out.state,
+                            probe=probe,
+                            mask=mask,
+                            canvas_grid_size=cfg.canvas_grid_size,
+                            batch_size=1,
+                        ).item()
                     )
                     reward = current_ce - ce_after
                     actions.append(_viewpoint_to_action(vp, min_scale=min_scale)[0])
@@ -359,10 +369,11 @@ def main() -> None:
 
                 vp, out, next_ce, _ = records[critic_idx]
                 state = out.state
-                history = _append_history(
-                    history=history,
+                coords, lengths = _append_history(
+                    coords=coords,
+                    lengths=lengths,
                     viewpoint=vp,
-                    max_steps=dims["max_steps"],
+                    step=step_idx + 1,
                 )
                 current_ce = next_ce
                 ce_sums[step_idx + 1] += current_ce

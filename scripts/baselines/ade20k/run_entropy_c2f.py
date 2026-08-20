@@ -16,23 +16,24 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch import Tensor
-
-EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
-if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
-    sys.path.insert(0, str(EVAL_REPO))
-
-from canvit_eval.episode import run_episode  # noqa: E402
-from canvit_eval.policies import make_policy  # noqa: E402
 from canvit_pytorch import CanViTForSemanticSegmentation, resolve_canvit_repo
 from canvit_specialize.datasets.ade20k import (
     IGNORE_LABEL,
     ADE20kDataset,
     make_val_transforms,
 )
+from torch import Tensor
 
-from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.greedy import miou_from_state
+from canvit_rl.environment import CanViTEnvConfig, get_device
+
+# Resolve an optional local CanViT-eval checkout from the repository root.
+EVAL_REPO = Path(__file__).resolve().parents[3] / "CanViT-eval"
+if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
+    sys.path.insert(0, str(EVAL_REPO))
+
+from canvit_eval.episode import run_episode  # noqa: E402
+from canvit_eval.policies import make_policy  # noqa: E402
 
 
 def _segmentation_ce_loss(

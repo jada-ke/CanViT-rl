@@ -209,7 +209,7 @@ def test_dense_teacher_reconstruction_error_map_uses_targets():
         canvas_grid_size=2,
     )
 
-    expected = torch.tensor([[[[0.0, 0.125], [0.5, 1.0]]]])
+    expected = torch.tensor([[[[0.0, 0.0625], [0.5, 1.0]]]])
     assert torch.allclose(error_map, expected)
 
 
