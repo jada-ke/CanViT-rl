@@ -29,12 +29,17 @@ Reinforcement-learning experiments for active-vision glimpse selection on top of
 ```bash
 uv sync
 cp .envrc.example .envrc
+```
+
+Edit `.envrc` for your machine, then load it:
+
+```bash
 source .envrc
 ```
 
-Fill in `.envrc` with local dataset/checkpoint paths as needed. If
-`CANVIT_CHECKPOINT` is empty, the code will try to download the configured
-checkpoint on first use.
+The template keeps local dataset/checkpoint paths out of Git. If
+`CANVIT_CHECKPOINT` is empty, code that accepts a model repo will use its
+built-in default or download the configured checkpoint on first use.
 
 After changing CanViT Git dependencies, refresh the lockfile:
 

@@ -1,0 +1,18 @@
+# Local development environment for CanViT-rl.
+#
+# Copy this file to `.envrc`, edit paths for your machine, then run:
+#   source .envrc
+#
+# Keep `.envrc` untracked. This template is intentionally safe to commit.
+
+# Optional: override the CanViT checkpoint/model repo used by scripts.
+# Leave empty to let scripts use their built-in defaults.
+export CANVIT_CHECKPOINT=""
+
+# Optional: path to a local ADE20K root. Many scripts also expose --dataset or
+# --ade20k-root, so this is mainly a convenience for eval helpers.
+export ADE20K_ROOT="datasets/ADE20k"
+
+# Optional: path to a local CanViT-pretrain checkout for IN21k dense workflows.
+# Required only when that package is not installed in the active environment.
+export CANVIT_PRETRAIN_ROOT=""

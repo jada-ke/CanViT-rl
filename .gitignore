@@ -1,5 +1,4 @@
 .envrc
-.envrc.example
 .DS_Store
 datasets/ADE20k
 checkpoints
