@@ -82,12 +82,12 @@ from canvit_rl.canvas.state import (
 from canvit_rl.vision.precision import resolve_canvit_dtype
 from canvit_rl.environment import get_device
 from canvit_rl.ade20k.greedy import _index_state_batch, _repeat_state_chunks
-from canvit_rl.in21k.dense.checkpoints import (
+from canvit_rl.in21k.checkpoints import (
     load_dense_sac_critic_initializer,
     load_dense_sac_resume,
     save_dense_sac_checkpoint,
 )
-from canvit_rl.in21k.dense.dense_train_batch import (
+from canvit_rl.in21k.dense_train_batch import (
     DenseTrainBatch,
     FixedDenseSubsetLoader,
     PairedDenseShardLoader,
@@ -96,8 +96,8 @@ from canvit_rl.in21k.dense.dense_train_batch import (
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
 )
-from canvit_rl.in21k.dense.pretrain_modules import load_pretrain_modules
-from canvit_rl.in21k.dense.rewards import (
+from canvit_rl.in21k.pretrain_modules import load_pretrain_modules
+from canvit_rl.in21k.rewards import (
     DenseDistillationMetrics,
     dense_distillation_metrics,
     dense_reward,

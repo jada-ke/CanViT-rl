@@ -7,7 +7,7 @@ from typing import Protocol
 
 from torch import Tensor
 
-from canvit_rl.in21k.dense.dense_train_batch import DenseTrainBatch
+from canvit_rl.in21k.dense_train_batch import DenseTrainBatch
 
 
 class TensorDestandardizer(Protocol):

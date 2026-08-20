@@ -76,7 +76,7 @@ class FixedDenseSubsetDataset(Dataset[tuple[Tensor, Tensor, Tensor, int]]):
     @staticmethod
     def _open_tar_reader(tar_dir: Path, shard_path: Path):
         """Open the tar reader matching one dense-feature shard."""
-        from canvit_rl.in21k.dense.pretrain_modules import install_pretrain_train_shim
+        from canvit_rl.in21k.pretrain_modules import install_pretrain_train_shim
 
         install_pretrain_train_shim()
         from canvit_pretrain.train.data.tar_images import TarImageReader, load_tar_index

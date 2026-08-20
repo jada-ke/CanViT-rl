@@ -9,7 +9,7 @@ Usage:
 
     uv run python scripts.training.ade20k.pretrain_canvit_critic.py \
         --state-mode canvas \
-        --dataset synthetic_segmentation \
+        --dataset data/synthetic_segmentation \
         --dataset-format synthetic \
         --comet-log-interval 50 \
         --split training \

@@ -7,7 +7,7 @@ from canvit_rl.canvas.state import (
     canvas_teacher_reconstruction_error,
     scale_aware_detail_debt,
 )
-from canvit_rl.in21k.dense.checkpoints import load_dense_sac_critic_initializer
+from canvit_rl.in21k.checkpoints import load_dense_sac_critic_initializer
 from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
 
 

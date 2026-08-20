@@ -367,7 +367,7 @@ def main() -> None:
     grid_size = cfg.canvas_patch_grid_size
     cls_norm, scene_norm = model.standardizers(grid_size)
     if args.reset_normalizer or not scene_norm.initialized:
-        from canvit_rl.in21k.dense.dense_train_batch import (
+        from canvit_rl.in21k.dense_train_batch import (
             init_normalizer_stats_from_shard,
         )
 

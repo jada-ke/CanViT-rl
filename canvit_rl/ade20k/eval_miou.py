@@ -3,10 +3,11 @@ Evaluate a trained canvit-rl policy on ADE20K mIoU using canvit-eval.
 
 This script intentionally reuses canvit-eval's episode runner and ADE20K
 segmentation components, but supplies a custom policy wrapper backed by the
-MLPPolicy checkpoint trained in canvit_rl.train.
+MLPPolicy checkpoint trained by an external/ad-hoc training script. Bring your
+own MLPPolicy checkpoint in the format expected by EvalConfig.
 
 Example:
-    python -m canvit_rl.eval_miou --checkpoint checkpoints/policy_final.pt
+    python -m canvit_rl.ade20k.eval_miou --checkpoint checkpoints/policy_final.pt
 """
 
 from __future__ import annotations

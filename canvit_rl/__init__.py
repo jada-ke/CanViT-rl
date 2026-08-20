@@ -2,7 +2,8 @@
 
 The stable public surface is intentionally small: environment integration,
 baseline policy/reward helpers, and subpackages for larger experiment families.
-See `canvit_rl/README.md` for the newcomer-oriented package map.
+See the "Repository Tour" section of the root README.md for the
+newcomer-oriented package map.
 """
 
 from canvit_rl.environment import CanViTEnv, CanViTEnvConfig, get_device

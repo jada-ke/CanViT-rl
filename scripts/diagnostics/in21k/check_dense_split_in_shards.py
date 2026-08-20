@@ -205,7 +205,7 @@ def _scan_images_to_shards(
 
     print(f"shards_dir: {shards_dir}")
     print(f"image_root: {args.image_root}")
-    print(f"mode: from_images")
+    print("mode: from_images")
     print(f"scanned_shards: {len(shard_paths)}")
     print(f"usable_shard_rows: {usable_rows}")
     print(f"duplicate_usable_shard_paths: {duplicate_rows}")

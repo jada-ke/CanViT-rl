@@ -5,7 +5,7 @@ This mirrors ``scripts/training/ade20k/train_canvas_sac.py`` for ADE20K segmenta
 replacing replay/SAC updates with on-policy clipped PPO updates.
 
 python scripts/training/ade20k/train_canvas_ppo.py \
-  --dataset synthetic_segmentation \
+  --dataset data/synthetic_segmentation \
   --dataset-format synthetic \
   --batches 5001 \
   --batch-size 4 \

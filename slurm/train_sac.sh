@@ -34,7 +34,7 @@ apptainer exec --nv \
     $SCRATCH/canvit_rl.sif \
     python -u /workspace/scripts/train_canvas_sac.py \
     --num-workers 8 \
-    --dataset synthetic_segmentation \
+    --dataset data/synthetic_segmentation \
     --dataset-format synthetic \
     --split training \
     --eval-split validation \

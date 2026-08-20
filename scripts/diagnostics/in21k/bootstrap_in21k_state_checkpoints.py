@@ -42,12 +42,12 @@ os.environ.setdefault("XDG_CACHE_HOME", str(_cache_dir))
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 from canvit_rl.vision.precision import resolve_canvit_dtype  # noqa: E402
-from canvit_rl.in21k.dense.dense_train_batch import (  # noqa: E402
+from canvit_rl.in21k.dense_train_batch import (  # noqa: E402
     dense_glimpse_images,
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
 )
-from canvit_rl.in21k.dense.rewards import dense_distillation_metrics  # noqa: E402
+from canvit_rl.in21k.rewards import dense_distillation_metrics  # noqa: E402
 from canvit_rl.canvas.models import CanvasStateActor  # noqa: E402
 from canvit_rl.policies.viewpoint import action_to_viewpoint  # noqa: E402
 from scripts.training.in21k.train_i21k_dense_sac import (  # noqa: E402

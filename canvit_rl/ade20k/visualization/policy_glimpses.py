@@ -9,7 +9,7 @@ Usage:
     uv run python scripts/analysis/ade20k/visualize_policy_glimpses.py \
         --policy canvas-bc \
         --policy-checkpoint checkpoints/canvas_bc/synthetic_im7_t1_k32_5000/latest.pt \
-        --dataset synthetic_segmentation \
+        --dataset data/synthetic_segmentation \
         --split validation \
         --t 1 \
         --image-index 0,1,2 \
@@ -18,7 +18,7 @@ Usage:
     uv run python scripts/analysis/ade20k/visualize_policy_glimpses.py \
         --policy canvas-sac \
         --policy-checkpoint checkpoints/canvas_sac/synthetic-im1-t1_100/latest.pt \
-        --dataset synthetic_segmentation \
+        --dataset data/synthetic_segmentation \
         --split validation \
         --t 1 \
         --image-index 0,1,2 \

@@ -3,7 +3,7 @@
 Example:
     uv run python scripts/synthetic_dataset/generate_synthetic_dataset.py \
         --ade-root datasets/ADE20k \
-        --root synthetic_segmentation \
+        --root data/synthetic_segmentation \
         --train-samples 7 \
         --val-samples 3 \
         --min-fraction 0.25 \
@@ -13,7 +13,7 @@ Example:
 
 The output layout is:
 
-    synthetic_segmentation/
+    data/synthetic_segmentation/
     ├── images/
     │   ├── training/
     │   │   └── sample_00000.png
@@ -263,7 +263,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ade-root", type=Path, default=Path("datasets/ADE20k"))
     parser.add_argument("--split", choices=["training", "validation"], default="training")
-    parser.add_argument("--root", type=Path, default=Path("synthetic_segmentation"))
+    parser.add_argument("--root", type=Path, default=Path("data/synthetic_segmentation"))
     parser.add_argument("--num-samples", type=int, default=5)
     parser.add_argument(
         "--train-samples",

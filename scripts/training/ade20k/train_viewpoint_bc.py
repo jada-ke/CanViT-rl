@@ -13,7 +13,7 @@ Example:
     uv run python scripts/training/ade20k/train_viewpoint_bc.py --optuna-trials 20 --batches 50
 
     uv run python scripts/training/ade20k/train_viewpoint_bc.py \
-        --dataset synthetic_segmentation \
+        --dataset data/synthetic_segmentation \
         --dataset-format synthetic \
         --state-representation current_canvas \
         --num-workers 8

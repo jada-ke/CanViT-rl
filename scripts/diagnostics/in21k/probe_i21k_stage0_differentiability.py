@@ -26,15 +26,15 @@ from canvit_pytorch.model.pretraining.hub import CanViTForPretrainingHFHub
 
 from canvit_rl.vision.precision import resolve_canvit_dtype
 from canvit_rl.environment import get_device
-from canvit_rl.in21k.dense.dense_train_batch import (
+from canvit_rl.in21k.dense_train_batch import (
     FixedDenseSubsetLoader,
     apply_dense_feature_config,
     dense_glimpse_images,
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
 )
-from canvit_rl.in21k.dense.pretrain_modules import load_pretrain_modules
-from canvit_rl.in21k.dense.rewards import dense_distillation_metrics
+from canvit_rl.in21k.pretrain_modules import load_pretrain_modules
+from canvit_rl.in21k.rewards import dense_distillation_metrics
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])[:, None, None]

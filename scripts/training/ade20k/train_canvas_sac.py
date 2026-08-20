@@ -9,7 +9,7 @@ This is the canvas-state analogue of scripts/training/ade20k/train_viewpoint_sac
 
 Example:
     python scripts/training/ade20k/train_canvas_sac.py \
-    --dataset synthetic_segmentation \
+    --dataset data/synthetic_segmentation \
     --batches 100 --batch-size 1 --max-samples 1 --t 2 \
     --eval-images 1 --eval-batch-size 1 --eval-split training\
     --replay-batch-size 4 \

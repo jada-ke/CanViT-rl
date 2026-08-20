@@ -49,14 +49,14 @@ from canvit_rl.canvas.state import (
 from canvit_rl.vision.precision import resolve_canvit_dtype
 from canvit_rl.canvas.critic_losses import candidate_critic_loss
 from canvit_rl.ade20k.greedy import _index_state_batch, _repeat_state_chunks
-from canvit_rl.in21k.dense.dense_train_batch import (
+from canvit_rl.in21k.dense_train_batch import (
     DenseTrainBatch,
     dense_glimpse_images,
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
 )
 from canvit_rl.canvas.candidates import sample_candidate_viewpoints
-from canvit_rl.in21k.dense.rewards import DenseDistillationMetrics, dense_reward
+from canvit_rl.in21k.rewards import DenseDistillationMetrics, dense_reward
 from canvit_rl.canvas.models import CanvasStateCritic
 from canvit_rl.policies.viewpoint import viewpoint_to_action
 from scripts.training.in21k.train_i21k_dense_sac import (
@@ -374,7 +374,7 @@ def _dense_metrics(
     args: argparse.Namespace,
 ) -> DenseDistillationMetrics:
     """Compute dense distillation metrics with the active reward weights."""
-    from canvit_rl.in21k.dense.rewards import dense_distillation_metrics
+    from canvit_rl.in21k.rewards import dense_distillation_metrics
 
     return dense_distillation_metrics(
         model=model,

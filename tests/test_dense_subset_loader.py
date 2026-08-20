@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from canvit_rl.in21k.dense import FixedDenseSubsetLoader
+from canvit_rl.in21k import FixedDenseSubsetLoader
 
 
 def _write_image(path: Path, color: tuple[int, int, int]) -> None:

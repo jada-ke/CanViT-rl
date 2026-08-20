@@ -1,6 +1,6 @@
 import torch
 
-from canvit_rl.in21k.dense.rewards import (
+from canvit_rl.in21k.rewards import (
     DenseDistillationMetrics,
     dense_loss_eps_reduction_reward,
     dense_loss_reduction_reward,

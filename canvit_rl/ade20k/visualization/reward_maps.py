@@ -26,7 +26,7 @@ Example:
 
     uv run python scripts/analysis/ade20k/visualize_sac_reward_maps.py \
         --checkpoint checkpoints/canvas_sac/synthetic-im7-t1-10_000-critlr_3/best.pt \
-        --dataset synthetic_segmentation \
+        --dataset data/synthetic_segmentation \
         --split training \
         --image-index 0,1,2,3,4,5,6 \
         --state-steps 0,1 \
@@ -37,7 +37,7 @@ Example:
 
     uv run python scripts/analysis/ade20k/visualize_sac_reward_maps.py \
         --checkpoint checkpoints/canvas_critic/canvas_synthetic_im7_t1_k32_5000/best.pt \
-        --dataset synthetic_segmentation \
+        --dataset data/synthetic_segmentation \
         --split validation \
         --image-index 0,1,2 \
         --grid-size 21 \
