@@ -1,6 +1,6 @@
 """Optuna launcher for IN21k dense-feature Canvas SAC hyperparameter tuning.
 
-This script wraps ``scripts.training.in21k.train_i21k_dense_sac.py`` in one process per trial
+This script wraps ``scripts/training/in21k/train_i21k_dense_sac.py`` in one process per trial
 so the dense trainer can keep owning model/data initialization, checkpointing,
 and Comet logging.
 
@@ -31,8 +31,8 @@ from typing import Any
 import torch
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-TRAIN_SCRIPT = REPO_ROOT / "scripts" / "train_i21k_dense_sac.py"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+TRAIN_SCRIPT = REPO_ROOT / "scripts" / "training" / "in21k" / "train_i21k_dense_sac.py"
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -328,6 +328,29 @@ def main() -> None:
 
     args, train_argv = parse_args()
     _ensure_output_dirs(args)
+    if args.dry_run:
+        # Problem: dry-run previously entered Optuna and printed one command per
+        # default trial. Solution: build one lightweight fixed trial command and
+        # return immediately. Result: dry-run is a quick path/executable smoke
+        # check for the nested trainer location.
+        class DryRunTrial:
+            number = 0
+
+            @staticmethod
+            def suggest_float(_name, low, high, **_kwargs):
+                return (low + high) / 2.0
+
+            @staticmethod
+            def suggest_categorical(_name, choices):
+                return choices[0]
+
+        command, _checkpoint_dir = _build_trial_command(
+            args=args,
+            train_argv=train_argv,
+            trial=DryRunTrial(),
+        )
+        print(" ".join(command))
+        return
 
     def objective(trial: Any) -> float:
         command, checkpoint_dir = _build_trial_command(
@@ -336,9 +359,6 @@ def main() -> None:
             trial=trial,
         )
         trial.set_user_attr("checkpoint_dir", str(checkpoint_dir))
-        if args.dry_run:
-            print(" ".join(command))
-            raise optuna.TrialPruned("dry run")
         try:
             _run_trial_command(command, checkpoint_dir, args.trial_output)
             value = _load_objective(checkpoint_dir, args.objective_metric)
@@ -357,8 +377,6 @@ def main() -> None:
         load_if_exists=bool(args.optuna_storage),
     )
     study.optimize(objective, n_trials=args.optuna_trials)
-    if args.dry_run:
-        return
     print(f"Best trial: {study.best_trial.number}")
     print(f"Best value: {study.best_value:.6f}")
     print(f"Best params: {study.best_params}")

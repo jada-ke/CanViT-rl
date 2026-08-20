@@ -4,7 +4,7 @@ The data path is owned by CanViT-pretrain's shard loader. This script only
 wraps that batch contract in the existing Canvas SAC actor/critic/replay code.
 
 Example:
-    uv run python scripts.training.in21k.train_i21k_dense_sac.py \
+    uv run python scripts/training/in21k/train_i21k_dense_sac.py \
         --feature-base-dir datasets/mnist_glimpse_dense_oracle/features \
         --feature-image-root datasets/mnist_glimpse_export/oracle \
         --paired-hidden-feature-base-dir datasets/mnist_glimpse_dense_hidden/features \
@@ -12,7 +12,7 @@ Example:
         --model-repo canvit/canvitb16-add-vpe-pretrain-g128px-s512px-in21k-dv3b16-2026-02-02 \
         --batches 1000 --batch-size 8 --t 4 --no-comet
 
-    uv run python scripts.training.in21k.train_i21k_dense_sac.py \
+    uv run python scripts/training/in21k/train_i21k_dense_sac.py \
         --feature-base-dir datasets/imagenet_ood/features \
         --feature-image-root datasets/imagenet_ood/images \
         --model-repo "canvit/canvitb16-add-vpe-pretrain-g128px-s512px-in21k-dv3b16-2026-02-02" \
@@ -21,20 +21,22 @@ Example:
         --subset-shards 1 \
         --batch-size 4 \
         --batches 201 \
-        --debug-viz-dir results/i21k_dense_debug \
-        --debug-viz-images 4 \
         --t 2 \
         --critic-local-action-features \
         --canvas-entropy-state \
         --disable-canvas-max-pool \
-        --reward-mode raw_mse_l0_delta \
+        --reward-mode norm_loss_reduction \
         --reward-map-interval 200 \
         --reward-map-images 4 \
         --comet \
         --eval-interval 50 \
         --eval-images 4 \
         --eval-subset-seed 42 \
-        --eval-batch-size 4 
+        --eval-batch-size 4 \
+        --comet \
+        --comet-project test \
+        --comet-log-interval 10 \
+        --experiment-name test
 
 """
 

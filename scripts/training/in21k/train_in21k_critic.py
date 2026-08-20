@@ -6,7 +6,7 @@ regress Q(state, action) to those one-step rewards without SAC bootstrapping or
 actor updates.
 
 Example:
-    uv run python scripts.training.in21k.train_in21k_critic.py \
+    uv run python scripts/training/in21k/train_in21k_critic.py \
         --feature-base-dir /features \
         --feature-image-root /data/train \
         --model-repo canvit/canvitb16-add-vpe-pretrain-g128px-s512px-in21k-dv3b16-2026-02-02 \

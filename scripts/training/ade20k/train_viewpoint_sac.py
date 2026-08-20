@@ -2,7 +2,7 @@
 Train image-independent SAC over viewpoint history for CanViT active vision.
 
 The learned state is the same fixed-slot viewpoint history used by
-scripts/training/ade20k/train_viewpoint_bc.py and scripts.training.ade20k.pretrain_canvit_critic.py:
+scripts/training/ade20k/train_viewpoint_bc.py and scripts/training/ade20k/pretrain_canvit_critic.py:
 
     state = previous Viewpoints
     action = next Viewpoint

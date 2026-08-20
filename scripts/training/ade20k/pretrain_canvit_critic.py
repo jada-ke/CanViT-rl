@@ -2,12 +2,12 @@
 Train continuous SAC critics from k-candidate relative CE-gain oracle labels.
 
 Usage:
-    uv run python scripts.training.ade20k.pretrain_canvit_critic.py --batches 100 --max-samples 1 --batch-size 1 --t 1 --k 16 \
+    uv run python scripts/training/ade20k/pretrain_canvit_critic.py --batches 100 --max-samples 1 --batch-size 1 --t 1 --k 16 \
         --test-images 8 --checkpoint-dir checkpoints/canvit_critic --experiment-name critic-im1-k16-t1 \
         --comet-log-interval 10 --max-history 2
-    uv run python scripts.training.ade20k.pretrain_canvit_critic.py --optuna-trials 20 --batches 50
+    uv run python scripts/training/ade20k/pretrain_canvit_critic.py --optuna-trials 20 --batches 50
 
-    uv run python scripts.training.ade20k.pretrain_canvit_critic.py \
+    uv run python scripts/training/ade20k/pretrain_canvit_critic.py \
         --state-mode canvas \
         --dataset data/synthetic_segmentation \
         --dataset-format synthetic \

@@ -6,8 +6,8 @@ Action: continuous Viewpoint parameters [cx, cy, scale_raw].
 Reward: scaled improvement in ADE20K mIoU.
 
 Example:
-    uv run python scripts.training.ade20k.train_canvit_sac.py --episodes 1000 --t 5
-    uv run python scripts.training.ade20k.train_canvit_sac.py \
+    uv run python scripts/training/ade20k/train_canvit_sac.py --episodes 1000 --t 5
+    uv run python scripts/training/ade20k/train_canvit_sac.py \
         --episodes 1000 --t 5 \
         --pretrained-critic checkpoints/canvit_critic/pretrained.pt
 """
