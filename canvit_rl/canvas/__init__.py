@@ -1,6 +1,5 @@
-"""Canvas-policy training helpers.
+"""Image-dependent Canvas-state policy helpers."""
 
-This package groups Canvas SAC orchestration utilities while preserving older
-top-level modules such as `canvit_rl.canvas_sac` for compatibility.
-"""
+from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic, CanvasStateEncoder
 
+__all__ = ["CanvasStateActor", "CanvasStateCritic", "CanvasStateEncoder"]

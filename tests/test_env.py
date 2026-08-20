@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 import torch
  
-from canvit_rl.env import CanViTEnv, CanViTEnvConfig, get_device
+from canvit_rl.environment import CanViTEnv, CanViTEnvConfig, get_device
  
  
 # ---------------------------------------------------------------------------

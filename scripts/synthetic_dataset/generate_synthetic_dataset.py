@@ -42,7 +42,7 @@ import numpy as np
 from PIL import Image
 
 from _paths import repo_path
-from canvit_rl.ade_labels import remap_ade_mask_labels
+from canvit_rl.ade20k.labels import remap_ade_mask_labels
 
 
 IGNORE_LABEL = 255

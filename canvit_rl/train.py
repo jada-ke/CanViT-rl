@@ -29,28 +29,12 @@ from torch.utils.data import DataLoader, RandomSampler
 
 from canvit_pytorch import CanViTForPretrainingHFHub, Viewpoint, sample_at_viewpoint
 from canvit_pytorch.teacher import load_teacher
-from canvit_rl.env import CanViTEnvConfig, get_device
-from canvit_rl.policy import MLPPolicy
+from canvit_rl.environment import CanViTEnvConfig, get_device
+from canvit_rl.policies.mlp import MLPPolicy
+from canvit_rl.policies.viewpoint import action_to_viewpoint
 from canvit_specialize.datasets.ade20k import ADE20kDataset, make_val_transforms
 
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Action → Viewpoint
-# ---------------------------------------------------------------------------
-
-def action_to_viewpoint(action: torch.Tensor) -> Viewpoint:
-    """
-    Map policy output [B, 3] → Viewpoint.
-    action[:, 0:2] → centers (cx, cy) in [-1, 1]
-    action[:, 2]   → scale, remapped from [-1, 1] to [0.05, 1.0]
-    """
-    centers = action[:, :2].float()                        # [B, 2]
-    scale_raw = action[:, 2]
-    scales = (scale_raw + 1.0) / 2.0 * 0.95 + 0.05       # [0.05, 1.0]
-    scales = scales.float()
-    return Viewpoint(centers=centers, scales=scales)
-
 
 # ---------------------------------------------------------------------------
 # Episode rollout (differentiable)
@@ -107,7 +91,10 @@ def run_episode(
 
         # Policy forward (differentiable)
         action = policy(obs)                             # [1, 3]
-        vp = action_to_viewpoint(action)
+        # Problem: train.py duplicated the package action->Viewpoint mapping.
+        # Solution: use the shared policy utility with the same 0.05 minimum
+        # scale used by the old local mapper. Result: one conversion contract.
+        vp = action_to_viewpoint(action, min_scale=0.05)
 
         # Sample glimpse and step CanViT (differentiable w.r.t. vp/action)
         glimpse = sample_at_viewpoint(

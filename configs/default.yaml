@@ -20,6 +20,6 @@ lr: 3.e-4
 lambda_scale: 0.01  # reward = Δsim - lambda_scale * scale
 
 # --- Logging & Checkpoints ---
-log_interval: 50
+log_interval: 100
 checkpoint_interval: 50
 checkpoint_dir: checkpoints

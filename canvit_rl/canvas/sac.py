@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
 
 REPLAY_STORAGE_DTYPE = torch.float16
 REPLAY_STORAGE_DTYPE_BYTES = 2

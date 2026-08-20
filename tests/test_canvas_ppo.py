@@ -8,7 +8,7 @@ from canvit_rl.canvas.ppo import (
     clipped_value_loss,
     normalize_minibatch_advantages,
 )
-from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
 
 
 def _modules():

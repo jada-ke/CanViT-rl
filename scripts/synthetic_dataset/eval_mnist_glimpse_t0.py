@@ -46,8 +46,8 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from _paths import repo_path
-from canvit_rl.canvit_precision import resolve_canvit_dtype
-from canvit_rl.env import get_device
+from canvit_rl.vision.precision import resolve_canvit_dtype
+from canvit_rl.environment import get_device
 
 
 DEFAULT_MODEL_REPO = (

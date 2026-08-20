@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 from canvit_rl.canvas.sac import CanvasSAC
-from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
 
 
 def canvas_state_representation(args: argparse.Namespace) -> str:

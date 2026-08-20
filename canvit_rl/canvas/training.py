@@ -12,10 +12,10 @@ from canvit_specialize.datasets.ade20k import make_val_transforms
 from torch.utils.data import DataLoader, RandomSampler
 
 from canvit_rl.canvas.eval import dataloader_kwargs
-from canvit_rl.env import CanViTEnvConfig
-from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
-from canvit_rl.synthetic_data import build_segmentation_dataset
-from canvit_rl.viewpoint_policy import randomize_actor_mean_viewpoint_prior
+from canvit_rl.environment import CanViTEnvConfig
+from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.ade20k.datasets import build_segmentation_dataset
+from canvit_rl.policies.viewpoint import randomize_actor_mean_viewpoint_prior
 
 
 @dataclass

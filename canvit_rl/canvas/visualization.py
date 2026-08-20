@@ -6,17 +6,14 @@ import argparse
 
 import torch
 
-from canvit_rl.env import CanViTEnvConfig
-from canvit_rl.sac_models import CanvasStateActor, CanvasStateCritic
-
-try:
-    from visualize_sac_reward_maps import visualize_reward_maps_for_indices
-except ImportError:
-    from scripts.visualize_sac_reward_maps import visualize_reward_maps_for_indices
-try:
-    from visualize_policy_glimpses import visualize_canvas_policy_for_indices
-except ImportError:
-    from scripts.visualize_policy_glimpses import visualize_canvas_policy_for_indices
+from canvit_rl.ade20k.visualization.policy_glimpses import (
+    visualize_canvas_policy_for_indices,
+)
+from canvit_rl.ade20k.visualization.reward_maps import (
+    visualize_reward_maps_for_indices,
+)
+from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.environment import CanViTEnvConfig
 
 
 def parse_reward_map_scales(value: str) -> list[float]:

@@ -28,11 +28,11 @@ from canvit_rl.canvas.state import (
     canvas_segmentation_entropy,
     empty_viewpoint_history,
 )
-from canvit_rl.env import CanViTEnvConfig
-from canvit_rl.greedy import _segmentation_cross_entropy_losses
-from canvit_rl.sac_models import CanvasStateActor
-from canvit_rl.synthetic_data import build_segmentation_dataset
-from canvit_rl.viewpoint_policy import action_to_viewpoint
+from canvit_rl.environment import CanViTEnvConfig
+from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
+from canvit_rl.canvas.models import CanvasStateActor
+from canvit_rl.ade20k.datasets import build_segmentation_dataset
+from canvit_rl.policies.viewpoint import action_to_viewpoint
 
 EVAL_REPO = Path(__file__).resolve().parents[1] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:

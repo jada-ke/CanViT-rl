@@ -1,6 +1,6 @@
 # tests/conftest.py
 import pytest
-from canvit_rl.env import CanViTEnv, CanViTEnvConfig
+from canvit_rl.environment import CanViTEnv, CanViTEnvConfig
 
 @pytest.fixture(scope="module")
 def env():

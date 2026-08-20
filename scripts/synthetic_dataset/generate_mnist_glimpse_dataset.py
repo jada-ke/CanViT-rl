@@ -49,8 +49,8 @@ from torch import Tensor
 from torchvision.datasets import MNIST
 
 from _paths import repo_path
-from canvit_rl.canvit_precision import resolve_canvit_dtype
-from canvit_rl.env import get_device
+from canvit_rl.vision.precision import resolve_canvit_dtype
+from canvit_rl.environment import get_device
 
 
 IGNORE_LABEL = 255
