@@ -1,14 +1,14 @@
 import torch
 import torch.nn.functional as F
 
-from canvit_rl.canvas.ppo import (
+from canvit_rl.policies.canvas_state.ppo import (
     CanvasPPO,
     CanvasPPORollout,
     canvas_actor_log_prob,
     clipped_value_loss,
     normalize_minibatch_advantages,
 )
-from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
 
 
 def _modules():

@@ -35,7 +35,7 @@ from tqdm import tqdm
 
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.greedy import miou_from_state
-from canvit_rl.policies.sac_sequence import (
+from canvit_rl.policies.image_independent.sac_sequence import (
     CanViTSequenceEncoder,
     ContinuousCritic,
     GaussianActor,

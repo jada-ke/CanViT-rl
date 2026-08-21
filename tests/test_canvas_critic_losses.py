@@ -1,6 +1,6 @@
 import torch
 
-from canvit_rl.canvas.critic_losses import (
+from canvit_rl.policies.canvas_state.critic_losses import (
     candidate_critic_loss,
     pairwise_best_margin_loss,
     topk_reward_weights,

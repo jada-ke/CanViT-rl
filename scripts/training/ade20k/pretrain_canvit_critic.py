@@ -60,7 +60,7 @@ from canvit_specialize.datasets.ade20k import make_val_transforms
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
-from canvit_rl.canvas.state import canvas_layernorm_spatial
+from canvit_rl.policies.canvas_state.state import canvas_layernorm_spatial
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.greedy import (
     _index_state_batch,
@@ -68,9 +68,9 @@ from canvit_rl.ade20k.greedy import (
     _repeat_state_chunks,
     _segmentation_cross_entropy_losses,
 )
-from canvit_rl.canvas.models import CanvasStateCritic
+from canvit_rl.policies.canvas_state.models import CanvasStateCritic
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
-from canvit_rl.policies.viewpoint import ViewpointHistoryCritic
+from canvit_rl.policies.image_independent.viewpoint import ViewpointHistoryCritic
 
 from canvit_rl.ade20k.visualization.reward_maps import visualize_reward_maps_for_indices
 

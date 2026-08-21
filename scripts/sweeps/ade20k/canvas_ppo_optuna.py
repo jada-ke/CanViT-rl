@@ -144,7 +144,7 @@ def run_canvas_ppo_optuna(
         import optuna
     except ImportError as exc:
         raise RuntimeError("Install optuna or run without --optuna-trials.") from exc
-    from canvit_rl.canvas.ppo import CanvasPPOCollapseError
+    from canvit_rl.policies.canvas_state.ppo import CanvasPPOCollapseError
 
     if args.resume is not None:
         raise ValueError("--resume cannot be used with --optuna-trials.")

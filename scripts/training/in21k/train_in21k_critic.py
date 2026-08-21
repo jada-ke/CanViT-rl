@@ -41,13 +41,13 @@ import torch
 from canvit_pytorch import Viewpoint, sample_at_viewpoint
 from tqdm import tqdm
 
-from canvit_rl.canvas.state import (
+from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
     empty_viewpoint_history,
 )
 from canvit_rl.vision.precision import resolve_canvit_dtype
-from canvit_rl.canvas.critic_losses import candidate_critic_loss
+from canvit_rl.policies.canvas_state.critic_losses import candidate_critic_loss
 from canvit_rl.ade20k.greedy import _index_state_batch, _repeat_state_chunks
 from canvit_rl.in21k.dense_train_batch import (
     DenseTrainBatch,
@@ -55,10 +55,10 @@ from canvit_rl.in21k.dense_train_batch import (
     init_normalizer_stats_from_shard,
     load_dense_train_batch,
 )
-from canvit_rl.canvas.candidates import sample_candidate_viewpoints
+from canvit_rl.policies.canvas_state.candidates import sample_candidate_viewpoints
 from canvit_rl.in21k.rewards import DenseDistillationMetrics, dense_reward
-from canvit_rl.canvas.models import CanvasStateCritic
-from canvit_rl.policies.viewpoint import viewpoint_to_action
+from canvit_rl.policies.canvas_state.models import CanvasStateCritic
+from canvit_rl.policies.image_independent.viewpoint import viewpoint_to_action
 from scripts.training.in21k.train_i21k_dense_sac import (
     build_dense_eval_loader,
     build_dense_loader,

@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from canvit_rl.environment import CanViTEnvConfig, get_device
-from canvit_rl.canvas.state import (
+from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_cosine_dissimilarity,
     canvas_dinov3_reconstruction_norm,
@@ -48,8 +48,8 @@ from canvit_rl.canvas.state import (
     scale_aware_detail_debt,
 )
 from canvit_rl.ade20k.greedy import miou_from_state
-from canvit_rl.canvas.models import CanvasStateActor
-from canvit_rl.policies.sac_sequence import CanViTSequenceEncoder, GaussianActor
+from canvit_rl.policies.canvas_state.models import CanvasStateActor
+from canvit_rl.policies.image_independent.sac_sequence import CanViTSequenceEncoder, GaussianActor
 from canvit_rl.state.sequences import (
     append_glimpse,
     batch_from_sequence,

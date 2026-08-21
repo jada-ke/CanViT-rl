@@ -46,10 +46,10 @@ from canvit_specialize.datasets.ade20k import IGNORE_LABEL, make_val_transforms
 
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
 from canvit_rl.ade20k.greedy import miou_from_state, run_greedy_episode
-from canvit_rl.canvas.models import CanvasStateActor
-from canvit_rl.canvas.state import canvas_layernorm_spatial, canvas_segmentation_entropy
+from canvit_rl.policies.canvas_state.models import CanvasStateActor
+from canvit_rl.policies.canvas_state.state import canvas_layernorm_spatial, canvas_segmentation_entropy
 from canvit_rl.environment import CanViTEnvConfig, get_device
-from canvit_rl.policies.viewpoint import (
+from canvit_rl.policies.image_independent.viewpoint import (
     ViewpointGaussianActor,
     action_to_viewpoint,
 )

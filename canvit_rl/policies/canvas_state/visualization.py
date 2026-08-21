@@ -12,7 +12,7 @@ from canvit_rl.ade20k.visualization.policy_glimpses import (
 from canvit_rl.ade20k.visualization.reward_maps import (
     visualize_reward_maps_for_indices,
 )
-from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
 from canvit_rl.environment import CanViTEnvConfig
 
 

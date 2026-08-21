@@ -1,14 +1,14 @@
 import torch
 
-from canvit_rl.canvas.sac import CanvasReplayBuffer
-from canvit_rl.canvas.state import (
+from canvit_rl.policies.canvas_state.sac import CanvasReplayBuffer
+from canvit_rl.policies.canvas_state.state import (
     canvas_cosine_dissimilarity,
     canvas_dinov3_reconstruction_norm,
     canvas_teacher_reconstruction_error,
     scale_aware_detail_debt,
 )
 from canvit_rl.in21k.checkpoints import load_dense_sac_critic_initializer
-from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
 
 
 def _batch(batch_size: int = 2) -> dict[str, torch.Tensor]:

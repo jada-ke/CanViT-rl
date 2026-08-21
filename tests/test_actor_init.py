@@ -2,7 +2,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from canvit_rl.policies.viewpoint import randomize_actor_mean_viewpoint_prior
+from canvit_rl.policies.image_independent.viewpoint import randomize_actor_mean_viewpoint_prior
 
 
 class DummyActor(nn.Module):

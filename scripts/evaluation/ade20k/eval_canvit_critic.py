@@ -29,9 +29,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
-from canvit_rl.canvas.state import empty_viewpoint_history
+from canvit_rl.policies.canvas_state.state import empty_viewpoint_history
 from canvit_rl.environment import CanViTEnvConfig, get_device
-from canvit_rl.policies.viewpoint import ViewpointHistoryCritic
+from canvit_rl.policies.image_independent.viewpoint import ViewpointHistoryCritic
 from scripts.training.ade20k.pretrain_canvit_critic import (
     _append_history,
     _viewpoint_to_action,

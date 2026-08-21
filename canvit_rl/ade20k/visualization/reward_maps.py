@@ -69,10 +69,10 @@ from canvit_rl.ade20k.greedy import (
     _repeat_state_chunks,
     _segmentation_cross_entropy_losses,
 )
-from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
-from canvit_rl.canvas.state import canvas_layernorm_spatial, canvas_segmentation_entropy
+from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.canvas_state.state import canvas_layernorm_spatial, canvas_segmentation_entropy
 from canvit_rl.environment import CanViTEnvConfig, get_device
-from canvit_rl.policies.viewpoint import (
+from canvit_rl.policies.image_independent.viewpoint import (
     ViewpointGaussianActor,
     ViewpointHistoryCritic,
     action_to_viewpoint,

@@ -6,10 +6,12 @@ Reinforcement-learning experiments for active-vision glimpse selection on top of
 
 - `canvit_rl/environment/`: image/model-dependent CanViT environment
   integration.
-- `canvit_rl/policies/` and `canvit_rl/state/`: image-independent policy,
-  action-conversion, and sequence-state utilities.
-- `canvit_rl/canvas/`: shared Canvas-state models, SAC/PPO helpers,
-  checkpointing, and visualization.
+- `canvit_rl/policies/image_independent/`: policies and action-conversion helpers
+  that use compact state/history inputs, not image or canvas tensors.
+- `canvit_rl/policies/canvas_state/`: image-dependent Canvas-state SAC/PPO
+  actors, critics, checkpointing, evaluation, and visualization helpers.
+- `canvit_rl/state/`: image-independent sequence-state utilities shared by policy
+  code.
 - `canvit_rl/ade20k/`: ADE20K-specific labels, datasets, rewards, greedy
   segmentation baselines, and mIoU evaluation.
 - `canvit_rl/in21k/`: dense ImageNet-21k feature-distillation loaders,

@@ -48,8 +48,8 @@ from canvit_rl.in21k.dense_train_batch import (  # noqa: E402
     load_dense_train_batch,
 )
 from canvit_rl.in21k.rewards import dense_distillation_metrics  # noqa: E402
-from canvit_rl.canvas.models import CanvasStateActor  # noqa: E402
-from canvit_rl.policies.viewpoint import action_to_viewpoint  # noqa: E402
+from canvit_rl.policies.canvas_state.models import CanvasStateActor  # noqa: E402
+from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint  # noqa: E402
 from scripts.training.in21k.train_i21k_dense_sac import (  # noqa: E402
     append_viewpoint_history,
     build_dense_eval_loader,

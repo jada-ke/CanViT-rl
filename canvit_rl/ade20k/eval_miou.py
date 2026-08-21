@@ -35,8 +35,8 @@ from torch import Tensor
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from canvit_rl.policies.mlp import MLPPolicy
-from canvit_rl.policies.viewpoint import action_to_viewpoint
+from canvit_rl.policies.image_independent.mlp import MLPPolicy
+from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint
 
 # Resolve an optional local CanViT-eval checkout from the repository root.
 EVAL_REPO = Path(__file__).resolve().parents[2] / "CanViT-eval"

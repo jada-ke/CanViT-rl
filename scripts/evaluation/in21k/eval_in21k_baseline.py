@@ -38,7 +38,7 @@ from scripts.training.in21k.train_i21k_dense_sac import (
     parse_reward_map_scales,
 )
 from canvit_rl.vision.precision import resolve_canvit_dtype
-from canvit_rl.policies.viewpoint import viewpoint_to_action
+from canvit_rl.policies.image_independent.viewpoint import viewpoint_to_action
 from canvit_pytorch import Viewpoint
 from canvit_pytorch.policies import random_viewpoints
 

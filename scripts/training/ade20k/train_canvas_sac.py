@@ -41,7 +41,7 @@ if "-h" not in sys.argv and "--help" not in sys.argv and "--no-comet" not in sys
     except ImportError:
         pass
 
-from canvit_rl.canvas.logging import (
+from canvit_rl.policies.canvas_state.logging import (
     log_canvas_sac_final_metrics,
     log_final_full_validation_miou_curve,
     make_comet_experiment,
@@ -57,13 +57,13 @@ from canvit_pytorch import (
 )
 from tqdm import tqdm
 
-from canvit_rl.canvas.state import (
+from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
     canvas_segmentation_entropy,
     empty_viewpoint_history,
 )
-from canvit_rl.canvas.sac import (
+from canvit_rl.policies.canvas_state.sac import (
     REPLAY_STORAGE_DTYPE,
     CanvasReplayBuffer,
     CanvasSAC,
@@ -73,13 +73,13 @@ from canvit_rl.canvas.sac import (
     validate_replay_memory,
 )
 from canvit_rl.vision.precision import configure_frozen_canvit_precision
-from canvit_rl.canvas.args import add_canvas_sac_args, validate_canvas_sac_args
-from canvit_rl.canvas.checkpoints import (
+from canvit_rl.policies.canvas_state.args import add_canvas_sac_args, validate_canvas_sac_args
+from canvit_rl.policies.canvas_state.checkpoints import (
     load_canvas_sac_pretrained_initializers,
     load_canvas_sac_resume,
     save_canvas_sac_checkpoint,
 )
-from canvit_rl.canvas.eval import (
+from canvit_rl.policies.canvas_state.eval import (
     evaluate_best_full_validation_miou,
     evaluate_canvas_sac,
     evaluate_egc2f_full_validation_miou,
@@ -88,19 +88,19 @@ from canvit_rl.canvas.eval import (
     should_run_final_full_validation_miou,
     viewpoint_entropy,
 )
-from canvit_rl.canvas.training import (
+from canvit_rl.policies.canvas_state.training import (
     build_canvas_sac_data,
     build_canvas_sac_networks,
     combine_eval_metrics,
     sync_for_timing,
 )
-from canvit_rl.canvas.visualization import (
+from canvit_rl.policies.canvas_state.visualization import (
     maybe_visualize_canvas_sac_reward_maps,
     parse_reward_map_scales,
 )
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.rewards import relative_ce_reduction
-from canvit_rl.policies.viewpoint import action_to_viewpoint
+from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint
 
 try:
     from canvas_sac_optuna import add_canvas_sac_optuna_args, run_canvas_sac_optuna

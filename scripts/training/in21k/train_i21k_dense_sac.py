@@ -62,7 +62,7 @@ from canvit_pytorch import Viewpoint, sample_at_viewpoint
 from canvit_pytorch.model.pretraining.hub import CanViTForPretrainingHFHub
 from tqdm import tqdm
 
-from canvit_rl.canvas.sac import (
+from canvit_rl.policies.canvas_state.sac import (
     REPLAY_STORAGE_DTYPE,
     CanvasReplayBuffer,
     CanvasSAC,
@@ -71,8 +71,8 @@ from canvit_rl.canvas.sac import (
     should_pin_replay_memory,
     validate_replay_memory,
 )
-from canvit_rl.canvas.eval import viewpoint_entropy
-from canvit_rl.canvas.state import (
+from canvit_rl.policies.canvas_state.eval import viewpoint_entropy
+from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_cosine_dissimilarity,
     canvas_dinov3_reconstruction_norm,
@@ -104,8 +104,8 @@ from canvit_rl.in21k.rewards import (
     dense_distillation_metrics,
     dense_reward,
 )
-from canvit_rl.canvas.models import CanvasStateActor, CanvasStateCritic
-from canvit_rl.policies.viewpoint import action_to_viewpoint, viewpoint_to_action
+from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint, viewpoint_to_action
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])[:, None, None]

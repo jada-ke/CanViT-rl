@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import torch
 
-from canvit_rl.canvas.candidates import (
+from canvit_rl.policies.canvas_state.candidates import (
     fixed_scale_candidate_viewpoints,
     last_history_viewpoint,
     sample_candidate_viewpoints,

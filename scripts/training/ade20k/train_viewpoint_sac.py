@@ -69,7 +69,7 @@ from tqdm import tqdm
 from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
 from canvit_rl.ade20k.visualization.reward_maps import visualize_reward_maps_for_indices
 from canvit_rl.environment import CanViTEnvConfig, get_device
-from canvit_rl.policies.viewpoint import (
+from canvit_rl.policies.image_independent.viewpoint import (
     ViewpointGaussianActor,
     ViewpointHistoryCritic,
     action_to_viewpoint,

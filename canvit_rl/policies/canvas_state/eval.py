@@ -22,7 +22,7 @@ from canvit_specialize.metrics import mIoUAccumulator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from canvit_rl.canvas.state import (
+from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
     canvas_segmentation_entropy,
@@ -30,12 +30,14 @@ from canvit_rl.canvas.state import (
 )
 from canvit_rl.environment import CanViTEnvConfig
 from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
-from canvit_rl.canvas.models import CanvasStateActor
+from canvit_rl.policies.canvas_state.models import CanvasStateActor
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
-from canvit_rl.policies.viewpoint import action_to_viewpoint
+from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint
 
-# Resolve an optional local CanViT-eval checkout from the repository root.
-EVAL_REPO = Path(__file__).resolve().parents[2] / "CanViT-eval"
+# Problem: nesting Canvas-state policy helpers under policies/ moved this file
+# one level deeper. Solution: climb to the repository root before probing for a
+# sibling CanViT-eval checkout.
+EVAL_REPO = Path(__file__).resolve().parents[3] / "CanViT-eval"
 if EVAL_REPO.is_dir() and str(EVAL_REPO) not in sys.path:
     sys.path.insert(0, str(EVAL_REPO))
 

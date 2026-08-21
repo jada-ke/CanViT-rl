@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from canvit_rl.canvas.logging import add_canvas_sac_comet_args
+from canvit_rl.policies.canvas_state.logging import add_canvas_sac_comet_args
 
 
 def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
