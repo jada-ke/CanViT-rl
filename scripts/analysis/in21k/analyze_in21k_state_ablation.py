@@ -36,6 +36,9 @@ STATE_LABELS = {
     "canvas_hist": "Viewpoint History",
     "canvas_hist_cosprev": "Viewpoint History + Cos-Prev",
     "canvas_hist_reconstructionnorm": "Viewpoint History + Reconstruction Norm",
+    "canvas_hist_reconstructionnorm_cosprev": (
+        "Viewpoint History + Reconstruction Norm + Cos-Prev"
+    ),
     "viewpoint-history": "Viewpoint History",
     "canvas_no_hist": "No History",
     "canvas_no_hist_detdebt": "No History + Detail Debt",
@@ -52,6 +55,7 @@ STATE_NOTES = {
     "canvas_hist": "Longer-run default explicit VPE/GRU coordinate-history state.",
     "canvas_hist_cosprev": "Longer-run viewpoint-history state plus current-vs-previous canvas feature change.",
     "canvas_hist_reconstructionnorm": "Longer-run viewpoint-history state plus target-free reconstructed-feature norm map.",
+    "canvas_hist_reconstructionnorm_cosprev": "Longer-run viewpoint-history state plus reconstruction norm and cos-prev aux maps.",
     "viewpoint-history": "Default explicit VPE/GRU coordinate-history state.",
     "canvas_no_hist": "Current canvas only; explicit viewpoint-history branch disabled.",
     "canvas_no_hist_detdebt": "Canvas only plus scale-aware visited-footprint detail debt.",
@@ -244,7 +248,7 @@ def format_recommendation(traces: list[StateTrace], *, rank_window: int) -> list
         "",
         f"At the longest shared horizon in this JSON (`x={max_horizon:g}`), `{best_long.name}` is best by final-window `train/norm_mean`.",
         "",
-        "Use viewpoint history plus `--reconstruction-norm-state` as the current main state candidate if this trace is your intended `canvas_hist_reconstructionnorm` run. The longer training helps the leading candidates separate from their earlier checkpoints, but the remaining top gaps are still small enough to treat as a one-seed training signal rather than a settled statistical result.",
+        "Use viewpoint history plus `--reconstruction-norm-state` as the current main state candidate if this trace is your intended `canvas_hist_reconstructionnorm` run. The longer training makes this the most favorable curve overall, but the top runs still settle very close together, so this should be read as a practical choice rather than a dramatic separation.",
         "",
         "Recommended next comparisons:",
         "",
@@ -322,6 +326,16 @@ def format_recommendation(traces: list[StateTrace], *, rank_window: int) -> list
             "canvas_hist_cosprev",
         ),
         (
+            "Longer reconstruction norm + cos-prev vs reconstruction norm",
+            "canvas_hist_reconstructionnorm_cosprev",
+            "canvas_hist_reconstructionnorm",
+        ),
+        (
+            "Longer reconstruction norm + cos-prev vs cos-prev",
+            "canvas_hist_reconstructionnorm_cosprev",
+            "canvas_hist_cosprev",
+        ),
+        (
             "Longer history cos-prev vs longer no-history cos-prev",
             "canvas_hist_cosprev",
             "canvas_no_hist_cosprev",
@@ -377,7 +391,8 @@ def format_recommendation(traces: list[StateTrace], *, rank_window: int) -> list
             "- `teacher_reconstruction_error` is the strongest endpoint trace, but it is target-dependent and only slightly ahead of the cleaner reconstruction-norm state.",
             "- The longer-run subset changes the story: viewpoint history plus reconstruction norm is now the best longest-horizon trace.",
             "- Longer training appears useful because the comparable longer traces improve over their shorter earlier versions.",
-            "- The leading gaps remain small, so this is best treated as a practical single-seed selection signal rather than proof that the state is universally better.",
+            "- The leading curves end up in nearly the same range. This does not make reconstruction norm a decisive winner; it makes it the most sensible default because it has the best endpoint/AUC trend, improves over the plain history baseline, and has a clean interpretation.",
+            "- Since adding cos-prev to reconstruction norm did not improve the curve, further gains are more likely to come from SAC hyperparameter tuning than from continuing to stack state features.",
             "- Detail debt still does not have a clear positive signal in the shorter runs.",
         ]
     )

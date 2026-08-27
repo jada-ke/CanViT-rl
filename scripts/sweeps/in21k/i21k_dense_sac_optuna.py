@@ -61,21 +61,24 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--objective-metric",
         type=str,
-        default="eval/reward",
-        help="Metric key read from each trial's final checkpoint.",
+        default="eval/norm_mean",
+        help=(
+            "Metric key read from each trial's final checkpoint. Defaults to "
+            "the time-averaged normalized pretraining objective, not the final "
+            "normalized endpoint loss."
+        ),
     )
     parser.add_argument(
         "--objective-direction",
         choices=["maximize", "minimize"],
-        default="maximize",
+        default="minimize",
     )
     parser.add_argument("--base-seed", type=int, default=42)
     parser.add_argument(
         "--search-architecture",
         action="store_true",
         help=(
-            "Currently disabled/no-op. Architecture dimensions are fixed while "
-            "SAC dynamics are being swept."
+            "Also tune actor/critic canvas-state model dimensions."
         ),
     )
     parser.add_argument(
@@ -154,40 +157,39 @@ def _suggest_trial_overrides(args: argparse.Namespace, trial: Any) -> list[str]:
         str(trial.suggest_float("target_entropy", -5.0, -2.0)),
     ]
     if args.search_replay:
-        # Problem: the original replay search included tiny debug settings that
-        # update SAC from little replay diversity. Solution: keep replay search
-        # opt-in, but use warmups/batch sizes appropriate for small 80/20 image
-        # subset sweeps. Result: Optuna spends trials on plausible SAC dynamics
-        # instead of near-immediate updates from a handful of transitions.
+        # Problem: longer runs make tiny replay warmups overfit early noisy
+        # transitions. Solution: keep replay search opt-in, but sweep later
+        # learning starts that still fit the default 2048 transition buffer.
+        # Result: SAC updates begin after a more representative canvas-state
+        # distribution without waiting so long that short smoke runs stall.
         overrides.extend(
             [
                 "--replay-batch-size",
                 str(trial.suggest_categorical("replay_batch_size", [16, 32, 64])),
                 "--learning-starts",
-                str(trial.suggest_categorical("learning_starts", [64, 128, 256])),
+                str(trial.suggest_categorical("learning_starts", [256, 512, 1024])),
                 "--updates-per-batch",
                 str(trial.suggest_categorical("updates_per_batch", [1, 2, 4])),
             ]
         )
-    # Problem: architecture sweeps add many trials and recent experiments point
-    # at SAC dynamics rather than model capacity. Solution: keep
-    # --search-architecture accepted for command compatibility, but leave the
-    # dimension search disabled until capacity is the active question again.
-    # Result: Optuna focuses on LR/alpha/replay without silently
-    # changing actor or critic size.
-    # if args.search_architecture:
-    #     overrides.extend(
-    #         [
-    #             "--d-model",
-    #             str(trial.suggest_categorical("d_model", [128, 256, 384])),
-    #             "--rff-dim",
-    #             str(trial.suggest_categorical("rff_dim", [64, 128, 256])),
-    #             "--critic-d-model",
-    #             str(trial.suggest_categorical("critic_d_model", [256, 384, 512])),
-    #             "--critic-rff-dim",
-    #             str(trial.suggest_categorical("critic_rff_dim", [128, 256, 384])),
-    #         ]
-    #     )
+    if args.search_architecture:
+        # Problem: long IN21k runs can expose actor/critic capacity limits that
+        # short SAC-dynamics sweeps intentionally ignored. Solution: make the
+        # architecture flag active again and sweep dimensions accepted by the
+        # dense trainer. Result: capacity search is explicit instead of being a
+        # surprising no-op.
+        overrides.extend(
+            [
+                "--d-model",
+                str(trial.suggest_categorical("d_model", [128, 256, 384])),
+                "--rff-dim",
+                str(trial.suggest_categorical("rff_dim", [64, 128, 256])),
+                "--critic-d-model",
+                str(trial.suggest_categorical("critic_d_model", [256, 384, 512])),
+                "--critic-rff-dim",
+                str(trial.suggest_categorical("critic_rff_dim", [128, 256, 384])),
+            ]
+        )
     if args.search_gamma:
         overrides.extend(
             [
