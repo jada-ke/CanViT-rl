@@ -8,9 +8,20 @@ glimpses using average saliency inside candidate windows with simple NMS.
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 import time
 from pathlib import Path
 
+if "--comet" in sys.argv:
+    try:
+        from comet_ml import Experiment
+    except ImportError:
+        Experiment = None
+else:
+    Experiment = None
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 from canvit_pytorch import (
@@ -26,13 +37,14 @@ from canvit_specialize.datasets.ade20k import (
     make_val_transforms,
 )
 from canvit_specialize.metrics import mIoUAccumulator
+from PIL import Image
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from _paths import repo_path
-from canvit_rl.env import CanViTEnvConfig, get_device
-from canvit_rl.greedy import miou_from_state
+from canvit_rl.environment.canvit_env import CanViTEnvConfig, get_device
+from canvit_rl.ade20k.greedy import miou_from_state
 
 
 class IndexedDataset(Dataset):
@@ -47,6 +59,33 @@ class IndexedDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[Tensor, Tensor, int]:
         image, mask = self.dataset[idx]
         return image, mask, idx
+
+
+def _make_comet_experiment(args: argparse.Namespace):
+    """Create an opt-in Comet experiment for saliency baseline eval outputs."""
+    if not args.comet:
+        return None
+    if Experiment is None:
+        raise RuntimeError("Install comet-ml or rerun without --comet.")
+
+    # Problem: Comet can warn or miss framework setup if imported after torch.
+    # Solution: import it above torch when --comet is present, then construct
+    # the experiment here. Result: normal offline runs avoid Comet import cost,
+    # while Comet runs follow the repo's training-script import order.
+    experiment = Experiment(
+        project_name=args.comet_project,
+        workspace=args.comet_workspace,
+        auto_param_logging=False,
+        auto_metric_logging=False,
+    )
+    if args.experiment_name:
+        experiment.set_name(args.experiment_name)
+    if args.comet_tags:
+        experiment.add_tags(
+            [tag.strip() for tag in args.comet_tags.split(",") if tag.strip()]
+        )
+    experiment.log_parameters(vars(args))
+    return experiment
 
 
 def _parse_scales(value: str) -> list[float]:
@@ -144,6 +183,126 @@ def _select_one_viewpoint(
     return center, scale_t, best_yx
 
 
+def _connected_components(mask: np.ndarray) -> list[np.ndarray]:
+    visited = np.zeros(mask.shape, dtype=bool)
+    components: list[np.ndarray] = []
+    height, width = mask.shape
+    for start_y, start_x in np.argwhere(mask):
+        if visited[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        visited[start_y, start_x] = True
+        pixels: list[tuple[int, int]] = []
+        while stack:
+            y, x = stack.pop()
+            pixels.append((y, x))
+            for ny in (y - 1, y, y + 1):
+                for nx in (x - 1, x, x + 1):
+                    if (
+                        ny < 0
+                        or ny >= height
+                        or nx < 0
+                        or nx >= width
+                        or visited[ny, nx]
+                        or not mask[ny, nx]
+                    ):
+                        continue
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+        components.append(np.asarray(pixels, dtype=np.int64))
+    return components
+
+
+def _scale_for_blob(
+    *,
+    y_min: int,
+    y_max: int,
+    x_min: int,
+    x_max: int,
+    height: int,
+    width: int,
+    scales: list[float],
+    margin: float,
+) -> float:
+    needed = max(
+        ((y_max - y_min + 1) / height) * margin,
+        ((x_max - x_min + 1) / width) * margin,
+    )
+    for scale in sorted(scales):
+        if scale >= needed:
+            return scale
+    return max(scales)
+
+
+def _select_blob_viewpoint(
+    saliency: Tensor,
+    scales: list[float],
+    *,
+    threshold_quantile: float,
+    min_area_px: int,
+    margin: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    height, width = saliency.shape
+    saliency_cpu = saliency.detach().cpu()
+    positive = saliency_cpu[saliency_cpu > 0]
+    if positive.numel() == 0:
+        return _select_one_viewpoint(saliency, scales)
+
+    threshold = float(torch.quantile(positive, threshold_quantile).item())
+    mask = saliency_cpu.numpy() >= threshold
+    components = [
+        component
+        for component in _connected_components(mask)
+        if len(component) >= min_area_px
+    ]
+    if not components:
+        return _select_one_viewpoint(saliency, scales)
+
+    saliency_np = saliency_cpu.numpy()
+    best_component = max(
+        components,
+        key=lambda component: float(saliency_np[component[:, 0], component[:, 1]].sum()),
+    )
+    y_values = best_component[:, 0]
+    x_values = best_component[:, 1]
+    weights = saliency_np[y_values, x_values]
+    weight_sum = max(float(weights.sum()), 1e-6)
+    y = float((y_values * weights).sum() / weight_sum)
+    x = float((x_values * weights).sum() / weight_sum)
+    scale = _scale_for_blob(
+        y_min=int(y_values.min()),
+        y_max=int(y_values.max()),
+        x_min=int(x_values.min()),
+        x_max=int(x_values.max()),
+        height=height,
+        width=width,
+        scales=scales,
+        margin=margin,
+    )
+    # Problem: raw blob extents can produce arbitrary zooms that make saliency
+    # comparisons hard to sweep. Solution: use the blob bbox only to pick from
+    # the allowed scale set, e.g. 0.25 or 0.5. Result: zoom is blob-aware but
+    # still controlled by explicit hyperparameters.
+    scale_t = torch.tensor(scale, dtype=torch.float32, device=saliency.device)
+    center_x = (2.0 * (x + 0.5) / width) - 1.0
+    center_y = (2.0 * (y + 0.5) / height) - 1.0
+    bound = (1.0 - scale_t).clamp_min(0.0)
+    center = torch.stack(
+        (
+            torch.tensor(center_x, dtype=torch.float32, device=saliency.device).clamp(
+                -bound,
+                bound,
+            ),
+            torch.tensor(center_y, dtype=torch.float32, device=saliency.device).clamp(
+                -bound,
+                bound,
+            ),
+        )
+    )
+    yx = torch.tensor([round(y), round(x)], dtype=torch.long, device=saliency.device)
+    return center, scale_t, yx
+
+
 def _suppress_region(saliency: Tensor, yx: Tensor, scale: float, nms_scale: float) -> None:
     height, width = saliency.shape
     radius_y = max(1, round(height * scale * nms_scale / 2.0))
@@ -161,6 +320,10 @@ def _saliency_schedule(
     n_glimpses: int,
     scales: list[float],
     nms_scale: float,
+    selection_mode: str,
+    blob_threshold_quantile: float,
+    blob_min_area_px: int,
+    blob_margin: float,
 ) -> tuple[Tensor, Tensor]:
     if n_glimpses == 0:
         batch_size = len(saliency_maps)
@@ -177,13 +340,194 @@ def _saliency_schedule(
         step_centers = []
         step_scales = []
         for saliency in working:
-            center, scale, yx = _select_one_viewpoint(saliency, scales)
+            if selection_mode == "blob":
+                center, scale, yx = _select_blob_viewpoint(
+                    saliency,
+                    scales,
+                    threshold_quantile=blob_threshold_quantile,
+                    min_area_px=blob_min_area_px,
+                    margin=blob_margin,
+                )
+            else:
+                center, scale, yx = _select_one_viewpoint(saliency, scales)
             step_centers.append(center)
             step_scales.append(scale)
             _suppress_region(saliency, yx, float(scale.item()), nms_scale)
         centers_by_t.append(torch.stack(step_centers))
         scales_by_t.append(torch.stack(step_scales))
     return torch.stack(centers_by_t), torch.stack(scales_by_t)
+
+
+def _viewpoint_box(
+    center: Tensor,
+    scale: Tensor,
+    *,
+    image_size: int,
+) -> tuple[int, int, int, int]:
+    center = center.detach().cpu().float()
+    scale_value = float(scale.detach().cpu().item())
+    half = max(1.0, image_size * scale_value / 2.0)
+    x = float((center[0].item() + 1.0) * 0.5 * image_size)
+    y = float((center[1].item() + 1.0) * 0.5 * image_size)
+    return (
+        max(0, round(x - half)),
+        max(0, round(y - half)),
+        min(image_size - 1, round(x + half)),
+        min(image_size - 1, round(y + half)),
+    )
+
+
+def _load_visualization_image(image_path: Path, scene_size_px: int) -> np.ndarray:
+    image = Image.open(image_path).convert("RGB").resize(
+        (scene_size_px, scene_size_px),
+        resample=Image.Resampling.BILINEAR,
+    )
+    return np.asarray(image, dtype=np.uint8)
+
+
+def _saliency_overlay(image_np: np.ndarray, saliency: Tensor) -> np.ndarray:
+    sal = saliency.detach().cpu().float()
+    sal = sal - sal.min()
+    sal = sal / sal.max().clamp_min(1e-6)
+    sal_np = sal.numpy()
+    heat = np.zeros_like(image_np)
+    heat[..., 0] = (sal_np * 255.0).astype(np.uint8)
+    heat[..., 2] = (sal_np * 255.0).astype(np.uint8)
+    return np.clip(image_np.astype(np.float32) * 0.72 + heat.astype(np.float32) * 0.28, 0, 255).astype(
+        np.uint8
+    )
+
+
+def _save_visualization_figure(
+    *,
+    rows: list[dict[str, object]],
+    method: str,
+    output_dir: Path,
+    scene_size_px: int,
+) -> Path | None:
+    if not rows:
+        return None
+    try:
+        import matplotlib.patches as patches
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("Install matplotlib to save saliency timestep figures.") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    n_steps = int(rows[0]["centers_by_t"].shape[0]) + 1
+    n_cols = n_steps + 1
+    colors = plt.cm.viridis(np.linspace(0.05, 0.95, n_steps))
+    fig, axes = plt.subplots(
+        len(rows),
+        n_cols,
+        figsize=(4.0 * n_cols, max(3.2 * len(rows), 4.0)),
+        dpi=150,
+        squeeze=False,
+    )
+    for sample_idx, row in enumerate(rows):
+        image_np = _load_visualization_image(
+            Path(row["image_path"]),
+            scene_size_px,
+        )
+        saliency = row["saliency"]
+        centers_by_t = row["centers_by_t"]
+        scales_by_t = row["scales_by_t"]
+        image_id = str(row["image_id"])
+        overlay_np = _saliency_overlay(image_np, saliency)
+
+        overview_ax = axes[sample_idx, 0]
+        overview_ax.imshow(image_np)
+        overview_ax.set_title(f"{image_id}\nall viewpoints")
+        overview_ax.axis("off")
+
+        full_box = (0, 0, scene_size_px - 1, scene_size_px - 1)
+        all_boxes: list[tuple[int, int, int, int]] = [full_box]
+        for step_idx in range(1, n_steps):
+            all_boxes.append(
+                _viewpoint_box(
+                    centers_by_t[step_idx - 1, 0],
+                    scales_by_t[step_idx - 1, 0],
+                    image_size=scene_size_px,
+                )
+            )
+
+        for step_idx, box in enumerate(all_boxes):
+            color = colors[step_idx]
+            # Problem: per-sample strip images made it harder to compare many
+            # saliency rollouts at once. Solution: mirror the IN21k SAC figure
+            # layout: an overview column plus one focused column per timestep.
+            # Result: a single PNG shows all requested samples and their gaze
+            # sequence with consistent colors and titles.
+            overview_ax.add_patch(
+                patches.Rectangle(
+                    (box[0], box[1]),
+                    max(box[2] - box[0], 1),
+                    max(box[3] - box[1], 1),
+                    linewidth=2.5,
+                    edgecolor=color,
+                    facecolor="none",
+                )
+            )
+            overview_ax.text(
+                box[0] + 3,
+                box[1] + 12,
+                f"t{step_idx}",
+                color=color,
+                fontsize=9,
+                weight="bold",
+            )
+
+        for step_idx, box in enumerate(all_boxes):
+            ax = axes[sample_idx, step_idx + 1]
+            ax.imshow(image_np if step_idx == 0 else overlay_np)
+            ax.add_patch(
+                patches.Rectangle(
+                    (box[0], box[1]),
+                    max(box[2] - box[0], 1),
+                    max(box[3] - box[1], 1),
+                    linewidth=3.0,
+                    edgecolor=colors[step_idx],
+                    facecolor="none",
+                )
+            )
+            if step_idx == 0:
+                title = "t0 full\nscale=1.00"
+            else:
+                center = centers_by_t[step_idx - 1, 0].detach().cpu().tolist()
+                scale = float(scales_by_t[step_idx - 1, 0].detach().cpu())
+                title = f"t{step_idx} {method}\ns={scale:.2f} c=({center[0]:+.2f},{center[1]:+.2f})"
+            ax.set_title(title)
+            ax.axis("off")
+
+    fig.suptitle(f"ADE20K saliency heuristic glimpses: {method}")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
+    output = output_dir / f"{method}_saliency_timesteps.png"
+    fig.savefig(output)
+    plt.close(fig)
+    return output
+
+
+def _log_to_comet(
+    *,
+    comet_exp,
+    metrics: dict[str, float],
+    output: Path,
+    visualization_path: Path | None,
+) -> None:
+    """Log final saliency mIoU metrics and generated artifacts to Comet."""
+    if comet_exp is None:
+        return
+    comet_exp.log_metrics(metrics)
+    if visualization_path is not None:
+        # Problem: saliency crop sanity checks were only local files. Solution:
+        # log the combined timestep figure alongside scalar mIoU. Result:
+        # Comet runs show both quantitative outcome and the exact gaze pattern.
+        comet_exp.log_image(
+            str(visualization_path),
+            name=f"saliency/{visualization_path.name}",
+        )
+    comet_exp.log_asset(str(output), file_name=output.name)
+    comet_exp.end()
 
 
 def main() -> None:
@@ -198,7 +542,34 @@ def main() -> None:
         "--scales",
         type=str,
         default="0.25",
-        help="Comma-separated glimpse scales",
+        help=(
+            "Comma-separated allowed glimpse scales. In blob mode, the blob "
+            "bbox is quantized to the smallest allowed scale that covers it."
+        ),
+    )
+    parser.add_argument(
+        "--selection-mode",
+        choices=["fixed_fovea", "blob"],
+        default="fixed_fovea",
+        help="How saliency maps choose each post-t0 Viewpoint.",
+    )
+    parser.add_argument(
+        "--blob-threshold-quantile",
+        type=float,
+        default=0.85,
+        help="Saliency quantile used to threshold connected blobs.",
+    )
+    parser.add_argument(
+        "--blob-min-area-px",
+        type=int,
+        default=16,
+        help="Ignore connected saliency blobs smaller than this many pixels.",
+    )
+    parser.add_argument(
+        "--blob-margin",
+        type=float,
+        default=1.25,
+        help="Multiplier applied to blob bbox before quantizing to --scales.",
     )
     parser.add_argument("--nms-scale", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -208,7 +579,23 @@ def main() -> None:
     parser.add_argument("--method", type=str, required=True)
     parser.add_argument("--saliency-cache-root", type=Path, default=Path("cache/saliency"))
     parser.add_argument("--probe-repo", type=str, default=None)
-    parser.add_argument("--output", type=Path, default=Path("results/saliency_baseline_miou.pt"))
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("results/saliency_baseline_miou.json"),
+    )
+    parser.add_argument(
+        "--visualize-samples",
+        type=int,
+        default=0,
+        help="Save timestep-strip overlays for the first N evaluated images.",
+    )
+    parser.add_argument(
+        "--visualization-dir",
+        type=Path,
+        default=Path("results/saliency_visualizations"),
+        help="Directory for --visualize-samples PNG strips.",
+    )
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
@@ -217,13 +604,31 @@ def main() -> None:
         default="accumulator",
         help="Match random baseline modes for dataset-level or per-image mIoU.",
     )
+    parser.add_argument(
+        "--comet",
+        action="store_true",
+        help="Log final metrics, result JSON, and optional visualization to Comet.",
+    )
+    parser.add_argument("--comet-workspace", type=str, default=None)
+    parser.add_argument("--comet-project", type=str, default="canvit-rl")
+    parser.add_argument("--experiment-name", type=str, default=None)
+    parser.add_argument("--comet-tags", type=str, default="saliency,ade20k")
     args = parser.parse_args()
 
     if args.t < 0:
         raise ValueError("--t must be non-negative.")
     if args.nms_scale <= 0:
         raise ValueError("--nms-scale must be positive.")
+    if not 0.0 < args.blob_threshold_quantile < 1.0:
+        raise ValueError("--blob-threshold-quantile must satisfy 0 < q < 1.")
+    if args.blob_min_area_px < 1:
+        raise ValueError("--blob-min-area-px must be positive.")
+    if args.blob_margin <= 0:
+        raise ValueError("--blob-margin must be positive.")
+    if args.visualize_samples < 0:
+        raise ValueError("--visualize-samples must be non-negative.")
     scales = _parse_scales(args.scales)
+    comet_exp = _make_comet_experiment(args)
 
     cfg = CanViTEnvConfig()
     device = get_device()
@@ -279,6 +684,9 @@ def main() -> None:
     scale_sums = [0.0 for _ in range(n_steps)]
     count_sums = [0 for _ in range(n_steps)]
     n_images = 0
+    n_visualized = 0
+    visualization_rows: list[dict[str, object]] = []
+    visualization_dir = repo_path(args.visualization_dir)
     t_start = time.monotonic()
 
     with torch.inference_mode():
@@ -301,7 +709,35 @@ def main() -> None:
                 n_glimpses=args.t,
                 scales=scales,
                 nms_scale=args.nms_scale,
+                selection_mode=args.selection_mode,
+                blob_threshold_quantile=args.blob_threshold_quantile,
+                blob_min_area_px=args.blob_min_area_px,
+                blob_margin=args.blob_margin,
             )
+            if n_visualized < args.visualize_samples:
+                for local_idx, image_id in enumerate(image_ids):
+                    if n_visualized >= args.visualize_samples:
+                        break
+                    visualization_rows.append(
+                        {
+                            "image_path": dataset.images[int(indices[local_idx])],
+                            "image_id": image_id,
+                            "saliency": saliency_maps[local_idx].detach().cpu(),
+                            "centers_by_t": centers_by_t[
+                                :,
+                                local_idx : local_idx + 1,
+                            ]
+                            .detach()
+                            .cpu(),
+                            "scales_by_t": scales_by_t[
+                                :,
+                                local_idx : local_idx + 1,
+                            ]
+                            .detach()
+                            .cpu(),
+                        }
+                    )
+                    n_visualized += 1
             state = model.init_state(
                 batch_size=batch_size,
                 canvas_grid_size=cfg.canvas_grid_size,
@@ -359,6 +795,12 @@ def main() -> None:
         mious = {f"t{t}": miou_sums[t] / count_sums[t] for t in range(n_steps)}
     mean_scales = {f"t{t}": scale_sums[t] / count_sums[t] for t in range(n_steps)}
     wall_time = time.monotonic() - t_start
+    visualization_path = _save_visualization_figure(
+        rows=visualization_rows,
+        method=args.method,
+        output_dir=visualization_dir,
+        scene_size_px=cfg.scene_size_px,
+    )
 
     print("\n--- Saliency Baseline mIoU ---")
     for t in range(n_steps):
@@ -368,38 +810,68 @@ def main() -> None:
             f"scale={mean_scales[f't{t}']:.3f}  "
             f"miou={mious[f't{t}']:.4f}"
         )
+    final_metrics = {
+        **{f"miou/t{t}": mious[f"t{t}"] for t in range(n_steps)},
+        **{f"scale/t{t}": mean_scales[f"t{t}"] for t in range(n_steps)},
+        "miou/final": mious[f"t{n_steps - 1}"],
+        "eval/n_images": float(n_images),
+        "eval/wall_time_seconds": wall_time,
+    }
 
     output = repo_path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "mious": mious,
-            "mean_scales": mean_scales,
-            "metadata": {
-                "policy": "saliency_nms_after_full_scene",
-                "method": args.method,
-                "dataset": str(repo_path(args.dataset)),
-                "split": args.split,
-                "n_images": n_images,
-                "canvas_grid_size": cfg.canvas_grid_size,
-                "glimpse_size_px": cfg.glimpse_size_px,
-                "scene_size_px": cfg.scene_size_px,
-                "n_saliency_glimpses": args.t,
-                "n_logged_steps": n_steps,
-                "scales": scales,
-                "nms_scale": args.nms_scale,
-                "requested_batch_size": args.batch_size,
-                "effective_batch_size": effective_batch_size,
-                "probe_repo": probe_repo,
-                "model_repo": cfg.checkpoint,
-                "amp": amp,
-                "miou_mode": args.miou_mode,
-                "wall_time_seconds": wall_time,
-            },
+    result_payload = {
+        "mious": mious,
+        "mean_scales": mean_scales,
+        "metadata": {
+            "policy": "saliency_nms_after_full_scene",
+            "method": args.method,
+            "dataset": str(repo_path(args.dataset)),
+            "split": args.split,
+            "n_images": n_images,
+            "canvas_grid_size": cfg.canvas_grid_size,
+            "glimpse_size_px": cfg.glimpse_size_px,
+            "scene_size_px": cfg.scene_size_px,
+            "n_saliency_glimpses": args.t,
+            "n_logged_steps": n_steps,
+            "scales": scales,
+            "nms_scale": args.nms_scale,
+            "selection_mode": args.selection_mode,
+            "blob_threshold_quantile": args.blob_threshold_quantile,
+            "blob_min_area_px": args.blob_min_area_px,
+            "blob_margin": args.blob_margin,
+            "requested_batch_size": args.batch_size,
+            "effective_batch_size": effective_batch_size,
+            "probe_repo": probe_repo,
+            "model_repo": cfg.checkpoint,
+            "amp": amp,
+            "miou_mode": args.miou_mode,
+            "wall_time_seconds": wall_time,
+            "visualized_samples": n_visualized,
+            "visualization_dir": str(visualization_dir),
+            "visualization_path": (
+                None if visualization_path is None else str(visualization_path)
+            ),
         },
-        output,
+    }
+    # Problem: saliency eval results were saved as a PyTorch payload even
+    # though the contents are scalar metrics and metadata. Solution: write a
+    # plain JSON result file. Result: Comet, plotting scripts, and humans can
+    # inspect the output without torch.load.
+    with output.open("w", encoding="utf-8") as f:
+        json.dump(result_payload, f, indent=2, sort_keys=True)
+    _log_to_comet(
+        comet_exp=comet_exp,
+        metrics=final_metrics,
+        output=output,
+        visualization_path=visualization_path,
     )
     print(f"\nSaved {output} after {wall_time:.1f}s")
+    if visualization_path is not None:
+        print(
+            f"Saved one visualization figure with {n_visualized} sample(s) to "
+            f"{visualization_path}"
+        )
 
 
 if __name__ == "__main__":

@@ -6,9 +6,9 @@ can be converted into the same cache format by passing their exported maps via
 --external-map-dir.
 
 Examples:
-    uv run python scripts/saliency/precompute_saliency_maps.py --method itti
+    uv run python scripts/saliency/precompute_saliency_maps.py --method center_surround
     uv run python scripts/saliency/precompute_saliency_maps.py \
-        --method gbvs --external-map-dir results/gbvs_maps
+        --method itti --external-map-dir results/matlab_itti_maps
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from tqdm import tqdm
 
 from _paths import repo_path
 
-NATIVE_METHODS = {"edge", "itti", "spectral_residual"}
-EXTERNAL_METHODS = {"aws", "gbvs", "deepgaze", "itti_reference"}
+NATIVE_METHODS = {"center_surround", "edge", "spectral_residual"}
+EXTERNAL_METHODS = {"aws", "gbvs", "deepgaze", "itti"}
 ALL_METHODS = sorted(NATIVE_METHODS | EXTERNAL_METHODS)
 
 
@@ -114,16 +114,15 @@ def _center_surround(channel: Tensor) -> Tensor:
     return torch.stack(responses).mean(dim=0)
 
 
-def _itti_saliency(rgb: Tensor) -> Tensor:
+def _center_surround_saliency(rgb: Tensor) -> Tensor:
     r, g, b = rgb
     intensity = rgb.mean(dim=0)
     rg = (r - g).abs()
     by = (b - 0.5 * (r + g)).abs()
     edges = _edge_saliency(rgb)
-    # Problem: the original Itti-Koch-Niebur model is a larger multi-scale
-    # feature pipeline. Solution: combine center-surround intensity,
-    # opponent-color, and orientation/edge conspicuity. Result: a deterministic
-    # Itti-style bottom-up saliency heuristic without MATLAB dependencies.
+    # Problem: SaliencyToolbox owns the canonical Itti label in this pipeline.
+    # Solution: keep this dependency-free center-surround baseline under a
+    # descriptive non-Itti name. Result: plots have exactly one `itti` method.
     saliency = (
         _center_surround(intensity)
         + _center_surround(rg)
@@ -136,8 +135,8 @@ def _itti_saliency(rgb: Tensor) -> Tensor:
 def _native_saliency(method: str, rgb: Tensor) -> Tensor:
     if method == "edge":
         return _edge_saliency(rgb)
-    if method == "itti":
-        return _itti_saliency(rgb)
+    if method == "center_surround":
+        return _center_surround_saliency(rgb)
     if method == "spectral_residual":
         return _spectral_residual_saliency(rgb)
     raise ValueError(f"Unsupported native saliency method: {method}")
