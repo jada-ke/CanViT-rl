@@ -85,6 +85,7 @@ def save_dense_sac_checkpoint(
             "batch": batch,
             "updates": updates,
             "metrics": metrics,
+            "comet_experiment_key": getattr(args, "comet_experiment_key", None),
             # Problem: dense SAC now has several aux-map ablations that share
             # the legacy replay key. Solution: persist both a descriptive state
             # label and the channel count. Result: ADE eval can rebuild the

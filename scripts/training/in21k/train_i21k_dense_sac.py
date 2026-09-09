@@ -51,10 +51,12 @@ from pathlib import Path
 
 if "--comet" in sys.argv and "--no-comet" not in sys.argv:
     try:
-        from comet_ml import Experiment
+        from comet_ml import ExistingExperiment, Experiment
     except ImportError:
+        ExistingExperiment = None
         Experiment = None
 else:
+    ExistingExperiment = None
     Experiment = None
 import numpy as np
 import torch
@@ -119,6 +121,15 @@ def add_dense_sac_comet_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--comet-workspace", type=str, default=None)
     parser.add_argument("--comet-project", type=str, default="i21k-dense-sac")
     parser.add_argument("--experiment-name", type=str, default=None)
+    parser.add_argument(
+        "--comet-experiment-key",
+        type=str,
+        default=None,
+        help=(
+            "Resume logging to an existing Comet experiment key. When omitted "
+            "with --resume, the key saved in the checkpoint is reused if present."
+        ),
+    )
     parser.add_argument("--comet-tags", type=str, default="i21k-dense-sac")
 
 
@@ -134,14 +145,37 @@ def make_dense_comet_experiment(args: argparse.Namespace):
     """Create a Comet experiment only when explicitly enabled."""
     if args.no_comet:
         return None
-    if Experiment is None:
+    if Experiment is None or ExistingExperiment is None:
         raise RuntimeError("Install comet-ml or run without --comet.")
-    experiment = Experiment(
-        project_name=args.comet_project,
-        workspace=args.comet_workspace,
-        auto_param_logging=True,
-        auto_metric_logging=True,
-    )
+    comet_experiment_key = args.comet_experiment_key
+    if comet_experiment_key is None and args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if isinstance(checkpoint, dict):
+            saved_args = checkpoint.get("args", {})
+            if not isinstance(saved_args, dict):
+                saved_args = {}
+            comet_experiment_key = checkpoint.get(
+                "comet_experiment_key"
+            ) or saved_args.get("comet_experiment_key")
+    comet_kwargs = {
+        "project_name": args.comet_project,
+        "workspace": args.comet_workspace,
+        "auto_param_logging": True,
+        "auto_metric_logging": True,
+    }
+    if comet_experiment_key:
+        # Problem: dense SAC checkpoint resume restored optimizer state but
+        # opened a new Comet run. Solution: reopen the checkpoint's saved
+        # experiment key, or an explicit CLI key. Result: resumed metrics and
+        # figures continue on the original experiment timeline.
+        experiment = ExistingExperiment(
+            previous_experiment=comet_experiment_key,
+            **comet_kwargs,
+        )
+        args.comet_experiment_key = comet_experiment_key
+    else:
+        experiment = Experiment(**comet_kwargs)
+        args.comet_experiment_key = experiment.get_key()
     experiment.set_name(args.experiment_name or "i21k-dense-sac")
     if args.comet_tags:
         experiment.add_tags(

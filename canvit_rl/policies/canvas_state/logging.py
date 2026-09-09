@@ -14,7 +14,33 @@ def add_canvas_sac_comet_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--comet-workspace", type=str, default=None)
     parser.add_argument("--comet-project", type=str, default="canvas-sac")
     parser.add_argument("--experiment-name", type=str, default=None)
+    parser.add_argument(
+        "--comet-experiment-key",
+        type=str,
+        default=None,
+        help=(
+            "Resume logging to an existing Comet experiment key. When omitted "
+            "with --resume, the key saved in the checkpoint is reused if present."
+        ),
+    )
     parser.add_argument("--comet-tags", type=str, default="canvas-sac")
+
+
+def _checkpoint_comet_experiment_key(path: Path | None) -> str | None:
+    """Read a saved Comet experiment key without restoring model state."""
+    if path is None:
+        return None
+    import torch
+
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        return None
+    saved_args = checkpoint.get("args", {})
+    if not isinstance(saved_args, dict):
+        saved_args = {}
+    return checkpoint.get("comet_experiment_key") or saved_args.get(
+        "comet_experiment_key"
+    )
 
 
 def make_comet_experiment(args: argparse.Namespace):
@@ -26,12 +52,16 @@ def make_comet_experiment(args: argparse.Namespace):
         # crashes in some Python/IPython stacks, even for --help and tests.
         # Solution: import Comet only when a run actually enables logging.
         # Result: script import and argparse smoke tests stay side-effect-light.
-        from comet_ml import Experiment
+        from comet_ml import ExistingExperiment, Experiment
     except ImportError:
         raise RuntimeError(
             "Comet logging is enabled by default, but comet_ml is not installed. "
             "Install comet-ml or run with --no-comet."
         ) from None
+    comet_experiment_key = (
+        args.comet_experiment_key
+        or _checkpoint_comet_experiment_key(getattr(args, "resume", None))
+    )
     kwargs: dict[str, Any] = {
         "project_name": args.comet_project,
         "auto_param_logging": True,
@@ -39,7 +69,18 @@ def make_comet_experiment(args: argparse.Namespace):
     }
     if args.comet_workspace:
         kwargs["workspace"] = args.comet_workspace
-    experiment = Experiment(**kwargs)
+    if comet_experiment_key:
+        # Problem: checkpoint resume used to restore trainer state while Comet
+        # created a separate run. Solution: reopen the saved/explicit Comet
+        # experiment key. Result: resumed metrics append to the same dashboard.
+        experiment = ExistingExperiment(
+            previous_experiment=comet_experiment_key,
+            **kwargs,
+        )
+        args.comet_experiment_key = comet_experiment_key
+    else:
+        experiment = Experiment(**kwargs)
+        args.comet_experiment_key = experiment.get_key()
     experiment.set_name(args.experiment_name or "canvas-state-sac")
     if args.comet_tags:
         experiment.add_tags(

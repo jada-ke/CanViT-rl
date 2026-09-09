@@ -56,6 +56,7 @@ def save_canvas_sac_checkpoint(
             "batch": batch,
             "updates": updates,
             "best_eval_final_ce": best_eval_final_ce,
+            "comet_experiment_key": getattr(args, "comet_experiment_key", None),
             "selection_metric": "eval/final_ce",
             "selection_mode": "min",
             "eval_metrics": eval_metrics or {},
