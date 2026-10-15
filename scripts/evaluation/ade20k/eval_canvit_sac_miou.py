@@ -27,6 +27,7 @@ from canvit_pytorch import (
     resolve_canvit_repo,
     sample_at_viewpoint,
 )
+from canvit_pytorch.model.pretraining.hub import CanViTForPretrainingHFHub
 from canvit_specialize.datasets.ade20k import (
     ADE20kDataset,
     IGNORE_LABEL,
@@ -49,6 +50,14 @@ from canvit_rl.policies.canvas_state.state import (
     scale_aware_detail_debt,
 )
 from canvit_rl.ade20k.greedy import miou_from_state
+from canvit_rl.ade20k.visualization.policy_glimpses import (
+    _record_state_metrics,
+    _save_visualization,
+)
+from canvit_rl.policies.canvas_state.logging import (
+    add_canvas_sac_comet_args,
+    make_comet_experiment,
+)
 from canvit_rl.policies.canvas_state.models import CanvasStateActor
 from canvit_rl.policies.image_independent.sac_sequence import CanViTSequenceEncoder, GaussianActor
 from canvit_rl.state.sequences import (
@@ -119,6 +128,31 @@ def _policy_training_provenance(
     if any(key in checkpoint_args for key in ("feature_base_dir", "teacher_name")):
         return "IN21k dense-feature policy (inferred from saved training arguments)"
     return "unknown (checkpoint does not record enough training provenance)"
+
+
+def _checkpoint_training_progress(
+    payload: dict[str, Any],
+    checkpoint_args: dict[str, Any],
+) -> dict[str, int | None]:
+    """Recover how many glimpses the policy had been trained on when saved.
+
+    Problem: checkpoints store batch/update counters, not the glimpse count
+    used as the training Comet x-axis. Solution: rebuild it the same way the
+    trainers do, batch_size * (t + 1) glimpses per completed batch.
+    """
+    batches = payload.get("batch")
+    batch_size = checkpoint_args.get("batch_size")
+    train_t = checkpoint_args.get("t")
+    glimpses = None
+    if batches is not None and batch_size is not None and train_t is not None:
+        glimpses = int(batches) * int(batch_size) * (int(train_t) + 1)
+    updates = payload.get("updates")
+    return {
+        "train_glimpses": glimpses,
+        "train_batches": None if batches is None else int(batches),
+        "train_batch_size": None if batch_size is None else int(batch_size),
+        "train_updates": None if updates is None else int(updates),
+    }
 
 
 def _backbone_pretraining_label(model_repo: str) -> str:
@@ -386,6 +420,49 @@ def _deterministic_canvas_action(
     return actor.deterministic_action(batch)
 
 
+def _log_eval_curves_to_comet(
+    *,
+    comet_exp,
+    mious: dict[str, float],
+    mean_scales: dict[str, float],
+    n_steps: int,
+) -> None:
+    """Log final aggregated mIoU and mean scale per timestep as line charts."""
+    timesteps = list(range(n_steps))
+    miou_values = [float(mious[f"t{t}"]) for t in timesteps]
+    scale_values = [float(mean_scales[f"t{t}"]) for t in timesteps]
+    # Using the timestep as the Comet step makes each metric render as a line
+    # chart over t0..tT in the Panels view.
+    for t, miou, scale in zip(timesteps, miou_values, scale_values, strict=True):
+        comet_exp.log_metric("eval/miou_by_timestep", miou, step=t)
+        comet_exp.log_metric("eval/mean_scale_by_timestep", scale, step=t)
+        comet_exp.log_metric(f"eval/miou_t{t}", miou)
+        comet_exp.log_metric(f"eval/mean_scale_t{t}", scale)
+    comet_exp.log_curve("eval_miou_by_timestep", x=timesteps, y=miou_values, step=0)
+    comet_exp.log_curve(
+        "eval_mean_scale_by_timestep", x=timesteps, y=scale_values, step=0
+    )
+
+    import matplotlib.pyplot as plt
+
+    fig, (miou_ax, scale_ax) = plt.subplots(1, 2, figsize=(10, 4), dpi=150)
+    miou_ax.plot(timesteps, miou_values, marker="o")
+    miou_ax.set_xlabel("timestep")
+    miou_ax.set_ylabel("mIoU")
+    miou_ax.set_title("Aggregated mIoU by timestep")
+    miou_ax.set_xticks(timesteps, [f"t{t}" for t in timesteps])
+    miou_ax.grid(True, alpha=0.25)
+    scale_ax.plot(timesteps, scale_values, marker="o", color="tab:orange")
+    scale_ax.set_xlabel("timestep")
+    scale_ax.set_ylabel("mean scale")
+    scale_ax.set_title("Mean glimpse scale by timestep")
+    scale_ax.set_xticks(timesteps, [f"t{t}" for t in timesteps])
+    scale_ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    comet_exp.log_figure(figure_name="eval_miou_and_scale_by_timestep", figure=fig, step=0)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -435,8 +512,27 @@ def main() -> None:
             "per-image mIoU values without dataset-level integration"
         ),
     )
+    parser.add_argument(
+        "--vis-images",
+        type=int,
+        default=0,
+        help=(
+            "Save glimpse/segmentation contact sheets for the first N evaluated "
+            "images (and log them to Comet when enabled)."
+        ),
+    )
+    parser.add_argument(
+        "--vis-output-dir",
+        type=Path,
+        default=Path("results/eval_glimpses"),
+    )
+    add_canvas_sac_comet_args(parser)
+    # Eval runs share the Comet project with training but get their own tags.
+    parser.set_defaults(comet_tags="eval,ade20k-miou")
     args = parser.parse_args()
 
+    if args.vis_images < 0:
+        raise ValueError("--vis-images must be non-negative.")
     if args.t < 0:
         raise ValueError("--t must be non-negative.")
     if args.min_scale <= 0 or args.min_scale > 1:
@@ -498,10 +594,41 @@ def main() -> None:
     print(f"  Evaluation: ADE20K {args.split} mIoU")
     print(f"  Policy actor: {policy_name}; {_policy_training_provenance(checkpoint_payload, checkpoint_args)}")
     print(f"  Policy checkpoint: {args.checkpoint}")
+    train_progress = _checkpoint_training_progress(checkpoint_payload, checkpoint_args)
+    if train_progress["train_glimpses"] is not None:
+        print(
+            f"  Trained so far: {train_progress['train_glimpses']:,} glimpses "
+            f"({train_progress['train_batches']:,} batches x batch_size "
+            f"{train_progress['train_batch_size']} x (t={checkpoint_t} + 1)); "
+            f"{train_progress['train_updates'] or 0:,} SAC updates"
+        )
+    else:
+        print("  Trained so far: unknown (checkpoint has no batch/batch_size record)")
     print(
         f"  CanViT backbone: {_backbone_pretraining_label(model_repo)} "
         f"({model_repo}); frozen during evaluation"
     )
+
+    if args.experiment_name is None:
+        args.experiment_name = f"eval-ade20k-{args.checkpoint.parent.name}-t{args.t}"
+    comet_exp = make_comet_experiment(args)
+    if comet_exp is not None:
+        # Record what was actually evaluated, beyond the raw CLI args.
+        comet_exp.log_parameters(
+            {
+                "eval_policy": policy_name,
+                "eval_n_actor_glimpses": args.t,
+                "eval_checkpoint_train_t": checkpoint_t,
+                **{k: v for k, v in train_progress.items() if v is not None},
+                "eval_model_repo": model_repo,
+                "eval_min_scale": min_scale,
+                "eval_max_history": max_history,
+                "eval_canvas_aux_kind": ",".join(canvas_aux_kind),
+            }
+        )
+        comet_exp.log_parameters(
+            {f"train_{k}": v for k, v in checkpoint_args.items()},
+        )
 
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
     dataset = ADE20kDataset(
@@ -540,6 +667,18 @@ def main() -> None:
     )
     model = seg.canvit
     probe = seg.head
+    if "reconstruction_norm" in canvas_aux_kind:
+        # Problem: from_pretrained_with_probe drops pretraining-only modules,
+        # including scene_patches_head, so predict_teacher_scene is missing for
+        # IN21k dense SAC checkpoints whose actor uses reconstruction_norm state.
+        # Solution: roll out with the full pretraining model from the same repo
+        # (identical CanViT weights/forward, plus the teacher-scene head) and
+        # keep the ADE20K probe for segmentation.
+        # Result: the actor sees the same aux state as in training; mIoU is
+        # unchanged because the backbone weights are identical.
+        print(f"Loading CanViT pretraining heads for reconstruction_norm state: {model_repo}")
+        model = CanViTForPretrainingHFHub.from_pretrained(model_repo).eval().to(device)
+        del seg
     for param in model.parameters():
         param.requires_grad_(False)
     for param in probe.parameters():
@@ -632,6 +771,7 @@ def main() -> None:
 
             step_states = [state]
             step_scales = [1.0]
+            step_viewpoints = [full_vp]
             for step_idx in range(args.t):
                 if is_canvas_policy:
                     batch = {
@@ -700,6 +840,40 @@ def main() -> None:
                         )
                 step_states.append(state)
                 step_scales.append(float(vp.scales[0].detach().cpu().item()))
+                step_viewpoints.append(vp)
+
+            if image_idx < args.vis_images:
+                # Plot from the exact rollout being scored, so figures match the
+                # reported mIoU and work for every actor/aux-state variant.
+                vis_scores, vis_mious = [], []
+                for step_state in step_states:
+                    score, miou = _record_state_metrics(
+                        model=model,
+                        probe=probe,
+                        state=step_state,
+                        mask=mask,
+                        canvas_grid_size=cfg.canvas_grid_size,
+                    )
+                    vis_scores.append(score)
+                    vis_mious.append(miou)
+                vis_path = args.vis_output_dir / f"{args.experiment_name}_img{image_idx:04d}.png"
+                _save_visualization(
+                    image=image[0],
+                    mask=mask[0],
+                    viewpoints=step_viewpoints,
+                    states=step_states,
+                    model=model,
+                    probe=probe,
+                    canvas_grid_size=cfg.canvas_grid_size,
+                    scores=vis_scores,
+                    loss_reductions=[0.0]
+                    + [prev - cur for prev, cur in zip(vis_scores, vis_scores[1:])],
+                    mious=vis_mious,
+                    output=vis_path,
+                    title=f"{policy_name} ADE20K {args.split} image {image_idx}",
+                )
+                if comet_exp is not None:
+                    comet_exp.log_image(str(vis_path), name=vis_path.name, step=image_idx)
 
             for step_idx, step_state in enumerate(step_states):
                 if args.miou_mode == "accumulator":
@@ -773,7 +947,7 @@ def main() -> None:
                 "n_logged_steps": n_steps,
                 "min_scale": min_scale,
                 "probe_repo": probe_repo,
-                "model_repo": cfg.checkpoint,
+                "model_repo": model_repo,
                 "seed": args.seed,
                 "stochastic": args.stochastic,
                 "miou_mode": args.miou_mode,
@@ -783,6 +957,22 @@ def main() -> None:
         args.output,
     )
     print(f"\nSaved {args.output} after {wall_time:.1f}s")
+
+    if comet_exp is not None:
+        _log_eval_curves_to_comet(
+            comet_exp=comet_exp,
+            mious=mious,
+            mean_scales=mean_scales,
+            n_steps=n_steps,
+        )
+        comet_exp.log_metric("eval/n_images", n_images)
+        if train_progress["train_glimpses"] is not None:
+            # Also a metric (not only a param) so eval runs of successive
+            # checkpoints can be compared against training progress.
+            comet_exp.log_metric("eval/train_glimpses", train_progress["train_glimpses"])
+        comet_exp.log_metric("eval/wall_time_seconds", wall_time)
+        comet_exp.log_asset(str(args.output))
+        comet_exp.end()
 
 
 if __name__ == "__main__":
