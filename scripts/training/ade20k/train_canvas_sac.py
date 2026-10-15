@@ -100,7 +100,10 @@ from canvit_rl.policies.canvas_state.visualization import (
 )
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.rewards import relative_ce_reduction
-from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint
+from canvit_rl.policies.image_independent.viewpoint import (
+    action_to_viewpoint,
+    parse_discrete_scales,
+)
 
 try:
     from canvas_sac_optuna import add_canvas_sac_optuna_args, run_canvas_sac_optuna
@@ -187,6 +190,8 @@ def _important_eval_metrics(metrics: dict[str, float]) -> dict[str, float]:
 
 def train_once(args: argparse.Namespace) -> float:
     """Run full current-canvas SAC and return best relative eval CE gain."""
+    # None -> continuous scales; list -> binned scale action.
+    discrete_scales = parse_discrete_scales(getattr(args, "discrete_scales", None))
     validate_canvas_sac_args(args)
     parse_reward_map_scales(args.reward_map_scales)
     random.seed(args.seed)
@@ -440,7 +445,9 @@ def train_once(args: argparse.Namespace) -> float:
                     train_windows["actor/action_std"].append(
                         float(action.std(unbiased=False).item())
                     )
-            vp = action_to_viewpoint(action, min_scale=args.min_scale)
+            vp = action_to_viewpoint(
+                action, min_scale=args.min_scale, discrete_scales=discrete_scales
+            )
             entropy_points.append(
                 torch.cat([vp.centers, vp.scales[:, None]], dim=1).detach().cpu().numpy()
             )

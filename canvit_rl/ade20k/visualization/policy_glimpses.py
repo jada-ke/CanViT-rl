@@ -703,6 +703,7 @@ def _run_canvas_sac_episode(
     cfg: CanViTEnvConfig,
     device: torch.device,
     canvit_dtype: torch.dtype | None = None,
+    discrete_scales: list[float] | None = None,
 ) -> dict:
     """Roll out a loaded image-dependent canvas SAC actor."""
     batch_size = image.shape[0]
@@ -764,7 +765,9 @@ def _run_canvas_sac_episode(
                 canvas_grid_size=cfg.canvas_grid_size,
             )
         action = actor.deterministic_action(actor_batch)
-        vp = action_to_viewpoint(action, min_scale=min_scale)
+        vp = action_to_viewpoint(
+            action, min_scale=min_scale, discrete_scales=discrete_scales
+        )
         glimpse = sample_at_viewpoint(
             spatial=image,
             viewpoint=vp,
@@ -827,6 +830,7 @@ def visualize_canvas_policy_for_indices(
     title_prefix: str,
     canvit_dtype: torch.dtype | None = None,
     output_name_suffix: str | None = None,
+    discrete_scales: list[float] | None = None,
 ) -> list[Path]:
     """Save deterministic live Canvas SAC policy glimpse visualizations."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -851,6 +855,7 @@ def visualize_canvas_policy_for_indices(
                     cfg=cfg,
                     device=device,
                     canvit_dtype=canvit_dtype,
+                    discrete_scales=discrete_scales,
                 )
                 rows.append(
                     {

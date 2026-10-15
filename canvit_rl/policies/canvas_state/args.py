@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from canvit_rl.policies.canvas_state.logging import add_canvas_sac_comet_args
+from canvit_rl.policies.image_independent.viewpoint import parse_discrete_scales
 
 
 def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
@@ -102,6 +103,16 @@ def add_canvas_sac_args(parser: argparse.ArgumentParser) -> None:
         help="Remove the adaptive-max canvas pooling branch from CanvasStateEncoder.",
     )
     parser.add_argument("--min-scale", type=float, default=0.25)
+    parser.add_argument(
+        "--discrete-scales",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated fixed glimpse scales, e.g. '0.25,0.5'. When set, "
+            "centers stay continuous and the actor's scale action is binned "
+            "into these values; omit for continuous scales in [min-scale, 1]."
+        ),
+    )
     parser.add_argument(
         "--randomize-actor-init",
         action="store_true",
@@ -221,6 +232,8 @@ def validate_canvas_sac_args(args: argparse.Namespace) -> None:
         raise ValueError("EG-C2F evaluation requires --t <= 20.")
     if not 0.0 <= args.actor_init_center_radius < 1.0:
         raise ValueError("--actor-init-center-radius must be in [0, 1).")
+    # Fail fast on malformed --discrete-scales before any model is built.
+    parse_discrete_scales(args.discrete_scales)
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError(
             "At least one canvas pooling branch must remain enabled; do not pass "

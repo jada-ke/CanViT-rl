@@ -32,7 +32,10 @@ from canvit_rl.environment import CanViTEnvConfig
 from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
 from canvit_rl.policies.canvas_state.models import CanvasStateActor
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
-from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint
+from canvit_rl.policies.image_independent.viewpoint import (
+    action_to_viewpoint,
+    parse_discrete_scales,
+)
 
 # Problem: nesting Canvas-state policy helpers under policies/ moved this file
 # one level deeper. Solution: climb to the repository root before probing for a
@@ -175,15 +178,25 @@ def eval_random_batch(
         initial_ce, _ = segmentation_metrics(
             model=model, probe=probe, state=state, masks=masks, cfg=cfg
         )
+        discrete_scales = parse_discrete_scales(getattr(args, "discrete_scales", None))
         for _ in range(args.t):
-            vp = random_viewpoints(
-                batch_size=images.shape[0],
-                device=device,
-                n_viewpoints=1,
-                min_scale=args.min_scale,
-                max_scale=1.0,
-                start_with_full_scene=False,
-            )[0]
+            if discrete_scales:
+                # Discrete-scale runs: sample the random baseline from the same
+                # action space as the policy (continuous centers, scale drawn
+                # uniformly from the allowed set) so the comparison is fair.
+                action = torch.empty(images.shape[0], 3, device=device).uniform_(-1.0, 1.0)
+                vp = action_to_viewpoint(
+                    action, min_scale=args.min_scale, discrete_scales=discrete_scales
+                )
+            else:
+                vp = random_viewpoints(
+                    batch_size=images.shape[0],
+                    device=device,
+                    n_viewpoints=1,
+                    min_scale=args.min_scale,
+                    max_scale=1.0,
+                    start_with_full_scene=False,
+                )[0]
             glimpse = sample_at_viewpoint(
                 spatial=images,
                 viewpoint=vp,
@@ -280,6 +293,8 @@ def eval_canvas_sac_batch(
     entropy_points: list[np.ndarray],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Roll out deterministic image-dependent SAC over a validation batch."""
+    # None -> continuous scales; list -> binned scale action.
+    discrete_scales = parse_discrete_scales(getattr(args, "discrete_scales", None))
     del canvas_feature_dim
     device = images.device
     batch_size = images.shape[0]
@@ -328,7 +343,9 @@ def eval_canvas_sac_batch(
             obs["entropy"] = canvas_entropy
         with torch.no_grad():
             action = actor.deterministic_action(obs)
-        vp = action_to_viewpoint(action, min_scale=args.min_scale)
+        vp = action_to_viewpoint(
+            action, min_scale=args.min_scale, discrete_scales=discrete_scales
+        )
         entropy_points.append(
             torch.cat([vp.centers, vp.scales[:, None]], dim=1).detach().cpu().numpy()
         )
@@ -526,6 +543,8 @@ def evaluate_full_validation_miou(
     description: str,
 ) -> tuple[dict[str, float], list[int], list[float]]:
     """Evaluate the current actor per timestep on full validation."""
+    # None -> continuous scales; list -> binned scale action.
+    discrete_scales = parse_discrete_scales(getattr(args, "discrete_scales", None))
     was_training = actor.training
     actor.eval()
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
@@ -620,7 +639,9 @@ def evaluate_full_validation_miou(
                 obs["entropy"] = canvas_entropy
             with torch.no_grad():
                 action = actor.deterministic_action(obs)
-            vp = action_to_viewpoint(action, min_scale=args.min_scale)
+            vp = action_to_viewpoint(
+                action, min_scale=args.min_scale, discrete_scales=discrete_scales
+            )
             with torch.inference_mode():
                 glimpse = sample_at_viewpoint(
                     spatial=images,

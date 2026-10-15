@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 from canvit_pytorch import VPEEncoder, Viewpoint
+
+
+def parse_discrete_scales(value: str | None) -> list[float] | None:
+    """Parse a comma-separated discrete scale set; None/empty means continuous."""
+    if value is None or not value.strip():
+        return None
+    scales = [float(item) for item in value.split(",") if item.strip()]
+    if not scales or any(scale <= 0.0 or scale > 1.0 for scale in scales):
+        raise ValueError("--discrete-scales must contain values in (0, 1].")
+    return scales
+
+
+def _discrete_scale_index(scale_raw: torch.Tensor, n_scales: int) -> torch.Tensor:
+    """Bin a tanh scale action in [-1, 1] into one of n equal-width bins."""
+    index = torch.floor((scale_raw.float() + 1.0) * 0.5 * n_scales).long()
+    return index.clamp(0, n_scales - 1)
 
 
 def _action_scale_from_viewpoint_scale(
@@ -20,10 +38,20 @@ def viewpoint_to_action(
     viewpoint: Viewpoint,
     *,
     min_scale: float,
+    discrete_scales: Sequence[float] | None = None,
 ) -> torch.Tensor:
     """Map a Viewpoint's center/scale tensors into the actor action range."""
     centers = viewpoint.centers.float()
     scales = viewpoint.scales.float()
+    if discrete_scales:
+        # Discrete-scale mode: snap each scale to the nearest allowed value and
+        # emit the center of that value's action bin, so critics see the same
+        # action coordinate the actor would use to select that scale.
+        allowed = torch.tensor(list(discrete_scales), device=scales.device)
+        index = (scales[:, None] - allowed[None, :]).abs().argmin(dim=1)
+        n_scales = len(discrete_scales)
+        scale_raw = (index.float() + 0.5) / n_scales * 2.0 - 1.0
+        return torch.cat([centers, scale_raw[:, None]], dim=-1)
     scale_raw = _action_scale_from_viewpoint_scale(scales, min_scale=min_scale)
     scale_raw = scale_raw.clamp(-1.0, 1.0)
     return torch.cat([centers.float(), scale_raw[:, None].float()], dim=-1)
@@ -33,9 +61,24 @@ def action_to_viewpoint(
     action: torch.Tensor,
     *,
     min_scale: float,
+    discrete_scales: Sequence[float] | None = None,
 ) -> Viewpoint:
-    """Map tanh actor actions into CanViT's Viewpoint interface."""
+    """Map tanh actor actions into CanViT's Viewpoint interface.
+
+    With ``discrete_scales`` the centers stay continuous while the scale action
+    in [-1, 1] is split into equal-width bins, one per allowed scale (e.g.
+    [0.25, 0.5]: scale_raw < 0 -> 0.25, scale_raw >= 0 -> 0.5).
+    """
     centers = action[:, :2].float()
+    if discrete_scales:
+        # Problem: ADE20K policies should be able to pick from a fixed scale
+        # set while still choosing continuous centers.
+        # Solution: keep the 3-D tanh action (so SAC/PPO actors, critics, and
+        # replay are unchanged) and bin only the scale coordinate.
+        # Result: Viewpoint scales are always one of discrete_scales.
+        allowed = torch.tensor(list(discrete_scales), device=action.device)
+        index = _discrete_scale_index(action[:, 2], len(discrete_scales))
+        return Viewpoint(centers=centers, scales=allowed[index].float())
     scales = ((action[:, 2] + 1.0) * 0.5 * (1.0 - min_scale) + min_scale).float()
     return Viewpoint(centers=centers, scales=scales)
 

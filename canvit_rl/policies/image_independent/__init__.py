@@ -10,6 +10,7 @@ from canvit_rl.policies.image_independent.viewpoint import (
     ViewpointGaussianActor,
     ViewpointHistoryCritic,
     action_to_viewpoint,
+    parse_discrete_scales,
     randomize_actor_mean_viewpoint_prior,
     viewpoint_to_action,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ViewpointGaussianActor",
     "ViewpointHistoryCritic",
     "action_to_viewpoint",
+    "parse_discrete_scales",
     "randomize_actor_mean_viewpoint_prior",
     "viewpoint_to_action",
 ]

@@ -346,6 +346,7 @@ def _evaluate_grid(
     chunk_size: int,
     device: torch.device,
     canvit_dtype: torch.dtype,
+    discrete_scales: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return true reward and predicted Q maps for one candidate scale."""
     vp_all = _candidate_grid(scale=scale, grid_size=grid_size, device=device)
@@ -403,7 +404,9 @@ def _evaluate_grid(
                     1,
                     1,
                 )
-            action = viewpoint_to_action(vp, min_scale=min_scale)
+            action = viewpoint_to_action(
+                vp, min_scale=min_scale, discrete_scales=discrete_scales
+            )
             q_pred = torch.minimum(q1(history_batch, action), q2(history_batch, action))
             rewards.append(reward.detach().cpu())
             q_values.append(q_pred.detach().cpu())
@@ -611,6 +614,7 @@ def visualize_reward_maps_for_indices(
     state_step: int = 0,
     state_steps: list[int] | None = None,
     output_name_suffix: str | None = None,
+    discrete_scales: list[float] | None = None,
 ) -> list[Path]:
     """Generate reward/Q landscape figures using live SAC networks."""
     rows: list[dict] = []
@@ -695,7 +699,9 @@ def visualize_reward_maps_for_indices(
                                 canvas_grid_size=cfg.canvas_grid_size,
                             )
                     action = actor.deterministic_action(actor_batch)
-                    vp = action_to_viewpoint(action, min_scale=min_scale)
+                    vp = action_to_viewpoint(
+                        action, min_scale=min_scale, discrete_scales=discrete_scales
+                    )
                     out = model(
                         glimpse=_sample_canvit_glimpse(
                             image=image_dev,
@@ -748,7 +754,9 @@ def visualize_reward_maps_for_indices(
                         actor_batch["entropy"] = canvas_entropy
                 if actor is not None:
                     actor_action = actor.deterministic_action(actor_batch)
-                    actor_vp = action_to_viewpoint(actor_action, min_scale=min_scale)
+                    actor_vp = action_to_viewpoint(
+                        actor_action, min_scale=min_scale, discrete_scales=discrete_scales
+                    )
                 seg_rgb = _segmentation_for_plot(
                     model=model,
                     probe=probe,
@@ -784,6 +792,7 @@ def visualize_reward_maps_for_indices(
                         chunk_size=chunk_size,
                         device=device,
                         canvit_dtype=canvit_dtype,
+                        discrete_scales=discrete_scales,
                     )
                     maps.append((scale, reward_map, q_map))
 
