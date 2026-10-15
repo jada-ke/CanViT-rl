@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,36 @@ def _checkpoint_value(
 ) -> Any:
     """Read a training arg from checkpoint metadata with CLI fallback."""
     return checkpoint_args.get(key.replace("-", "_"), fallback)
+
+
+def _policy_training_provenance(
+    payload: dict[str, Any],
+    checkpoint_args: dict[str, Any],
+) -> str:
+    """Describe policy training only when the checkpoint metadata supports it."""
+    if "reward" in payload and "feature_base_dir" in checkpoint_args:
+        reward = payload.get("reward")
+        return f"IN21k dense-feature SAC (saved reward={reward!r})"
+    if payload.get("selection_metric") == "eval/final_ce":
+        return "ADE20K segmentation Canvas SAC (selected by validation CE)"
+    if "episode" in payload and "total_steps" in payload:
+        return "ADE20K CanViT SAC (episode-based training checkpoint)"
+
+    dataset = str(checkpoint_args.get("dataset", "")).lower()
+    if "ade20k" in dataset or "adechallenge" in dataset:
+        return f"ADE20K-trained policy (saved dataset={dataset!r})"
+    if any(key in checkpoint_args for key in ("feature_base_dir", "teacher_name")):
+        return "IN21k dense-feature policy (inferred from saved training arguments)"
+    return "unknown (checkpoint does not record enough training provenance)"
+
+
+def _backbone_pretraining_label(model_repo: str) -> str:
+    """Use the repository identifier as a hint, without guessing unknown origins."""
+    if "in21k" in model_repo.lower():
+        return "IN21k-pretrained"
+    if "ade20k" in model_repo.lower():
+        return "ADE20K-named"
+    return "pretraining source unverified"
 
 
 def _is_canvas_checkpoint(payload: dict[str, Any]) -> bool:
@@ -362,6 +393,15 @@ def main() -> None:
         type=Path,
         default=Path("checkpoints/canvit_sac/latest.pt"),
     )
+    parser.add_argument(
+        "--model-repo",
+        type=str,
+        default=None,
+        help=(
+            "CanViT backbone repository or local path; defaults to "
+            "$CANVIT_CHECKPOINT, then the CanViT environment default"
+        ),
+    )
     parser.add_argument("--t", type=int, default=5)
     parser.add_argument("--dataset", type=str, default="datasets/ADE20k")
     parser.add_argument(
@@ -406,6 +446,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     cfg = CanViTEnvConfig()
+    model_repo = args.model_repo or os.environ.get("CANVIT_CHECKPOINT") or cfg.checkpoint
     device = get_device()
     print(f"Device: {device}")
 
@@ -448,6 +489,20 @@ def main() -> None:
         policy_name = "canvit_sac"
         print("Policy: viewpoint-history SAC")
 
+    # Problem: the prior output named the evaluation script/checkpoint policy,
+    # but not the separately loaded backbone and ADE20K segmentation probe.
+    # Solution: report each component and infer training provenance only from
+    # saved metadata or explicit repository identifiers. Result: IN21k
+    # pretraining is not confused with ADE20K probe training or policy training.
+    print("Model provenance:")
+    print(f"  Evaluation: ADE20K {args.split} mIoU")
+    print(f"  Policy actor: {policy_name}; {_policy_training_provenance(checkpoint_payload, checkpoint_args)}")
+    print(f"  Policy checkpoint: {args.checkpoint}")
+    print(
+        f"  CanViT backbone: {_backbone_pretraining_label(model_repo)} "
+        f"({model_repo}); frozen during evaluation"
+    )
+
     img_tf, mask_tf = make_val_transforms(cfg.scene_size_px, mode="squish")
     dataset = ADE20kDataset(
         root=Path(args.dataset),
@@ -467,10 +522,17 @@ def main() -> None:
     probe_repo = args.probe_repo or resolve_canvit_repo(
         f"probe-ade20k-40k-s512-c{cfg.canvas_grid_size}-in21k"
     )
+    probe_label = (
+        "ADE20K-trained segmentation probe"
+        if "ade20k" in str(probe_repo).lower()
+        else "segmentation probe; training source unverified"
+    )
+    print(f"  Segmentation head: {probe_label} ({probe_repo}); frozen during evaluation")
+    print("  Note: an ADE20K probe does not mean the CanViT backbone was fine-tuned on ADE20K.")
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
+            pretrained_repo=model_repo,
             probe_repo=probe_repo,
         )
         .eval()
