@@ -52,7 +52,7 @@ from canvit_rl.policies.canvas_state.state import (
 from canvit_rl.ade20k.greedy import miou_from_state
 from canvit_rl.ade20k.visualization.policy_glimpses import (
     _record_state_metrics,
-    _save_visualization,
+    _save_multi_image_visualization,
 )
 from canvit_rl.policies.canvas_state.logging import (
     add_canvas_sac_comet_args,
@@ -705,6 +705,7 @@ def main() -> None:
         maxinterval=float("inf"),
     )
 
+    vis_rows: list[dict] = []
     with torch.inference_mode():
         for image_idx, (image, mask) in enumerate(loader):
             if args.max_images is not None and image_idx >= args.max_images:
@@ -843,8 +844,9 @@ def main() -> None:
                 step_viewpoints.append(vp)
 
             if image_idx < args.vis_images:
-                # Plot from the exact rollout being scored, so figures match the
-                # reported mIoU and work for every actor/aux-state variant.
+                # Collect the exact rollout being scored (glimpse boxes only, no
+                # per-step segmentation); all N images are plotted together in
+                # one rows=images x cols=timesteps figure after the loop.
                 vis_scores, vis_mious = [], []
                 for step_state in step_states:
                     score, miou = _record_state_metrics(
@@ -856,24 +858,19 @@ def main() -> None:
                     )
                     vis_scores.append(score)
                     vis_mious.append(miou)
-                vis_path = args.vis_output_dir / f"{args.experiment_name}_img{image_idx:04d}.png"
-                _save_visualization(
-                    image=image[0],
-                    mask=mask[0],
-                    viewpoints=step_viewpoints,
-                    states=step_states,
-                    model=model,
-                    probe=probe,
-                    canvas_grid_size=cfg.canvas_grid_size,
-                    scores=vis_scores,
-                    loss_reductions=[0.0]
-                    + [prev - cur for prev, cur in zip(vis_scores, vis_scores[1:])],
-                    mious=vis_mious,
-                    output=vis_path,
-                    title=f"{policy_name} ADE20K {args.split} image {image_idx}",
+                vis_rows.append(
+                    {
+                        "image": image[0].detach().cpu(),
+                        "label": f"img{image_idx}",
+                        "result": {
+                            "viewpoints": step_viewpoints,
+                            "scores": vis_scores,
+                            "rewards": [0.0]
+                            + [prev - cur for prev, cur in zip(vis_scores, vis_scores[1:])],
+                            "mious": vis_mious,
+                        },
+                    }
                 )
-                if comet_exp is not None:
-                    comet_exp.log_image(str(vis_path), name=vis_path.name, step=image_idx)
 
             for step_idx, step_state in enumerate(step_states):
                 if args.miou_mode == "accumulator":
@@ -958,6 +955,19 @@ def main() -> None:
     )
     print(f"\nSaved {args.output} after {wall_time:.1f}s")
 
+    vis_path = None
+    if vis_rows:
+        vis_path = args.vis_output_dir / f"{args.experiment_name}_glimpses.png"
+        _save_multi_image_visualization(
+            rows=vis_rows,
+            output=vis_path,
+            title=(
+                f"{policy_name} ADE20K {args.split}: glimpses per timestep "
+                f"(rows=images, cols=t0..t{args.t})"
+            ),
+        )
+        print(f"Saved glimpse visualization {vis_path}")
+
     if comet_exp is not None:
         _log_eval_curves_to_comet(
             comet_exp=comet_exp,
@@ -972,6 +982,8 @@ def main() -> None:
             comet_exp.log_metric("eval/train_glimpses", train_progress["train_glimpses"])
         comet_exp.log_metric("eval/wall_time_seconds", wall_time)
         comet_exp.log_asset(str(args.output))
+        if vis_path is not None:
+            comet_exp.log_image(str(vis_path), name=vis_path.name)
         comet_exp.end()
 
 
