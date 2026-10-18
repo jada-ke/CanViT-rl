@@ -87,8 +87,11 @@ from canvit_rl.vision.precision import resolve_canvit_dtype
 from canvit_rl.environment import get_device
 from canvit_rl.ade20k.greedy import _index_state_batch, _repeat_state_chunks
 from canvit_rl.in21k.checkpoints import (
+    inherit_resume_defaults,
     load_dense_sac_critic_initializer,
     load_dense_sac_resume,
+    resolve_dense_checkpoint_dir,
+    restore_rng_state,
     save_dense_sac_checkpoint,
 )
 from canvit_rl.in21k.dense_train_batch import (
@@ -383,7 +386,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--checkpoint-interval", type=int, default=200)
-    parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints/i21k_dense_sac"))
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Explicit checkpoint directory. When omitted and --experiment-name "
+            "is set, defaults to <checkpoint-root>/<experiment-name>/<target "
+            "glimpses> (e.g. .../2M); otherwise <checkpoint-root>."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=Path("checkpoints/i21k_dense_sac"),
+        help="Base directory for automatically named checkpoint directories.",
+    )
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument(
         "--init-critic-checkpoint",
@@ -423,7 +441,31 @@ def parse_args() -> argparse.Namespace:
         default=Path("results/i21k_dense_reward_maps"),
     )
     add_dense_sac_comet_args(parser)
+    # Problem: resumes re-applied CLI defaults for every omitted flag. Solution:
+    # pre-parse --resume, load the checkpoint's saved args as parser defaults,
+    # then parse normally so explicit flags still override. Result: a resume
+    # continues with the original hyperparameters (and seeds) by default.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--resume", type=Path, default=None)
+    resume_path = pre_parser.parse_known_args()[0].resume
+    saved_args: dict = {}
+    if resume_path is not None:
+        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        saved_args = dict(checkpoint.get("args", {}) or {})
+        del checkpoint
+        inherit_resume_defaults(parser, saved_args)
     args = parser.parse_args()
+    if resume_path is not None:
+        overrides = {
+            key: (saved_args[key], value)
+            for key, value in vars(args).items()
+            if key in saved_args
+            and key not in {"resume", "batches", "checkpoint_dir", "comet_experiment_key"}
+            and saved_args[key] != value
+        }
+        print(f"Resuming with hyperparameters from {resume_path}.")
+        for key, (old_value, new_value) in sorted(overrides.items()):
+            print(f"  CLI override: {key}: {old_value!r} -> {new_value!r}")
     if args.max_history < args.t + 1:
         raise ValueError("--max-history must be at least --t + 1.")
     if args.resume is not None and args.init_critic_checkpoint is not None:
@@ -1433,8 +1475,13 @@ def build_pretrain_config(args: argparse.Namespace):
     return cfg, modules
 
 
-def build_dense_loader(args: argparse.Namespace, cfg, modules):
-    """Create CanViT-pretrain's shard loader without constructing a val loader."""
+def build_dense_loader(args: argparse.Namespace, cfg, modules, start_step: int = 0):
+    """Create CanViT-pretrain's shard loader without constructing a val loader.
+
+    ``start_step`` is the number of train batches already consumed (from a
+    resume checkpoint); every loader is fast-forwarded past them so a resumed
+    run continues the data stream instead of restarting it.
+    """
     shards_dir = cfg.feature_base_dir / cfg.teacher_name / str(cfg.scene_resolution) / "shards"
     if args.paired_hidden_feature_base_dir is not None:
         hidden_shards_dir = (
@@ -1449,7 +1496,7 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules):
         # rows by staged sample basename instead of relying on shard row order.
         # Result: each rollout sees a hidden warmup image and oracle-target
         # reward for the same sample even after independent parquet shuffles.
-        return PairedDenseShardLoader(
+        paired_loader = PairedDenseShardLoader(
             hidden_shards_dir=hidden_shards_dir,
             target_shards_dir=shards_dir,
             image_size=cfg.scene_resolution,
@@ -1459,8 +1506,10 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules):
             target_image_root=cfg.feature_image_root,
             shuffle_seed=args.seed,
         )
+        paired_loader.skip_batches(start_step)
+        return paired_loader
     if args.subset_size > 0:
-        return FixedDenseSubsetLoader(
+        subset_loader = FixedDenseSubsetLoader(
             shards_dir=shards_dir,
             image_size=cfg.scene_resolution,
             batch_size=args.batch_size,
@@ -1471,15 +1520,19 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules):
             tar_dir=cfg.tar_dir,
             num_workers=args.num_workers,
         )
+        subset_loader.skip_batches(start_step)
+        return subset_loader
+    # ShardedFeatureLoader has native exact resume: it jumps to the right
+    # shard and skips the partial-shard batches.
     return modules.ShardedFeatureLoader(
         shards_dir=shards_dir,
         image_size=cfg.scene_resolution,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        start_step=0,
+        start_step=start_step,
         image_root=cfg.feature_image_root,
         tar_dir=cfg.tar_dir,
-        steps_per_job=args.batches,
+        steps_per_job=max(args.batches - start_step, 1),
     )
 
 
@@ -2003,7 +2056,13 @@ def train_once(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     cfg, modules = build_pretrain_config(args)
     device = cfg.device
-    train_loader = build_dense_loader(args, cfg, modules)
+    # Batches already consumed by the resumed run; the loader skips past them.
+    resume_start_step = 0
+    if args.resume is not None:
+        resume_start_step = int(
+            torch.load(args.resume, map_location="cpu", weights_only=False).get("batch", 0)
+        )
+    train_loader = build_dense_loader(args, cfg, modules, start_step=resume_start_step)
     eval_loader = build_dense_eval_loader(args, cfg)
     model, glimpse_size_px = load_frozen_hf_model(args, cfg)
     canvit_dtype = resolve_canvit_dtype(args.canvit_dtype, device)
@@ -2031,7 +2090,7 @@ def train_once(args: argparse.Namespace) -> None:
         canvas_feature_dim,
         device,
     )
-    start_batch, update_count = load_dense_sac_resume(
+    resume_state = load_dense_sac_resume(
         path=args.resume,
         actor=actor,
         q1=q1,
@@ -2040,6 +2099,9 @@ def train_once(args: argparse.Namespace) -> None:
         target_q2=target_q2,
         agent=agent,
     )
+    start_batch = resume_state.start_batch
+    update_count = resume_state.updates
+    resume_glimpses = resume_state.glimpses
     load_dense_sac_critic_initializer(
         path=args.init_critic_checkpoint,
         q1=q1,
@@ -2047,6 +2109,22 @@ def train_once(args: argparse.Namespace) -> None:
         target_q1=target_q1,
         target_q2=target_q2,
     )
+    args.checkpoint_dir = resolve_dense_checkpoint_dir(
+        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_root=args.checkpoint_root,
+        experiment_name=args.experiment_name,
+        start_batch=start_batch,
+        end_batch=args.batches,
+        batch_size=args.batch_size,
+        t=args.t,
+        resume_glimpses=resume_glimpses,
+    )
+    print(f"Saving dense SAC checkpoints to {args.checkpoint_dir}")
+    if args.resume is not None:
+        print(
+            f"Resumed dense SAC from {args.resume}: start_batch={start_batch} "
+            f"updates={update_count} glimpses={resume_glimpses}"
+        )
     if args.init_critic_checkpoint is not None:
         print(f"Initialized dense SAC critics from {args.init_critic_checkpoint}")
     replay_bytes = replay_canvas_bytes(
@@ -2100,12 +2178,35 @@ def train_once(args: argparse.Namespace) -> None:
     scale_counts = [0 for _ in range(args.t)]
     latest_metrics: dict[str, float] = {}
     elapsed = 0.0
-    glimpses = 0
+    # Problem: glimpses restarted at 0 on resume, resetting the Comet x-axis.
+    # Solution: start from the checkpoint's glimpse count (independent of
+    # --checkpoint-dir) and track this run's glimpses separately for
+    # throughput, since elapsed time is per-process. Result: resumed runs
+    # continue the same glimpse axis with correct glimpses/sec.
+    glimpses = resume_glimpses
+    run_glimpses = 0
     reward_map_interval = max(args.reward_map_interval or args.log_interval, 1)
     next_reward_map_batch = start_batch
     next_actor_reward_percentile_batch = start_batch
     next_eval_batch = max(args.eval_interval, start_batch)
     last_eval_batch: int | None = None
+    if args.resume is not None:
+        # Restore the RNG stream last, after all startup work that consumes
+        # randomness (model/agent init, normalizers, loaders), so batch
+        # start_batch sees the same random state as an uninterrupted run.
+        if resume_state.rng_state is not None:
+            restore_rng_state(resume_state.rng_state)
+        else:
+            # Legacy checkpoints have no RNG snapshot. Re-seeding with --seed
+            # would replay the original run's random stream, so offset it by
+            # the resume batch to get a fresh, still-deterministic stream.
+            print(
+                "Checkpoint has no RNG state; re-seeding with "
+                f"seed={args.seed} + start_batch={start_batch}."
+            )
+            random.seed(args.seed + start_batch)
+            np.random.seed(args.seed + start_batch)
+            torch.manual_seed(args.seed + start_batch)
     pbar = tqdm(range(start_batch, args.batches + 1), desc="Training IN21k dense SAC")
     for batch_idx in pbar:
         if device.type == "cuda":
@@ -2462,6 +2563,7 @@ def train_once(args: argparse.Namespace) -> None:
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - batch_start
         glimpses = comet_step
+        run_glimpses += batch_glimpses
         if batch_idx % args.log_interval == 0 or batch_idx == start_batch:
             latest_metrics = {}
             if reward_window:
@@ -2478,7 +2580,7 @@ def train_once(args: argparse.Namespace) -> None:
                 if values:
                     loss_np = np.asarray(values, dtype=np.float64)
                     latest_metrics[f"train/{loss_name}"] = float(loss_np.mean())
-            latest_metrics["throughput/glimpses_per_sec"] = glimpses / max(elapsed, 1e-12)
+            latest_metrics["throughput/glimpses_per_sec"] = run_glimpses / max(elapsed, 1e-12)
             latest_metrics["train/viewpoint_entropy"] = viewpoint_entropy(
                 entropy_points,
                 bins=args.viewpoint_entropy_bins,
@@ -2562,6 +2664,7 @@ def train_once(args: argparse.Namespace) -> None:
                 batch=batch_idx,
                 updates=update_count,
                 metrics=latest_metrics,
+                glimpses=glimpses,
             )
 
     if eval_loader is not None and last_eval_batch != args.batches:
@@ -2594,6 +2697,7 @@ def train_once(args: argparse.Namespace) -> None:
         batch=args.batches,
         updates=update_count,
         metrics=latest_metrics,
+        glimpses=glimpses,
     )
 
 

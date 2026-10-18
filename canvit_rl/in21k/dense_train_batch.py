@@ -155,19 +155,37 @@ class FixedDenseSubsetSampler(Sampler[int]):
         self.order = self.initial_order.clone()
         self.generator = torch.Generator()
         self.generator.set_state(generator.get_state())
+        self.start_pos = 0
 
     def __iter__(self) -> Iterator[int]:
         while True:
-            for idx in self.order.tolist():
+            order = self.order.tolist()[self.start_pos :]
+            self.start_pos = 0
+            for idx in order:
                 yield int(idx)
             self.order = torch.randperm(self.subset_size, generator=self.generator)
 
     def __len__(self) -> int:
         return self.subset_size
 
+    def skip(self, num_samples: int) -> None:
+        """Advance the sample stream as if ``num_samples`` had been yielded.
+
+        Problem: resumed runs restarted the fixed-subset order from the top.
+        Solution: replay only the per-epoch reshuffles (no data loading) and
+        start the next iteration mid-epoch. Result: the resumed stream matches
+        the uninterrupted run's sample order exactly.
+        """
+        position = self.start_pos + num_samples
+        while position >= self.subset_size:
+            self.order = torch.randperm(self.subset_size, generator=self.generator)
+            position -= self.subset_size
+        self.start_pos = position
+
     def reset(self) -> None:
         """Restart from the same fixed order selected by --eval-subset-seed."""
         self.order = self.initial_order.clone()
+        self.start_pos = 0
 
 
 class FixedDenseSubsetLoader:
@@ -294,6 +312,12 @@ class FixedDenseSubsetLoader:
         """Replay the same fixed subset order for deterministic eval/baselines."""
         self.sampler.reset()
         self.loader_iter = None
+
+    def skip_batches(self, num_batches: int) -> None:
+        """Fast-forward past ``num_batches`` train batches for exact resume."""
+        if self.loader_iter is not None:
+            raise RuntimeError("skip_batches must be called before the first next().")
+        self.sampler.skip(num_batches * self.batch_size)
 
     def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return the next DataLoader batch from the fixed subset."""
@@ -536,6 +560,15 @@ class PairedDenseShardLoader:
         """Replay the same materialized paired order for deterministic eval."""
         self.order = self.initial_order.clone()
         self.pos = 0
+
+    def skip_batches(self, num_batches: int) -> None:
+        """Fast-forward past ``num_batches`` train batches for exact resume.
+
+        Index bookkeeping only (images are already in memory), so this replays
+        the same reshuffles as an uninterrupted run.
+        """
+        for _ in range(num_batches):
+            self._next_indices()
 
     def next(self) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Return hidden images, oracle images, targets, and labels."""
