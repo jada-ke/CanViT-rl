@@ -48,6 +48,7 @@ from tqdm import tqdm
 from _paths import repo_path
 from canvit_rl.vision.precision import resolve_canvit_dtype
 from canvit_rl.environment import get_device
+from canvit_rl.environment.hub import pinned_repo
 
 
 DEFAULT_MODEL_REPO = (
@@ -194,7 +195,7 @@ def _dataloader(dataset: Dataset, *, batch_size: int, device: torch.device) -> D
 
 def load_frozen_model(args: argparse.Namespace, device: torch.device):
     """Load frozen CanViT and resolve the t0 full-scene glimpse size."""
-    model = CanViTForPretrainingHFHub.from_pretrained(args.model_repo).to(device)
+    model = CanViTForPretrainingHFHub.from_pretrained(pinned_repo(args.model_repo)).to(device)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)

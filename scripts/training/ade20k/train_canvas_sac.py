@@ -104,6 +104,7 @@ from canvit_rl.policies.image_independent.viewpoint import (
     action_to_viewpoint,
     parse_discrete_scales,
 )
+from canvit_rl.environment.hub import pinned_repo
 
 try:
     from canvas_sac_optuna import add_canvas_sac_optuna_args, run_canvas_sac_optuna
@@ -212,8 +213,8 @@ def train_once(args: argparse.Namespace) -> float:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

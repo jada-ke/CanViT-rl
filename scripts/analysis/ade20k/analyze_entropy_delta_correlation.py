@@ -39,6 +39,7 @@ from tqdm import tqdm
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.greedy import miou_from_state
 from canvit_rl.tiles import TileSpec, eg_f2c_tiles, tile_to_viewpoint
+from canvit_rl.environment.hub import pinned_repo
 
 
 def _mean_entropy_for_tile(
@@ -316,8 +317,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

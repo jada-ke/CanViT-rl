@@ -2,7 +2,9 @@
 
 Observation: recurrent_cls token — shape (1, 768) squeezed to (768,)
 Action:      [cx, cy, scale] in [-1, 1] x [-1, 1] x (0, 1]
-Reward:      cosine similarity between canvas CLS and frozen DINOv3 teacher CLS
+Reward:      cosine similarity between the canvas's predicted teacher CLS
+             (scene_cls_head on recurrent_cls, destandardized) and the frozen
+             DINOv3 teacher CLS
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from canvit_pytorch import (
 )
 from canvit_pytorch.preprocess import preprocess
 from canvit_pytorch.teacher import load_teacher
+from canvit_rl.environment.hub import pinned_repo
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +100,19 @@ class CanViTEnv(gym.Env):
         # --- Model (loaded once, frozen) ---
         checkpoint = os.environ.get("CANVIT_CHECKPOINT", self.cfg.checkpoint)
         self._model = (
-            CanViTForPretrainingHFHub.from_pretrained(checkpoint)
+            CanViTForPretrainingHFHub.from_pretrained(pinned_repo(checkpoint))
             .eval()
             .to(self.device)
         )
         for p in self._model.parameters():
             p.requires_grad_(False)
+        # CLS standardizer stats are per-teacher, not per-canvas-grid, but the
+        # checkpoint stores them keyed by its training grid (e.g. "32"). Use a
+        # saved key so standardizers() does not create an uninitialized one
+        # for cfg.canvas_grid_size.
+        self._cls_standardizer, _ = self._model.standardizers(
+            self._model.canvas_patch_grid_sizes[0]
+        )
 
         # --- Teacher (loaded once, frozen) ---
         self._teacher = load_teacher(self.cfg.teacher_repo, self.device)
@@ -198,8 +208,22 @@ class CanViTEnv(gym.Env):
         # recurrent_cls: [1, 1, 768] → [1, 768]
         cls = out.state.recurrent_cls.squeeze(1).float()
 
-        # Cosine similarity between canvas CLS and frozen teacher CLS
-        sim = float(F.cosine_similarity(cls, teacher_cls, dim=-1).item())
+        # Problem: the raw recurrent_cls latent and the DINOv3 teacher CLS live
+        # in different spaces, so their cosine was ~0 with a random sign (and
+        # test_cosine_sim_in_info_is_float failed intermittently).
+        # Solution: compare in teacher space, as canvit_rl/in21k/rewards.py
+        # does: scene_cls_head predicts the standardized teacher CLS, the
+        # checkpoint's CLS standardizer maps it back to raw DINOv3 scale.
+        # Result: cosine_sim measures how well the canvas reconstructs the
+        # teacher CLS. The observation is still raw recurrent_cls.
+        with torch.inference_mode():
+            cls_pred = self._model.predict_scene_teacher_cls(out.state.recurrent_cls)
+            cls_pred_raw = self._cls_standardizer.destandardize(
+                cls_pred.unsqueeze(1)
+            ).squeeze(1)
+        sim = float(
+            F.cosine_similarity(cls_pred_raw.float(), teacher_cls.float(), dim=-1).item()
+        )
 
         obs = cls.squeeze(0).cpu().numpy().astype(np.float32)
         return obs, sim

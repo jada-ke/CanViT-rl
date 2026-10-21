@@ -33,6 +33,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from canvit_rl.environment import CanViTEnvConfig, get_device
+from canvit_rl.environment.hub import pinned_repo
 
 # Problem: this script now lives under scripts/evaluation/ade20k, so the old
 # relative CanViT-eval lookup pointed inside scripts/ instead of the repo root.
@@ -136,8 +137,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

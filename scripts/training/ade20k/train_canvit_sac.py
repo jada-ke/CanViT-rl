@@ -47,6 +47,7 @@ from canvit_rl.state.sequences import (
     extract_local_patches,
     sequence_to_arrays,
 )
+from canvit_rl.environment.hub import pinned_repo
 
 
 def _format_step_means(values: list[float]) -> str:
@@ -363,8 +364,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

@@ -73,6 +73,7 @@ from canvit_rl.ade20k.datasets import build_segmentation_dataset
 from canvit_rl.policies.image_independent.viewpoint import ViewpointHistoryCritic
 
 from canvit_rl.ade20k.visualization.reward_maps import visualize_reward_maps_for_indices
+from canvit_rl.environment.hub import pinned_repo
 
 
 def _sync_for_timing(device: torch.device) -> None:
@@ -833,8 +834,8 @@ def train_once(
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

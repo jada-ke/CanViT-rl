@@ -75,6 +75,7 @@ from canvit_rl.policies.image_independent.viewpoint import (
     action_to_viewpoint,
     randomize_actor_mean_viewpoint_prior,
 )
+from canvit_rl.environment.hub import pinned_repo
 
 # Resolve an optional local CanViT-eval checkout from the repository root.
 EVAL_REPO = Path(__file__).resolve().parents[3] / "CanViT-eval"
@@ -1004,8 +1005,8 @@ def train_once(args: argparse.Namespace) -> float:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

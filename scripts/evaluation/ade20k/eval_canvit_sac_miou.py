@@ -66,6 +66,7 @@ from canvit_rl.state.sequences import (
     empty_sequence,
     extract_local_patches,
 )
+from canvit_rl.environment.hub import pinned_repo
 from scripts.training.ade20k.train_canvit_sac import _action_to_viewpoint
 
 
@@ -659,8 +660,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=model_repo,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(model_repo),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)
@@ -677,7 +678,7 @@ def main() -> None:
         # Result: the actor sees the same aux state as in training; mIoU is
         # unchanged because the backbone weights are identical.
         print(f"Loading CanViT pretraining heads for reconstruction_norm state: {model_repo}")
-        model = CanViTForPretrainingHFHub.from_pretrained(model_repo).eval().to(device)
+        model = CanViTForPretrainingHFHub.from_pretrained(pinned_repo(model_repo)).eval().to(device)
         del seg
     for param in model.parameters():
         param.requires_grad_(False)

@@ -78,6 +78,7 @@ from canvit_rl.policies.image_independent.viewpoint import (
     action_to_viewpoint,
     viewpoint_to_action,
 )
+from canvit_rl.environment.hub import pinned_repo
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
@@ -954,8 +955,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

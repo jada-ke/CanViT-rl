@@ -46,6 +46,7 @@ from canvit_pytorch import (
     resolve_canvit_repo,
 )
 from canvit_rl.ade20k.greedy import run_greedy_batch
+from canvit_rl.environment.hub import pinned_repo
 from canvit_specialize.datasets.ade20k import (
     IGNORE_LABEL,
     NUM_CLASSES,
@@ -279,8 +280,8 @@ def main():
 
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

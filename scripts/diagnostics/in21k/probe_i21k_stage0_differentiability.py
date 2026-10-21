@@ -35,6 +35,7 @@ from canvit_rl.in21k.dense_train_batch import (
 )
 from canvit_rl.in21k.pretrain_modules import load_pretrain_modules
 from canvit_rl.in21k.rewards import dense_distillation_metrics
+from canvit_rl.environment.hub import pinned_repo
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
@@ -157,7 +158,7 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules):
 
 def load_frozen_model(args: argparse.Namespace, cfg):
     """Load a frozen CanViT while leaving input/viewpoint autograd enabled."""
-    model = CanViTForPretrainingHFHub.from_pretrained(args.model_repo).to(cfg.device)
+    model = CanViTForPretrainingHFHub.from_pretrained(pinned_repo(args.model_repo)).to(cfg.device)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)

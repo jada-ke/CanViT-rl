@@ -37,6 +37,7 @@ from tqdm import tqdm
 
 from canvit_rl.policies.image_independent.mlp import MLPPolicy
 from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint
+from canvit_rl.environment.hub import pinned_repo
 
 # Resolve an optional local CanViT-eval checkout from the repository root.
 EVAL_REPO = Path(__file__).resolve().parents[2] / "CanViT-eval"
@@ -170,8 +171,8 @@ def evaluate(cfg: EvalConfig) -> Path:
 
     log.info("Loading CanViT segmentation model: %s", cfg.model_repo)
     seg = CanViTForSemanticSegmentation.from_pretrained_with_probe(
-        pretrained_repo=cfg.model_repo,
-        probe_repo=probe_repo,
+        pretrained_repo=pinned_repo(cfg.model_repo),
+        probe_repo=pinned_repo(probe_repo),
     ).to(device).eval()
     probe = seg.head
     policy = load_policy(cfg, device)

@@ -51,6 +51,7 @@ from torchvision.datasets import MNIST
 from _paths import repo_path
 from canvit_rl.vision.precision import resolve_canvit_dtype
 from canvit_rl.environment import get_device
+from canvit_rl.environment.hub import pinned_repo
 
 
 IGNORE_LABEL = 255
@@ -315,7 +316,7 @@ class CanViTOracleFilter:
         self.args = args
         self.device = get_device()
         self.transform = preprocess(args.width)
-        self.model = CanViTForPretrainingHFHub.from_pretrained(args.model_repo).to(
+        self.model = CanViTForPretrainingHFHub.from_pretrained(pinned_repo(args.model_repo)).to(
             self.device
         )
         self.model.eval()

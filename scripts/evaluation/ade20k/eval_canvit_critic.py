@@ -32,6 +32,7 @@ from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
 from canvit_rl.policies.canvas_state.state import empty_viewpoint_history
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.policies.image_independent.viewpoint import ViewpointHistoryCritic
+from canvit_rl.environment.hub import pinned_repo
 from scripts.training.ade20k.pretrain_canvit_critic import (
     _append_history,
     _viewpoint_to_action,
@@ -207,8 +208,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)

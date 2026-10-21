@@ -111,6 +111,7 @@ from canvit_rl.in21k.rewards import (
 )
 from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
 from canvit_rl.policies.image_independent.viewpoint import action_to_viewpoint, viewpoint_to_action
+from canvit_rl.environment.hub import pinned_repo
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
@@ -1594,7 +1595,7 @@ def build_dense_eval_loader(args: argparse.Namespace, cfg):
 
 def load_frozen_hf_model(args: argparse.Namespace, cfg):
     """Load the frozen CanViT pretraining model from Hugging Face."""
-    model = CanViTForPretrainingHFHub.from_pretrained(args.model_repo).to(cfg.device)
+    model = CanViTForPretrainingHFHub.from_pretrained(pinned_repo(args.model_repo)).to(cfg.device)
     model.eval()
     for param in model.parameters():
         param.requires_grad_(False)

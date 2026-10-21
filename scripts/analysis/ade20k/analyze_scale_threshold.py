@@ -58,6 +58,7 @@ from tqdm import tqdm
 from canvit_rl.ade20k.labels import remap_ade_mask_labels
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.greedy import _segmentation_cross_entropy_losses
+from canvit_rl.environment.hub import pinned_repo
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])[:, None, None]
@@ -559,8 +560,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)
