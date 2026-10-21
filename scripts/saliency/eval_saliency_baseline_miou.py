@@ -45,6 +45,7 @@ from tqdm import tqdm
 from _paths import repo_path
 from canvit_rl.environment.canvit_env import CanViTEnvConfig, get_device
 from canvit_rl.ade20k.greedy import miou_from_state
+from canvit_rl.environment.hub import pinned_repo
 
 
 class IndexedDataset(Dataset):
@@ -223,11 +224,19 @@ def _scale_for_blob(
     width: int,
     scales: list[float],
     margin: float,
+    scale_range: tuple[float, float] | None = None,
 ) -> float:
     needed = max(
         ((y_max - y_min + 1) / height) * margin,
         ((x_max - x_min + 1) / width) * margin,
     )
+    if scale_range is not None:
+        # Problem: ADE20K SAC policies use continuous scales in [min-scale, 1]
+        # by default, so a quantized saliency baseline is not a like-for-like
+        # comparison. Solution: in blob_continuous mode use the margin-padded
+        # blob extent directly, clamped to [min_scale, max_scale]. Result: the
+        # baseline matches the default policy's continuous scale range.
+        return min(max(needed, scale_range[0]), scale_range[1])
     for scale in sorted(scales):
         if scale >= needed:
             return scale
@@ -241,12 +250,21 @@ def _select_blob_viewpoint(
     threshold_quantile: float,
     min_area_px: int,
     margin: float,
+    scale_range: tuple[float, float] | None = None,
+    fallback_scales: list[float] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     height, width = saliency.shape
+    # Problem: with no qualifying blob, the fallback reused --scales, which in
+    # fixed_fovea scoring almost always means the smallest scale. Solution:
+    # callers pass an explicit fallback scale (--blob-fallback large|small).
+    # Result: "no salient blob" defaults to a wider look instead of a tight
+    # zoom on faint residual saliency.
+    if fallback_scales is None:
+        fallback_scales = scales
     saliency_cpu = saliency.detach().cpu()
     positive = saliency_cpu[saliency_cpu > 0]
     if positive.numel() == 0:
-        return _select_one_viewpoint(saliency, scales)
+        return _select_one_viewpoint(saliency, fallback_scales)
 
     threshold = float(torch.quantile(positive, threshold_quantile).item())
     mask = saliency_cpu.numpy() >= threshold
@@ -256,7 +274,7 @@ def _select_blob_viewpoint(
         if len(component) >= min_area_px
     ]
     if not components:
-        return _select_one_viewpoint(saliency, scales)
+        return _select_one_viewpoint(saliency, fallback_scales)
 
     saliency_np = saliency_cpu.numpy()
     best_component = max(
@@ -278,6 +296,7 @@ def _select_blob_viewpoint(
         width=width,
         scales=scales,
         margin=margin,
+        scale_range=scale_range,
     )
     # Problem: raw blob extents can produce arbitrary zooms that make saliency
     # comparisons hard to sweep. Solution: use the blob bbox only to pick from
@@ -324,6 +343,8 @@ def _saliency_schedule(
     blob_threshold_quantile: float,
     blob_min_area_px: int,
     blob_margin: float,
+    scale_range: tuple[float, float] | None = None,
+    fallback_scales: list[float] | None = None,
 ) -> tuple[Tensor, Tensor]:
     if n_glimpses == 0:
         batch_size = len(saliency_maps)
@@ -340,13 +361,17 @@ def _saliency_schedule(
         step_centers = []
         step_scales = []
         for saliency in working:
-            if selection_mode == "blob":
+            if selection_mode in ("blob", "blob_continuous"):
                 center, scale, yx = _select_blob_viewpoint(
                     saliency,
                     scales,
                     threshold_quantile=blob_threshold_quantile,
                     min_area_px=blob_min_area_px,
                     margin=blob_margin,
+                    scale_range=(
+                        scale_range if selection_mode == "blob_continuous" else None
+                    ),
+                    fallback_scales=fallback_scales,
                 )
             else:
                 center, scale, yx = _select_one_viewpoint(saliency, scales)
@@ -385,17 +410,36 @@ def _load_visualization_image(image_path: Path, scene_size_px: int) -> np.ndarra
     return np.asarray(image, dtype=np.uint8)
 
 
-def _saliency_overlay(image_np: np.ndarray, saliency: Tensor) -> np.ndarray:
+def _saliency_overlay(
+    image_np: np.ndarray,
+    saliency: Tensor,
+    *,
+    max_alpha: float = 0.7,
+) -> np.ndarray:
+    # Problem: the old overlay dimmed the whole image (x0.72) and tinted it
+    # magenta, so the scene was hard to read under the glimpse boxes.
+    # Solution: blend toward a light pink with per-pixel alpha that grows
+    # with saliency; non-salient pixels stay untouched. Result: salient
+    # regions show as light translucent blotches over a readable image.
+    # Iteration: maps like DeepGaze are peaky (q90 ~ 0.35 after min-max), so
+    # squaring min-max values made blotches nearly invisible. Normalize by the
+    # 99th percentile and scale alpha linearly with saliency instead.
+    # Iteration 2: raised peak alpha to 0.7 and dropped the 1.5 exponent so
+    # mid-saliency regions also tint visibly.
     sal = saliency.detach().cpu().float()
+    if sal.shape != image_np.shape[:2]:
+        sal = F.interpolate(
+            sal[None, None],
+            size=image_np.shape[:2],
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
     sal = sal - sal.min()
-    sal = sal / sal.max().clamp_min(1e-6)
-    sal_np = sal.numpy()
-    heat = np.zeros_like(image_np)
-    heat[..., 0] = (sal_np * 255.0).astype(np.uint8)
-    heat[..., 2] = (sal_np * 255.0).astype(np.uint8)
-    return np.clip(image_np.astype(np.float32) * 0.72 + heat.astype(np.float32) * 0.28, 0, 255).astype(
-        np.uint8
-    )
+    sal = sal / torch.quantile(sal.flatten()[::4], 0.99).clamp_min(1e-6)
+    alpha = (sal.clamp(0.0, 1.0).numpy() * max_alpha)[..., None]
+    blotch = np.array([255.0, 105.0, 205.0], dtype=np.float32)
+    blended = image_np.astype(np.float32) * (1.0 - alpha) + blotch * alpha
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def _save_visualization_figure(
@@ -404,6 +448,7 @@ def _save_visualization_figure(
     method: str,
     output_dir: Path,
     scene_size_px: int,
+    saliency_alpha: float,
 ) -> Path | None:
     if not rows:
         return None
@@ -433,10 +478,11 @@ def _save_visualization_figure(
         centers_by_t = row["centers_by_t"]
         scales_by_t = row["scales_by_t"]
         image_id = str(row["image_id"])
-        overlay_np = _saliency_overlay(image_np, saliency)
+        overlay_np = _saliency_overlay(image_np, saliency, max_alpha=saliency_alpha)
 
         overview_ax = axes[sample_idx, 0]
-        overview_ax.imshow(image_np)
+        # Show the saliency blotches under the combined viewpoint boxes too.
+        overview_ax.imshow(overlay_np)
         overview_ax.set_title(f"{image_id}\nall viewpoints")
         overview_ax.axis("off")
 
@@ -479,7 +525,7 @@ def _save_visualization_figure(
 
         for step_idx, box in enumerate(all_boxes):
             ax = axes[sample_idx, step_idx + 1]
-            ax.imshow(image_np if step_idx == 0 else overlay_np)
+            ax.imshow(overlay_np)
             ax.add_patch(
                 patches.Rectangle(
                     (box[0], box[1]),
@@ -549,7 +595,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--selection-mode",
-        choices=["fixed_fovea", "blob"],
+        choices=["fixed_fovea", "blob", "blob_continuous"],
         default="fixed_fovea",
         help="How saliency maps choose each post-t0 Viewpoint.",
     )
@@ -570,6 +616,33 @@ def main() -> None:
         type=float,
         default=1.25,
         help="Multiplier applied to blob bbox before quantizing to --scales.",
+    )
+    parser.add_argument(
+        "--min-scale",
+        type=float,
+        default=0.25,
+        help="blob_continuous: lower scale clamp (matches SAC --min-scale).",
+    )
+    parser.add_argument(
+        "--max-scale",
+        type=float,
+        default=1.0,
+        help="blob_continuous: upper scale clamp.",
+    )
+    parser.add_argument(
+        "--blob-fallback",
+        choices=["large", "small"],
+        default="large",
+        help=(
+            "Scale used when no blob qualifies. blob: max/min of --scales; "
+            "blob_continuous: --continuous-fallback-scale/--min-scale."
+        ),
+    )
+    parser.add_argument(
+        "--continuous-fallback-scale",
+        type=float,
+        default=0.5,
+        help="blob_continuous + --blob-fallback large: fallback glimpse scale.",
     )
     parser.add_argument("--nms-scale", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -595,6 +668,12 @@ def main() -> None:
         type=Path,
         default=Path("results/saliency_visualizations"),
         help="Directory for --visualize-samples PNG strips.",
+    )
+    parser.add_argument(
+        "--saliency-alpha",
+        type=float,
+        default=0.7,
+        help="Peak opacity of the light saliency overlay in visualizations.",
     )
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--no-amp", action="store_true")
@@ -627,7 +706,25 @@ def main() -> None:
         raise ValueError("--blob-margin must be positive.")
     if args.visualize_samples < 0:
         raise ValueError("--visualize-samples must be non-negative.")
+    if not 0.0 < args.min_scale <= args.max_scale <= 1.0:
+        raise ValueError("Need 0 < --min-scale <= --max-scale <= 1.")
     scales = _parse_scales(args.scales)
+    # Fallback (no qualifying blob) runs the fixed_fovea rule at one scale:
+    # the range limits in blob_continuous, the --scales extremes in blob.
+    if args.selection_mode == "blob_continuous":
+        # Problem: using --max-scale (1.0) as the "large" fallback just repeats
+        # the t0 full-scene glimpse. Solution: a separate, configurable large
+        # fallback (default 0.5). Result: wide but not redundant fallback look.
+        if not args.min_scale <= args.continuous_fallback_scale <= args.max_scale:
+            raise ValueError(
+                "--continuous-fallback-scale must lie in [--min-scale, --max-scale]."
+            )
+        fallback_range = (args.min_scale, args.continuous_fallback_scale)
+    else:
+        fallback_range = (min(scales), max(scales))
+    fallback_scales = [
+        fallback_range[1] if args.blob_fallback == "large" else fallback_range[0]
+    ]
     comet_exp = _make_comet_experiment(args)
 
     cfg = CanViTEnvConfig()
@@ -661,8 +758,8 @@ def main() -> None:
     print(f"Loading CanViT segmentation model with probe: {probe_repo}")
     seg = (
         CanViTForSemanticSegmentation.from_pretrained_with_probe(
-            pretrained_repo=cfg.checkpoint,
-            probe_repo=probe_repo,
+            pretrained_repo=pinned_repo(cfg.checkpoint),
+            probe_repo=pinned_repo(probe_repo),
         )
         .eval()
         .to(device)
@@ -713,6 +810,8 @@ def main() -> None:
                 blob_threshold_quantile=args.blob_threshold_quantile,
                 blob_min_area_px=args.blob_min_area_px,
                 blob_margin=args.blob_margin,
+                scale_range=(args.min_scale, args.max_scale),
+                fallback_scales=fallback_scales,
             )
             if n_visualized < args.visualize_samples:
                 for local_idx, image_id in enumerate(image_ids):
@@ -800,6 +899,7 @@ def main() -> None:
         method=args.method,
         output_dir=visualization_dir,
         scene_size_px=cfg.scene_size_px,
+        saliency_alpha=args.saliency_alpha,
     )
 
     print("\n--- Saliency Baseline mIoU ---")
@@ -840,6 +940,10 @@ def main() -> None:
             "blob_threshold_quantile": args.blob_threshold_quantile,
             "blob_min_area_px": args.blob_min_area_px,
             "blob_margin": args.blob_margin,
+            "min_scale": args.min_scale,
+            "max_scale": args.max_scale,
+            "blob_fallback": args.blob_fallback,
+            "fallback_scale": fallback_scales[0],
             "requested_batch_size": args.batch_size,
             "effective_batch_size": effective_batch_size,
             "probe_repo": probe_repo,
