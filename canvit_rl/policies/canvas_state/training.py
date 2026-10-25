@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, RandomSampler
 from canvit_rl.policies.canvas_state.eval import dataloader_kwargs
 from canvit_rl.environment import CanViTEnvConfig
 from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.canvas_state.state import canvas_aux_state_kind
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
 from canvit_rl.policies.image_independent.viewpoint import randomize_actor_mean_viewpoint_prior
 
@@ -148,7 +149,8 @@ def build_canvas_sac_networks(
         d_model=args.d_model,
         rff_dim=args.rff_dim,
         rff_seed=args.rff_seed,
-        use_entropy_state=getattr(args, "canvas_entropy_state", False),
+        # Either aux kind uses the same single-channel aux branch.
+        use_entropy_state=canvas_aux_state_kind(args) is not None,
         use_canvas_avg_pool=not getattr(args, "disable_canvas_avg_pool", False),
         use_canvas_max_pool=not getattr(args, "disable_canvas_max_pool", False),
         use_viewpoint_history=not getattr(

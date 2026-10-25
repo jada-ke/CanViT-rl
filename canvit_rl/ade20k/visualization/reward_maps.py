@@ -70,7 +70,10 @@ from canvit_rl.ade20k.greedy import (
     _segmentation_cross_entropy_losses,
 )
 from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
-from canvit_rl.policies.canvas_state.state import canvas_layernorm_spatial, canvas_segmentation_entropy
+from canvit_rl.policies.canvas_state.state import (
+    canvas_aux_state_map,
+    canvas_layernorm_spatial,
+)
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.policies.image_independent.viewpoint import (
     ViewpointGaussianActor,
@@ -616,6 +619,9 @@ def visualize_reward_maps_for_indices(
     state_steps: list[int] | None = None,
     output_name_suffix: str | None = None,
     discrete_scales: list[float] | None = None,
+    # Which signal fills the actor/critic aux channel when the encoder has
+    # one; defaults to the legacy ADE probe entropy. See canvas_aux_state_kind.
+    aux_state_kind: str = "segmentation_entropy",
 ) -> list[Path]:
     """Generate reward/Q landscape figures using live SAC networks."""
     rows: list[dict] = []
@@ -693,7 +699,8 @@ def visualize_reward_maps_for_indices(
                             # saw during training. Solution: derive the
                             # normalized probe-entropy map from the current
                             # canvas before each rollout action.
-                            actor_batch["entropy"] = canvas_segmentation_entropy(
+                            actor_batch["entropy"] = canvas_aux_state_map(
+                                kind=aux_state_kind,
                                 model=model,
                                 probe=probe,
                                 state=state,
@@ -746,7 +753,8 @@ def visualize_reward_maps_for_indices(
                         for critic in (q1, q2)
                     )
                     if needs_entropy:
-                        canvas_entropy = canvas_segmentation_entropy(
+                        canvas_entropy = canvas_aux_state_map(
+                            kind=aux_state_kind,
                             model=model,
                             probe=probe,
                             state=state,

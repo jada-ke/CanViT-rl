@@ -25,7 +25,8 @@ from tqdm import tqdm
 from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
-    canvas_segmentation_entropy,
+    canvas_aux_state_kind,
+    canvas_aux_state_map,
     empty_viewpoint_history,
 )
 from canvit_rl.environment import CanViTEnvConfig
@@ -321,15 +322,12 @@ def eval_canvas_sac_batch(
             state=state,
             canvas_grid_size=cfg.canvas_grid_size,
         )
-        canvas_entropy = (
-            canvas_segmentation_entropy(
-                model=model,
-                probe=probe,
-                state=state,
-                canvas_grid_size=cfg.canvas_grid_size,
-            )
-            if getattr(args, "canvas_entropy_state", False)
-            else None
+        canvas_entropy = canvas_aux_state_map(
+            kind=canvas_aux_state_kind(args),
+            model=model,
+            probe=probe,
+            state=state,
+            canvas_grid_size=cfg.canvas_grid_size,
         )
     coords, lengths = append_viewpoint_history(
         coords=coords,
@@ -364,15 +362,12 @@ def eval_canvas_sac_batch(
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
-            canvas_entropy = (
-                canvas_segmentation_entropy(
-                    model=model,
-                    probe=probe,
-                    state=state,
-                    canvas_grid_size=cfg.canvas_grid_size,
-                )
-                if getattr(args, "canvas_entropy_state", False)
-                else None
+            canvas_entropy = canvas_aux_state_map(
+                kind=canvas_aux_state_kind(args),
+                model=model,
+                probe=probe,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
             )
         coords, lengths = append_viewpoint_history(
             coords=coords,
@@ -617,15 +612,12 @@ def evaluate_full_validation_miou(
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
-            canvas_entropy = (
-                canvas_segmentation_entropy(
-                    model=model,
-                    probe=probe,
-                    state=state,
-                    canvas_grid_size=cfg.canvas_grid_size,
-                )
-                if getattr(args, "canvas_entropy_state", False)
-                else None
+            canvas_entropy = canvas_aux_state_map(
+                kind=canvas_aux_state_kind(args),
+                model=model,
+                probe=probe,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
             )
         coords, lengths = append_viewpoint_history(
             coords=coords,
@@ -663,15 +655,12 @@ def evaluate_full_validation_miou(
                     state=state,
                     canvas_grid_size=cfg.canvas_grid_size,
                 )
-                canvas_entropy = (
-                    canvas_segmentation_entropy(
-                        model=model,
-                        probe=probe,
-                        state=state,
-                        canvas_grid_size=cfg.canvas_grid_size,
-                    )
-                    if getattr(args, "canvas_entropy_state", False)
-                    else None
+                canvas_entropy = canvas_aux_state_map(
+                    kind=canvas_aux_state_kind(args),
+                    model=model,
+                    probe=probe,
+                    state=state,
+                    canvas_grid_size=cfg.canvas_grid_size,
                 )
             coords, lengths = append_viewpoint_history(
                 coords=coords,

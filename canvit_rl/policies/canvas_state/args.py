@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from canvit_rl.policies.canvas_state.logging import add_canvas_sac_comet_args
+from canvit_rl.policies.canvas_state.state import canvas_aux_state_kind
 from canvit_rl.policies.image_independent.viewpoint import parse_discrete_scales
 
 
@@ -234,6 +235,9 @@ def validate_canvas_sac_args(args: argparse.Namespace) -> None:
         raise ValueError("--actor-init-center-radius must be in [0, 1).")
     # Fail fast on malformed --discrete-scales before any model is built.
     parse_discrete_scales(args.discrete_scales)
+    # Fail fast if both single-channel aux kinds are set (reconstruction_norm
+    # is only set by inherit_canvas_state_args from a checkpoint).
+    canvas_aux_state_kind(args)
     if args.disable_canvas_avg_pool and args.disable_canvas_max_pool:
         raise ValueError(
             "At least one canvas pooling branch must remain enabled; do not pass "

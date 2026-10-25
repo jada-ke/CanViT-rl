@@ -13,6 +13,7 @@ from canvit_rl.ade20k.visualization.reward_maps import (
     visualize_reward_maps_for_indices,
 )
 from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
+from canvit_rl.policies.canvas_state.state import canvas_aux_state_kind
 from canvit_rl.environment import CanViTEnvConfig
 from canvit_rl.policies.image_independent.viewpoint import parse_discrete_scales
 
@@ -48,6 +49,8 @@ def maybe_visualize_canvas_sac_reward_maps(
     indices = list(range(min(args.reward_map_images, len(eval_dataset))))
     # Match the trainer's action space so plotted glimpses/Q use binned scales.
     discrete_scales = parse_discrete_scales(getattr(args, "discrete_scales", None))
+    # Feed the same aux map as training (probe entropy vs reconstruction norm).
+    aux_state_kind = canvas_aux_state_kind(args) or "segmentation_entropy"
     # Problem: live reward diagnostics require two visualization scripts, which
     # made the trainer import and coordinate plotting details directly.
     # Solution: keep that orchestration here so train_canvas_sac only decides
@@ -75,6 +78,7 @@ def maybe_visualize_canvas_sac_reward_maps(
         max_history=args.max_history,
         output_name_suffix=f"{policy_label}_update_{update_count:06d}",
         discrete_scales=discrete_scales,
+        aux_state_kind=aux_state_kind,
     )
     paths.extend(
         visualize_canvas_policy_for_indices(
@@ -96,6 +100,7 @@ def maybe_visualize_canvas_sac_reward_maps(
             canvit_dtype=canvit_dtype,
             output_name_suffix=f"{policy_label}_update_{update_count:06d}",
             discrete_scales=discrete_scales,
+            aux_state_kind=aux_state_kind,
         )
     )
     if comet_exp is not None:

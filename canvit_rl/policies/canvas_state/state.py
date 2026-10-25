@@ -73,6 +73,60 @@ def canvas_dinov3_reconstruction_norm(
     return ((norm_map - min_val) / (max_val - min_val).clamp_min(eps)).contiguous()
 
 
+def canvas_aux_state_kind(args) -> str | None:
+    """Return the single aux-map kind ADE Canvas SAC/PPO feeds the actor/critics.
+
+    Problem: ADE ``--canvas-entropy-state`` means probe entropy, while IN21k
+    dense SAC uses the same flag name for reconstructed DINOv3 feature norms.
+    An IN21k-pretrained actor fine-tuned on ADE would therefore see a different
+    signal on its aux channel. Solution: ``inherit_canvas_state_args`` sets
+    ``reconstruction_norm_state`` from the init/resume checkpoint metadata, and
+    every rollout site resolves the map through this function. Result: the aux
+    channel keeps the same meaning across IN21k pretraining and ADE fine-tuning.
+    """
+    use_entropy = bool(getattr(args, "canvas_entropy_state", False))
+    use_reconstruction_norm = bool(getattr(args, "reconstruction_norm_state", False))
+    if use_entropy and use_reconstruction_norm:
+        raise ValueError(
+            "canvas_entropy_state and reconstruction_norm_state both use the "
+            "single ADE aux-state channel; set at most one."
+        )
+    if use_reconstruction_norm:
+        return "reconstruction_norm"
+    if use_entropy:
+        return "segmentation_entropy"
+    return None
+
+
+def canvas_aux_state_map(
+    *,
+    kind: str | None,
+    model,
+    probe: torch.nn.Module,
+    state,
+    canvas_grid_size: int,
+) -> torch.Tensor | None:
+    """Build the [B, 1, G, G] aux map selected by ``canvas_aux_state_kind``."""
+    if kind is None:
+        return None
+    if kind == "segmentation_entropy":
+        return canvas_segmentation_entropy(
+            model=model,
+            probe=probe,
+            state=state,
+            canvas_grid_size=canvas_grid_size,
+        )
+    if kind == "reconstruction_norm":
+        # Requires a CanViT with the pretraining teacher-scene head
+        # (CanViTForPretrainingHFHub); the segmentation wrapper drops it.
+        return canvas_dinov3_reconstruction_norm(
+            model=model,
+            state=state,
+            canvas_grid_size=canvas_grid_size,
+        )
+    raise ValueError(f"Unknown canvas aux-state kind: {kind}")
+
+
 def canvas_teacher_reconstruction_error(
     *,
     model,

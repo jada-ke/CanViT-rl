@@ -59,7 +59,10 @@ from canvit_pytorch import (
 from tqdm import tqdm
 
 from canvit_rl.policies.canvas_state.args import add_canvas_sac_args, validate_canvas_sac_args
-from canvit_rl.policies.canvas_state.checkpoints import checkpoint_module_state
+from canvit_rl.policies.canvas_state.checkpoints import (
+    checkpoint_aux_state_kind,
+    checkpoint_module_state,
+)
 from canvit_rl.policies.canvas_state.eval import (
     evaluate_best_full_validation_miou,
     evaluate_canvas_sac,
@@ -258,6 +261,19 @@ def _maybe_raise_ppo_trial_collapse(
 def validate_canvas_ppo_args(args: argparse.Namespace) -> None:
     """Validate PPO-specific constraints after shared Canvas arg checks."""
     validate_canvas_sac_args(args)
+    # Problem: PPO rollouts hardcode probe entropy and load the segmentation
+    # wrapper without the teacher-scene head, so an IN21k reconstruction-norm
+    # actor would silently get the wrong aux signal. Solution: reject such
+    # init/resume checkpoints until PPO is wired like train_canvas_sac.py.
+    for path in (args.resume, args.init_actor_checkpoint):
+        if path is None:
+            continue
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if checkpoint_aux_state_kind(checkpoint) == "reconstruction_norm":
+            raise ValueError(
+                f"{path} uses reconstruction_norm aux state, which only "
+                "train_canvas_sac.py supports."
+            )
     if args.t < 1:
         raise ValueError("Canvas PPO requires --t >= 1 so each rollout has actions.")
     if args.ppo_epochs < 1:

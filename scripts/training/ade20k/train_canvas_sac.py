@@ -50,6 +50,7 @@ from canvit_rl.policies.canvas_state.logging import (
 import numpy as np
 import torch
 from canvit_pytorch import (
+    CanViTForPretrainingHFHub,
     CanViTForSemanticSegmentation,
     Viewpoint,
     resolve_canvit_repo,
@@ -60,7 +61,8 @@ from tqdm import tqdm
 from canvit_rl.policies.canvas_state.state import (
     append_viewpoint_history,
     canvas_layernorm_spatial,
-    canvas_segmentation_entropy,
+    canvas_aux_state_kind,
+    canvas_aux_state_map,
     empty_viewpoint_history,
 )
 from canvit_rl.policies.canvas_state.sac import (
@@ -75,6 +77,7 @@ from canvit_rl.policies.canvas_state.sac import (
 from canvit_rl.vision.precision import configure_frozen_canvit_precision
 from canvit_rl.policies.canvas_state.args import add_canvas_sac_args, validate_canvas_sac_args
 from canvit_rl.policies.canvas_state.checkpoints import (
+    inherit_canvas_state_args,
     load_canvas_sac_pretrained_initializers,
     load_canvas_sac_resume,
     save_canvas_sac_checkpoint,
@@ -193,6 +196,10 @@ def train_once(args: argparse.Namespace) -> float:
     """Run full current-canvas SAC and return best relative eval CE gain."""
     # None -> continuous scales; list -> binned scale action.
     discrete_scales = parse_discrete_scales(getattr(args, "discrete_scales", None))
+    # Take actor shape and aux-state kind (probe entropy vs IN21k
+    # reconstruction norm) from --resume/--init-actor-checkpoint, so model
+    # loading, networks, replay and rollouts below all match the checkpoint.
+    inherit_canvas_state_args(args)
     validate_canvas_sac_args(args)
     parse_reward_map_scales(args.reward_map_scales)
     random.seed(args.seed)
@@ -221,6 +228,25 @@ def train_once(args: argparse.Namespace) -> float:
     )
     model = seg.canvit
     probe = seg.head
+    if canvas_aux_state_kind(args) == "reconstruction_norm":
+        # Problem: from_pretrained_with_probe drops pretraining-only modules,
+        # including scene_patches_head, so predict_teacher_scene is unavailable
+        # for the reconstruction-norm aux state.
+        # Solution: roll out with the full pretraining model from the same repo
+        # (identical CanViT backbone weights/forward plus the teacher-scene
+        # head) and keep the ADE20K probe for rewards/mIoU.
+        # Result: the aux channel matches IN21k dense SAC pretraining while the
+        # segmentation reward is unchanged. Mirrors eval_canvit_sac_miou.py.
+        print(
+            "Loading CanViT pretraining heads for reconstruction_norm state: "
+            f"{cfg.checkpoint}"
+        )
+        model = (
+            CanViTForPretrainingHFHub.from_pretrained(pinned_repo(cfg.checkpoint))
+            .eval()
+            .to(device)
+        )
+        del seg
     canvit_dtype = configure_frozen_canvit_precision(
         model=model,
         probe=probe,
@@ -274,7 +300,7 @@ def train_once(args: argparse.Namespace) -> float:
         capacity=args.buffer_size,
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=cfg.canvas_grid_size,
-        include_entropy=args.canvas_entropy_state,
+        include_entropy=canvas_aux_state_kind(args) is not None,
     )
     replay_device = resolve_replay_device(
         train_device=device,
@@ -300,7 +326,7 @@ def train_once(args: argparse.Namespace) -> float:
         canvas_feature_dim=canvas_feature_dim,
         canvas_grid_size=cfg.canvas_grid_size,
         storage_device=replay_device,
-        store_entropy=args.canvas_entropy_state,
+        store_entropy=canvas_aux_state_kind(args) is not None,
         pin_memory=replay_pin_memory,
     )
     comet_exp = make_comet_experiment(args)
@@ -415,15 +441,12 @@ def train_once(args: argparse.Namespace) -> float:
                 state=state,
                 canvas_grid_size=cfg.canvas_grid_size,
             )
-            canvas_entropy = (
-                canvas_segmentation_entropy(
-                    model=model,
-                    probe=probe,
-                    state=state,
-                    canvas_grid_size=cfg.canvas_grid_size,
-                )
-                if args.canvas_entropy_state
-                else None
+            canvas_entropy = canvas_aux_state_map(
+                kind=canvas_aux_state_kind(args),
+                model=model,
+                probe=probe,
+                state=state,
+                canvas_grid_size=cfg.canvas_grid_size,
             )
         coords, lengths = append_viewpoint_history(
             coords=coords,
@@ -477,15 +500,12 @@ def train_once(args: argparse.Namespace) -> float:
                     state=out.state,
                     canvas_grid_size=cfg.canvas_grid_size,
                 )
-                next_canvas_entropy = (
-                    canvas_segmentation_entropy(
-                        model=model,
-                        probe=probe,
-                        state=out.state,
-                        canvas_grid_size=cfg.canvas_grid_size,
-                    )
-                    if args.canvas_entropy_state
-                    else None
+                next_canvas_entropy = canvas_aux_state_map(
+                    kind=canvas_aux_state_kind(args),
+                    model=model,
+                    probe=probe,
+                    state=out.state,
+                    canvas_grid_size=cfg.canvas_grid_size,
                 )
             reward = relative_ce_reduction(current_ce, next_ce)
             coords, lengths = append_viewpoint_history(

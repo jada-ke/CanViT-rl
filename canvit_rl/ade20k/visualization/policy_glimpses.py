@@ -47,7 +47,10 @@ from canvit_specialize.datasets.ade20k import IGNORE_LABEL, make_val_transforms
 from canvit_rl.ade20k.datasets import build_segmentation_dataset
 from canvit_rl.ade20k.greedy import miou_from_state, run_greedy_episode
 from canvit_rl.policies.canvas_state.models import CanvasStateActor
-from canvit_rl.policies.canvas_state.state import canvas_layernorm_spatial, canvas_segmentation_entropy
+from canvit_rl.policies.canvas_state.state import (
+    canvas_aux_state_map,
+    canvas_layernorm_spatial,
+)
 from canvit_rl.environment import CanViTEnvConfig, get_device
 from canvit_rl.policies.image_independent.viewpoint import (
     ViewpointGaussianActor,
@@ -705,6 +708,9 @@ def _run_canvas_sac_episode(
     device: torch.device,
     canvit_dtype: torch.dtype | None = None,
     discrete_scales: list[float] | None = None,
+    # Which signal fills the actor/critic aux channel when the encoder has
+    # one; defaults to the legacy ADE probe entropy. See canvas_aux_state_kind.
+    aux_state_kind: str = "segmentation_entropy",
 ) -> dict:
     """Roll out a loaded image-dependent canvas SAC actor."""
     batch_size = image.shape[0]
@@ -759,7 +765,8 @@ def _run_canvas_sac_episode(
             # Solution: derive entropy from the current canvas before each
             # action. Result: glimpse visualization can load entropy-state
             # actors without hitting a missing batch['entropy'] KeyError.
-            actor_batch["entropy"] = canvas_segmentation_entropy(
+            actor_batch["entropy"] = canvas_aux_state_map(
+                kind=aux_state_kind,
                 model=model,
                 probe=probe,
                 state=state,
@@ -832,6 +839,9 @@ def visualize_canvas_policy_for_indices(
     canvit_dtype: torch.dtype | None = None,
     output_name_suffix: str | None = None,
     discrete_scales: list[float] | None = None,
+    # Which signal fills the actor/critic aux channel when the encoder has
+    # one; defaults to the legacy ADE probe entropy. See canvas_aux_state_kind.
+    aux_state_kind: str = "segmentation_entropy",
 ) -> list[Path]:
     """Save deterministic live Canvas SAC policy glimpse visualizations."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -857,6 +867,7 @@ def visualize_canvas_policy_for_indices(
                     device=device,
                     canvit_dtype=canvit_dtype,
                     discrete_scales=discrete_scales,
+                    aux_state_kind=aux_state_kind,
                 )
                 rows.append(
                     {
