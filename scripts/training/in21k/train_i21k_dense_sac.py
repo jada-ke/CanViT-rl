@@ -147,8 +147,18 @@ def parse_reward_map_scales(value: str) -> list[float]:
 
 def make_dense_comet_experiment(args: argparse.Namespace):
     """Create a Comet experiment only when explicitly enabled."""
+    global Experiment, ExistingExperiment
     if args.no_comet:
         return None
+    # Problem: the top-level import only fires when "--comet" is in sys.argv,
+    # but --resume inherits no_comet=False from the checkpoint's saved args, so
+    # Comet was enabled without ever being imported. Solution: import lazily
+    # here as a fallback. Result: resumed Comet runs log without re-passing --comet.
+    if Experiment is None or ExistingExperiment is None:
+        try:
+            from comet_ml import ExistingExperiment, Experiment
+        except ImportError:
+            pass
     if Experiment is None or ExistingExperiment is None:
         raise RuntimeError("Install comet-ml or run without --comet.")
     comet_experiment_key = args.comet_experiment_key
