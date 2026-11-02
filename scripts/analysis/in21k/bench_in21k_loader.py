@@ -85,6 +85,14 @@ def _read_images(indices: list[int], decode: bool) -> tuple[int, int]:
     return len(indices), nbytes
 
 
+def _worker_init() -> None:
+    # Problem: the multi-process phases hung after the 1-proc phases ran torch
+    # ops in the parent, starting its OpenMP thread pool, which is not
+    # fork-safe. Solution: do what DataLoader workers do and pin each worker to
+    # one torch thread. Result: forked workers no longer deadlock.
+    torch.set_num_threads(1)
+
+
 def _worker_features(indices: list[int]) -> tuple[int, int]:
     return _read_features(indices)
 
@@ -133,6 +141,10 @@ def main() -> None:
         # Same split as AllShardsDataset: worker w takes samples w, w+N, w+2N, ...
         return [indices[w::workers] for w in range(workers)]
 
+    # Fork the worker pool before the parent runs any torch compute (phase 4's
+    # resize), so children never inherit a started OpenMP pool.
+    pool = mp.get_context("fork").Pool(args.num_workers, initializer=_worker_init)
+
     t0 = time.perf_counter()
     k, b = _read_features(slices[1])
     report("2. features, 1 proc", k, b, time.perf_counter() - t0, args.t)
@@ -149,8 +161,7 @@ def main() -> None:
             _TRANSFORM(f.convert("RGB"))
     report("4. decode+resize, 1 proc", len(blobs), sum(map(len, blobs)), time.perf_counter() - t0, args.t)
 
-    ctx = mp.get_context("fork")
-    with ctx.Pool(args.num_workers) as pool:
+    with pool:
         t0 = time.perf_counter()
         parts = pool.map(_worker_features, strided(slices[4], args.num_workers))
         report(
