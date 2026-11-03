@@ -43,8 +43,11 @@ Example:
 from __future__ import annotations
 
 import argparse
+import logging
 import math
+import os
 import random
+import socket
 import sys
 import time
 from pathlib import Path
@@ -182,8 +185,18 @@ def make_dense_comet_experiment(args: argparse.Namespace):
         # opened a new Comet run. Solution: reopen the checkpoint's saved
         # experiment key, or an explicit CLI key. Result: resumed metrics and
         # figures continue on the original experiment timeline.
+        # Problem: ExistingExperiment defaults log_env_details/gpu/cpu to
+        # False, so resumed runs logged no sys.* metrics (GPU util, CPU, RAM,
+        # disk). Solution: re-enable system monitoring explicitly. Result:
+        # resumed phases can be checked for data starvation like fresh runs.
         experiment = ExistingExperiment(
             previous_experiment=comet_experiment_key,
+            log_env_details=True,
+            log_env_gpu=True,
+            log_env_cpu=True,
+            log_env_network=True,
+            log_env_disk=True,
+            log_env_host=True,
             **comet_kwargs,
         )
         args.comet_experiment_key = comet_experiment_key
@@ -575,6 +588,60 @@ def _viewpoint_box(
     right = int(round(min(width - 1.0, center_x + box_w * 0.5)))
     bottom = int(round(min(height - 1.0, center_y + box_h * 0.5)))
     return left, top, right, bottom
+
+
+# Problem: throughput/glimpses_per_sec only measures whole batches, so a slow
+# run cannot be split into loader wait vs. GPU rollout vs. SAC updates. Solution:
+# accumulate CUDA-synchronized wall time per loop phase and report each phase's
+# share at every log interval. Result: one run shows where batch time goes.
+TRAIN_TIMING_PHASES = ("data", "rollout", "viz", "update", "eval", "checkpoint")
+
+
+def _record_phase(
+    phase_times: dict[str, float],
+    name: str,
+    start: float,
+    device: torch.device,
+) -> float:
+    """Add time since ``start`` to ``phase_times[name]``; return the new start."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    now = time.perf_counter()
+    phase_times[name] += now - start
+    return now
+
+
+def _timing_metrics(phase_times: dict[str, float], n_batches: int) -> dict[str, float]:
+    """Return per-phase ms/batch and fraction of total time for a log window."""
+    total = sum(phase_times.values())
+    metrics: dict[str, float] = {}
+    for name in TRAIN_TIMING_PHASES:
+        seconds = phase_times[name]
+        metrics[f"timing/{name}_ms_per_batch"] = 1e3 * seconds / max(n_batches, 1)
+        metrics[f"timing/{name}_frac"] = seconds / total if total > 0 else 0.0
+    return metrics
+
+
+def _runtime_environment(args: argparse.Namespace, device: torch.device) -> dict[str, str]:
+    """Collect node/CPU/thread facts needed to compare throughput across jobs."""
+    try:
+        usable_cpus = str(len(os.sched_getaffinity(0)))
+    except AttributeError:
+        usable_cpus = str(os.cpu_count())
+    env = {
+        "host": socket.gethostname(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "slurm_nodelist": os.environ.get("SLURM_JOB_NODELIST", ""),
+        "slurm_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK", ""),
+        "slurm_mem_per_node": os.environ.get("SLURM_MEM_PER_NODE", ""),
+        "usable_cpus": usable_cpus,
+        "torch_num_threads": str(torch.get_num_threads()),
+        "num_workers": str(args.num_workers),
+        "kernel": os.uname().release,
+    }
+    if device.type == "cuda":
+        env["gpu"] = torch.cuda.get_device_name(device)
+    return env
 
 
 def maybe_save_debug_rollout_viz(
@@ -2177,6 +2244,17 @@ def train_once(args: argparse.Namespace) -> None:
     )
 
     comet_exp = make_dense_comet_experiment(args)
+    runtime_env = _runtime_environment(args, device)
+    print(
+        "Runtime environment: "
+        + " ".join(f"{key}={value}" for key, value in runtime_env.items()),
+        flush=True,
+    )
+    if comet_exp is not None:
+        # log_other keeps the latest value, so each resume overwrites these;
+        # the stdout line above preserves the per-job history.
+        for key, value in runtime_env.items():
+            comet_exp.log_other(f"runtime/{key}", value)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     reward_window: list[float] = []
     train_final_loss_windows: dict[str, list[float]] = {
@@ -2196,6 +2274,8 @@ def train_once(args: argparse.Namespace) -> None:
     # continue the same glimpse axis with correct glimpses/sec.
     glimpses = resume_glimpses
     run_glimpses = 0
+    phase_times = {name: 0.0 for name in TRAIN_TIMING_PHASES}
+    phase_window_batches = 0
     reward_map_interval = max(args.reward_map_interval or args.log_interval, 1)
     next_reward_map_batch = start_batch
     next_actor_reward_percentile_batch = start_batch
@@ -2230,6 +2310,7 @@ def train_once(args: argparse.Namespace) -> None:
             cls_norm=cls_norm,
             non_blocking=True,
         )
+        phase_start = _record_phase(phase_times, "data", batch_start, device)
         batch_size = batch.images.shape[0]
         batch_glimpses = batch_size * (args.t + 1)
         comet_step = glimpses + batch_glimpses
@@ -2292,6 +2373,7 @@ def train_once(args: argparse.Namespace) -> None:
             canvas_summary=canvas_summary,
             prev_canvas_summary=initial_canvas_summary,
         )
+        phase_start = _record_phase(phase_times, "rollout", phase_start, device)
         should_log_reward_maps = args.reward_map_images > 0 and batch_idx >= next_reward_map_batch
         if should_log_reward_maps:
             reward_map_batch = batch
@@ -2431,6 +2513,7 @@ def train_once(args: argparse.Namespace) -> None:
             )
             while next_reward_map_batch <= batch_idx:
                 next_reward_map_batch += reward_map_interval
+        phase_start = _record_phase(phase_times, "viz", phase_start, device)
         rollout_viewpoints = [full_vp]
         rollout_rewards: list[torch.Tensor] = []
 
@@ -2553,6 +2636,7 @@ def train_once(args: argparse.Namespace) -> None:
             current_metrics.loss_raw.detach().cpu().numpy().astype(float).tolist()
         )
 
+        phase_start = _record_phase(phase_times, "rollout", phase_start, device)
         maybe_save_debug_rollout_viz(
             args=args,
             comet_exp=comet_exp,
@@ -2564,11 +2648,14 @@ def train_once(args: argparse.Namespace) -> None:
             batch_idx=batch_idx,
             start_batch=start_batch,
         )
+        phase_start = _record_phase(phase_times, "viz", phase_start, device)
 
         if replay.size >= args.learning_starts:
             for _ in range(args.updates_per_batch):
                 agent.update(replay.sample(args.replay_batch_size, device))
                 update_count += 1
+        _record_phase(phase_times, "update", phase_start, device)
+        phase_window_batches += 1
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -2592,6 +2679,19 @@ def train_once(args: argparse.Namespace) -> None:
                     loss_np = np.asarray(values, dtype=np.float64)
                     latest_metrics[f"train/{loss_name}"] = float(loss_np.mean())
             latest_metrics["throughput/glimpses_per_sec"] = run_glimpses / max(elapsed, 1e-12)
+            timing = _timing_metrics(phase_times, phase_window_batches)
+            latest_metrics.update(timing)
+            pbar.write(
+                f"timing batch={batch_idx} n={phase_window_batches} "
+                + " ".join(
+                    f"{name}={timing[f'timing/{name}_ms_per_batch']:.0f}ms"
+                    f"({100 * timing[f'timing/{name}_frac']:.0f}%)"
+                    for name in TRAIN_TIMING_PHASES
+                )
+                + f" glimpses/s={latest_metrics['throughput/glimpses_per_sec']:.0f}"
+            )
+            phase_times = {name: 0.0 for name in TRAIN_TIMING_PHASES}
+            phase_window_batches = 0
             latest_metrics["train/viewpoint_entropy"] = viewpoint_entropy(
                 entropy_points,
                 bins=args.viewpoint_entropy_bins,
@@ -2613,6 +2713,7 @@ def train_once(args: argparse.Namespace) -> None:
                 updates=update_count,
             )
 
+        phase_start = time.perf_counter()
         if eval_loader is not None and batch_idx >= next_eval_batch:
             should_eval_actor_reward_percentiles = (
                 args.actor_reward_percentile_grid_size > 0
@@ -2660,6 +2761,7 @@ def train_once(args: argparse.Namespace) -> None:
                     next_actor_reward_percentile_batch += reward_map_interval
             while next_eval_batch <= batch_idx:
                 next_eval_batch += args.eval_interval
+        phase_start = _record_phase(phase_times, "eval", phase_start, device)
 
         if batch_idx % args.checkpoint_interval == 0:
             save_dense_sac_checkpoint(
@@ -2677,6 +2779,7 @@ def train_once(args: argparse.Namespace) -> None:
                 metrics=latest_metrics,
                 glimpses=glimpses,
             )
+        _record_phase(phase_times, "checkpoint", phase_start, device)
 
     if eval_loader is not None and last_eval_batch != args.batches:
         eval_metrics = evaluate_dense_sac(
@@ -2714,6 +2817,16 @@ def train_once(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """CLI entrypoint."""
+    # Problem: canvit_pretrain's ShardedFeatureLoader logs per-shard load time
+    # and per-worker read/transform/patches ms/img at INFO, but this script
+    # never configured logging, so those lines were dropped. Solution: route
+    # canvit_pretrain INFO logs to stderr; other libraries stay at WARNING.
+    # Result: job .out files show where loader time goes without extra flags.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.getLogger("canvit_pretrain").setLevel(logging.INFO)
     train_once(parse_args())
 
 

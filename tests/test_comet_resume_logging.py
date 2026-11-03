@@ -74,6 +74,9 @@ def test_canvas_comet_resume_uses_checkpoint_experiment_key(
     assert args.comet_experiment_key == "saved-comet-key"
     assert experiment.name == "resume-run"
     assert experiment.tags == ["resume", "canvas"]
+    # ExistingExperiment defaults system monitoring off; resumes must re-enable it.
+    for flag in ("log_env_details", "log_env_gpu", "log_env_cpu"):
+        assert experiment.kwargs[flag] is True
 
 
 def test_canvas_comet_fresh_run_stores_new_experiment_key(monkeypatch) -> None:

@@ -73,8 +73,18 @@ def make_comet_experiment(args: argparse.Namespace):
         # Problem: checkpoint resume used to restore trainer state while Comet
         # created a separate run. Solution: reopen the saved/explicit Comet
         # experiment key. Result: resumed metrics append to the same dashboard.
+        # Problem: ExistingExperiment defaults log_env_details/gpu/cpu to
+        # False, so resumed runs logged no sys.* metrics. Solution: re-enable
+        # system monitoring explicitly. Result: GPU/CPU/RAM/disk metrics
+        # continue across resumes.
         experiment = ExistingExperiment(
             previous_experiment=comet_experiment_key,
+            log_env_details=True,
+            log_env_gpu=True,
+            log_env_cpu=True,
+            log_env_network=True,
+            log_env_disk=True,
+            log_env_host=True,
             **kwargs,
         )
         args.comet_experiment_key = comet_experiment_key
