@@ -107,6 +107,7 @@ from canvit_rl.in21k.dense_train_batch import (
     load_dense_train_batch,
 )
 from canvit_rl.in21k.pretrain_modules import load_pretrain_modules
+from canvit_rl.in21k.shard_staging import StagedShardedFeatureLoader, resolve_stage_dir
 from canvit_rl.in21k.rewards import (
     DenseDistillationMetrics,
     dense_distillation_metrics,
@@ -261,6 +262,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--glimpse-grid-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--stage-shards-ahead",
+        type=int,
+        default=3,
+        help=(
+            "Copy this many upcoming feature shards to node-local disk in the "
+            "background (full-dataset loader only). 0 reads shards in place."
+        ),
+    )
+    parser.add_argument(
+        "--stage-shards-dir",
+        type=Path,
+        default=None,
+        help="Local staging directory. Default: $SLURM_TMPDIR/canvit_shards.",
+    )
+    parser.add_argument(
+        "--stage-copy-threads",
+        type=int,
+        default=2,
+        help="Concurrent shard copies used by --stage-shards-ahead.",
+    )
     parser.add_argument(
         "--subset-size",
         type=int,
@@ -1600,6 +1622,30 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules, start_step: int =
         )
         subset_loader.skip_batches(start_step)
         return subset_loader
+    # Problem: strided mmap reads of feature shards on shared storage starve
+    # the GPU (data wait ~66% of batch time on nibi). Solution: when a local
+    # staging dir is available, copy upcoming shards there in the background
+    # and let the loader read the local copies. Result: same loader, order and
+    # resume; shards that are not staged in time are read in place as before.
+    stage_dir = (
+        resolve_stage_dir(args.stage_shards_dir) if args.stage_shards_ahead > 0 else None
+    )
+    if stage_dir is not None:
+        return StagedShardedFeatureLoader(
+            modules.ShardedFeatureLoader,
+            shards_dir=shards_dir,
+            stage_dir=stage_dir,
+            start_step=start_step,
+            ahead=args.stage_shards_ahead,
+            copy_threads=args.stage_copy_threads,
+            image_size=cfg.scene_resolution,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            image_root=cfg.feature_image_root,
+            tar_dir=cfg.tar_dir,
+            steps_per_job=max(args.batches - start_step, 1),
+        )
+    print("Shard staging off: reading feature shards in place.", flush=True)
     # ShardedFeatureLoader has native exact resume: it jumps to the right
     # shard and skips the partial-shard batches.
     return modules.ShardedFeatureLoader(
@@ -2681,6 +2727,8 @@ def train_once(args: argparse.Namespace) -> None:
             latest_metrics["throughput/glimpses_per_sec"] = run_glimpses / max(elapsed, 1e-12)
             timing = _timing_metrics(phase_times, phase_window_batches)
             latest_metrics.update(timing)
+            if hasattr(train_loader, "staging_metrics"):
+                latest_metrics.update(train_loader.staging_metrics())
             pbar.write(
                 f"timing batch={batch_idx} n={phase_window_batches} "
                 + " ".join(
@@ -2813,6 +2861,8 @@ def train_once(args: argparse.Namespace) -> None:
         metrics=latest_metrics,
         glimpses=glimpses,
     )
+    if isinstance(train_loader, StagedShardedFeatureLoader):
+        train_loader.close()
 
 
 def main() -> None:
@@ -2827,6 +2877,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger("canvit_pretrain").setLevel(logging.INFO)
+    logging.getLogger("canvit_rl").setLevel(logging.INFO)
     train_once(parse_args())
 
 
