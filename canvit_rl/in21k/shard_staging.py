@@ -21,6 +21,7 @@ The upstream loader, sample order and exact resume are unchanged.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import shutil
@@ -38,13 +39,52 @@ log = logging.getLogger(__name__)
 DEFAULT_MIN_FREE_BYTES = 20 * 1024**3
 
 
-def copy_shard(src: Path, dst: Path) -> None:
-    """Copy ``src`` to ``dst`` sequentially, then drop ``src`` from page cache.
+# Problem: one sequential copy stream reads /project at only ~80-100 MB/s on
+# nibi (job 26201418), below the ~260 MB/s training consumes, so staging fell
+# behind. Solution: copy each shard as parallel byte ranges (os.pread/pwrite
+# release the GIL), keeping several requests in flight on the shared
+# filesystem. Result: per-shard copy rate scales with ``streams``.
+DEFAULT_COPY_STREAMS = 8
+COPY_CHUNK_BYTES = 64 * 1024**2
 
-    Page cache counts against the Slurm job's memory limit; the source pages
-    are never read again (workers read the local copy), so release them.
+
+def copy_shard(src: Path, dst: Path, streams: int = DEFAULT_COPY_STREAMS) -> None:
+    """Copy ``src`` to ``dst`` with ``streams`` parallel range reads.
+
+    Afterwards drop ``src`` from page cache: page cache counts against the
+    Slurm job's memory limit, and workers read the local copy instead.
     """
-    shutil.copyfile(src, dst)
+    size = os.path.getsize(src)
+    if streams <= 1 or size <= COPY_CHUNK_BYTES:
+        shutil.copyfile(src, dst)
+    else:
+        src_fd = os.open(src, os.O_RDONLY)
+        try:
+            dst_fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                os.ftruncate(dst_fd, size)
+
+                def copy_range(offset: int) -> None:
+                    end = min(offset + COPY_CHUNK_BYTES, size)
+                    pos = offset
+                    while pos < end:
+                        data = os.pread(src_fd, end - pos, pos)
+                        if not data:
+                            raise OSError(f"short read from {src} at byte {pos}")
+                        written = 0
+                        while written < len(data):
+                            written += os.pwrite(dst_fd, data[written:], pos + written)
+                        pos += len(data)
+
+                with ThreadPoolExecutor(streams, thread_name_prefix="range-copy") as pool:
+                    # list() re-raises the first failed range.
+                    list(pool.map(copy_range, range(0, size, COPY_CHUNK_BYTES)))
+            finally:
+                os.close(dst_fd)
+        finally:
+            os.close(src_fd)
+    if os.path.getsize(dst) != size:
+        raise OSError(f"copy of {src} is {os.path.getsize(dst)} bytes, expected {size}")
     if hasattr(os, "posix_fadvise"):
         fd = os.open(src, os.O_RDONLY)
         try:
@@ -129,7 +169,8 @@ class ShardStager:
         behind: int = 1,
         copy_threads: int = 2,
         min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
-        copy_fn: Callable[[Path, Path], Any] = copy_shard,
+        copy_streams: int = DEFAULT_COPY_STREAMS,
+        copy_fn: Callable[[Path, Path], Any] | None = None,
     ) -> None:
         if ahead < 1:
             raise ValueError("ahead must be >= 1")
@@ -139,7 +180,7 @@ class ShardStager:
         self.behind = behind
         self.copy_threads = copy_threads
         self.min_free_bytes = min_free_bytes
-        self.copy_fn = copy_fn
+        self.copy_fn = copy_fn or functools.partial(copy_shard, streams=copy_streams)
         self.n_shards = len(self.link_files)
         self._lock = threading.Lock()
         self._wake = threading.Event()
@@ -348,6 +389,7 @@ class StagedShardedFeatureLoader:
         start_step: int,
         ahead: int = 3,
         copy_threads: int = 2,
+        copy_streams: int = DEFAULT_COPY_STREAMS,
         min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
         **loader_kwargs: Any,
     ) -> None:
@@ -362,6 +404,7 @@ class StagedShardedFeatureLoader:
             sources,
             ahead=ahead,
             copy_threads=copy_threads,
+            copy_streams=copy_streams,
             min_free_bytes=min_free_bytes,
         )
         self.batches_per_shard = int(self.inner.batches_per_shard)

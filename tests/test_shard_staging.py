@@ -201,3 +201,37 @@ def test_staged_loader_matches_unstaged_stream(tmp_path) -> None:
 def test_stager_rejects_nonpositive_ahead(tmp_path, ahead) -> None:
     with pytest.raises(ValueError):
         _stager(tmp_path, ahead=ahead)
+
+
+@pytest.mark.parametrize("streams", [1, 3, 8])
+def test_copy_shard_ranges_are_byte_identical(tmp_path, monkeypatch, streams) -> None:
+    # Problem: parallel range copies must reproduce the file exactly,
+    # including a final partial chunk. Use a small chunk size so the test
+    # file spans many ranges.
+    import canvit_rl.in21k.shard_staging as staging
+
+    monkeypatch.setattr(staging, "COPY_CHUNK_BYTES", 1000)
+    src = tmp_path / "src.pt"
+    payload = os.urandom(10_537)  # not a multiple of the chunk size
+    src.write_bytes(payload)
+    dst = tmp_path / "dst.pt"
+    dst.write_bytes(b"stale content longer than nothing" * 1000)  # must be truncated
+    staging.copy_shard(src, dst, streams=streams)
+    assert dst.read_bytes() == payload
+
+
+def test_copy_shard_propagates_read_errors(tmp_path, monkeypatch) -> None:
+    import canvit_rl.in21k.shard_staging as staging
+
+    monkeypatch.setattr(staging, "COPY_CHUNK_BYTES", 100)
+    src = tmp_path / "src.pt"
+    src.write_bytes(b"x" * 1000)
+
+    def failing_pread(fd, n, offset):
+        if offset >= 500:
+            raise OSError("I/O error")
+        return b"x" * n
+
+    monkeypatch.setattr(staging.os, "pread", failing_pread)
+    with pytest.raises(OSError):
+        staging.copy_shard(src, tmp_path / "dst.pt", streams=4)
