@@ -284,6 +284,12 @@ def parse_args() -> argparse.Namespace:
         help="Concurrent shard copies used by --stage-shards-ahead.",
     )
     parser.add_argument(
+        "--stage-copy-streams",
+        type=int,
+        default=8,
+        help="Parallel byte-range reads per shard copy (1 = single stream).",
+    )
+    parser.add_argument(
         "--subset-size",
         type=int,
         default=0,
@@ -1638,6 +1644,7 @@ def build_dense_loader(args: argparse.Namespace, cfg, modules, start_step: int =
             start_step=start_step,
             ahead=args.stage_shards_ahead,
             copy_threads=args.stage_copy_threads,
+            copy_streams=args.stage_copy_streams,
             image_size=cfg.scene_resolution,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
