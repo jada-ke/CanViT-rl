@@ -640,14 +640,15 @@ def _record_phase(
 
 
 def _timing_metrics(phase_times: dict[str, float], n_batches: int) -> dict[str, float]:
-    """Return per-phase ms/batch and fraction of total time for a log window."""
-    total = sum(phase_times.values())
-    metrics: dict[str, float] = {}
-    for name in TRAIN_TIMING_PHASES:
-        seconds = phase_times[name]
-        metrics[f"timing/{name}_ms_per_batch"] = 1e3 * seconds / max(n_batches, 1)
-        metrics[f"timing/{name}_frac"] = seconds / total if total > 0 else 0.0
-    return metrics
+    """Return per-phase ms/batch for a log window.
+
+    Phase fractions are not logged: they follow from these values (each
+    phase's ms over their sum), so Comet keeps one series per phase.
+    """
+    return {
+        f"timing/{name}_ms_per_batch": 1e3 * phase_times[name] / max(n_batches, 1)
+        for name in TRAIN_TIMING_PHASES
+    }
 
 
 def _runtime_environment(args: argparse.Namespace, device: torch.device) -> dict[str, str]:
@@ -2736,11 +2737,12 @@ def train_once(args: argparse.Namespace) -> None:
             latest_metrics.update(timing)
             if hasattr(train_loader, "staging_metrics"):
                 latest_metrics.update(train_loader.staging_metrics())
+            window_seconds = sum(phase_times.values())
             pbar.write(
                 f"timing batch={batch_idx} n={phase_window_batches} "
                 + " ".join(
                     f"{name}={timing[f'timing/{name}_ms_per_batch']:.0f}ms"
-                    f"({100 * timing[f'timing/{name}_frac']:.0f}%)"
+                    f"({100 * phase_times[name] / max(window_seconds, 1e-12):.0f}%)"
                     for name in TRAIN_TIMING_PHASES
                 )
                 + f" glimpses/s={latest_metrics['throughput/glimpses_per_sec']:.0f}"
