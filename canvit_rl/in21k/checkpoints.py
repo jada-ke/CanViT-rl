@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -12,6 +13,24 @@ import torch
 
 from canvit_rl.policies.canvas_state.sac import CanvasSAC
 from canvit_rl.policies.canvas_state.models import CanvasStateActor, CanvasStateCritic
+
+
+def atomic_torch_save(obj: Any, path: Path) -> None:
+    """Save ``obj`` to ``path`` so an interrupted save never corrupts ``path``.
+
+    Problem: ``latest.pt`` was written in place every --checkpoint-interval
+    batches; a Slurm timeout or node failure mid-write left a truncated file
+    and lost the whole job's progress. Solution: write to a temporary file in
+    the same directory, fsync it, then ``os.replace`` it over ``path`` (atomic
+    on POSIX). Result: ``path`` is always either the previous or the new
+    complete checkpoint.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp")
+    torch.save(obj, tmp)
+    with open(tmp, "rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
 
 
 def _dense_state_representation(args: argparse.Namespace) -> str:
@@ -153,7 +172,7 @@ def save_dense_sac_checkpoint(
 ) -> None:
     """Save dense SAC state without assuming ADE/CE validation semantics."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
+    atomic_torch_save(
         {
             "actor": actor.state_dict(),
             "q1": q1.state_dict(),

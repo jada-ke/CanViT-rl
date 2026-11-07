@@ -60,3 +60,36 @@ def test_fresh_run_targets_glimpses() -> None:
 def test_explicit_dir_and_no_name_fallbacks() -> None:
     assert _resolve(checkpoint_dir=Path("custom")) == Path("custom")
     assert _resolve(experiment_name=None) == Path("checkpoints/in1k_dense_sac")
+
+
+def test_atomic_torch_save_keeps_previous_file_on_failure(tmp_path, monkeypatch) -> None:
+    # Problem: a job killed mid-save used to leave a truncated latest.pt.
+    # Expect: a failed save leaves the previous checkpoint loadable and
+    # unchanged; a successful save replaces it and leaves no temp file.
+    import torch
+
+    from canvit_rl.in21k import checkpoints
+
+    path = tmp_path / "latest.pt"
+    checkpoints.atomic_torch_save({"batch": 1}, path)
+    assert torch.load(path)["batch"] == 1
+
+    real_save = torch.save
+
+    def dying_save(obj, f):
+        real_save(obj, f)
+        with open(f, "r+b") as handle:  # simulate a write cut off mid-file
+            handle.truncate(10)
+        raise KeyboardInterrupt("killed")
+
+    monkeypatch.setattr(checkpoints.torch, "save", dying_save)
+    try:
+        checkpoints.atomic_torch_save({"batch": 2}, path)
+    except KeyboardInterrupt:
+        pass
+    monkeypatch.setattr(checkpoints.torch, "save", real_save)
+    assert torch.load(path)["batch"] == 1
+
+    checkpoints.atomic_torch_save({"batch": 3}, path)
+    assert torch.load(path)["batch"] == 3
+    assert not (tmp_path / ".latest.pt.tmp").exists()
