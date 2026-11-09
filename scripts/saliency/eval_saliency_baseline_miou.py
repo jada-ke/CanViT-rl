@@ -553,10 +553,61 @@ def _save_visualization_figure(
     return output
 
 
+def _log_eval_curves_to_comet(
+    *,
+    comet_exp,
+    mious: dict[str, float],
+    mean_scales: dict[str, float],
+    n_steps: int,
+    method: str,
+) -> None:
+    """Log final aggregated mIoU and mean scale per timestep as line charts."""
+    # Problem: saliency runs only logged flat miou/t* scalars, so Comet showed
+    # no mIoU-vs-timestep line like the SAC eval. Solution: mirror
+    # eval_canvit_sac_miou._log_eval_curves_to_comet with identical metric,
+    # curve, and figure names. Result: saliency and SAC runs overlay directly
+    # in the same Comet panels.
+    timesteps = list(range(n_steps))
+    miou_values = [float(mious[f"t{t}"]) for t in timesteps]
+    scale_values = [float(mean_scales[f"t{t}"]) for t in timesteps]
+    # Using the timestep as the Comet step makes each metric render as a line
+    # chart over t0..tT in the Panels view.
+    for t, miou, scale in zip(timesteps, miou_values, scale_values, strict=True):
+        comet_exp.log_metric("eval/miou_by_timestep", miou, step=t)
+        comet_exp.log_metric("eval/mean_scale_by_timestep", scale, step=t)
+    comet_exp.log_curve("eval_miou_by_timestep", x=timesteps, y=miou_values, step=0)
+    comet_exp.log_curve(
+        "eval_mean_scale_by_timestep", x=timesteps, y=scale_values, step=0
+    )
+
+    import matplotlib.pyplot as plt
+
+    fig, (miou_ax, scale_ax) = plt.subplots(1, 2, figsize=(10, 4), dpi=150)
+    miou_ax.plot(timesteps, miou_values, marker="o")
+    miou_ax.set_xlabel("timestep")
+    miou_ax.set_ylabel("mIoU")
+    miou_ax.set_title(f"Aggregated mIoU by timestep ({method})")
+    miou_ax.set_xticks(timesteps, [f"t{t}" for t in timesteps])
+    miou_ax.grid(True, alpha=0.25)
+    scale_ax.plot(timesteps, scale_values, marker="o", color="tab:orange")
+    scale_ax.set_xlabel("timestep")
+    scale_ax.set_ylabel("mean scale")
+    scale_ax.set_title("Mean glimpse scale by timestep")
+    scale_ax.set_xticks(timesteps, [f"t{t}" for t in timesteps])
+    scale_ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    comet_exp.log_figure(figure_name="eval_miou_and_scale_by_timestep", figure=fig, step=0)
+    plt.close(fig)
+
+
 def _log_to_comet(
     *,
     comet_exp,
     metrics: dict[str, float],
+    mious: dict[str, float],
+    mean_scales: dict[str, float],
+    n_steps: int,
+    method: str,
     output: Path,
     visualization_path: Path | None,
 ) -> None:
@@ -564,6 +615,13 @@ def _log_to_comet(
     if comet_exp is None:
         return
     comet_exp.log_metrics(metrics)
+    _log_eval_curves_to_comet(
+        comet_exp=comet_exp,
+        mious=mious,
+        mean_scales=mean_scales,
+        n_steps=n_steps,
+        method=method,
+    )
     if visualization_path is not None:
         # Problem: saliency crop sanity checks were only local files. Solution:
         # log the combined timestep figure alongside scalar mIoU. Result:
@@ -676,7 +734,17 @@ def main() -> None:
         help="Peak opacity of the light saliency overlay in visualizations.",
     )
     parser.add_argument("--max-batches", type=int, default=None)
-    parser.add_argument("--no-amp", action="store_true")
+    # Problem: bf16 autocast was on by default, while eval_canvit_sac_miou.py
+    # runs the CanViT forward in fp32, so saliency and SAC mIoU were not
+    # computed at identical precision. Solution: default to fp32; --amp opts
+    # back into bf16 (--no-amp still accepted). Result: saliency baselines are
+    # directly comparable to SAC eval numbers without extra flags.
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run the CanViT forward under bf16 autocast (default: fp32, matching SAC eval).",
+    )
     parser.add_argument(
         "--miou-mode",
         choices=["accumulator", "mean"],
@@ -729,7 +797,7 @@ def main() -> None:
 
     cfg = CanViTEnvConfig()
     device = get_device()
-    amp = not args.no_amp
+    amp = args.amp
     amp_dtype = torch.bfloat16 if amp else torch.float32
     print(f"Device: {device}")
 
@@ -967,6 +1035,10 @@ def main() -> None:
     _log_to_comet(
         comet_exp=comet_exp,
         metrics=final_metrics,
+        mious=mious,
+        mean_scales=mean_scales,
+        n_steps=n_steps,
+        method=args.method,
         output=output,
         visualization_path=visualization_path,
     )
