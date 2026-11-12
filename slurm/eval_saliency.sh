@@ -4,16 +4,18 @@
 #SBATCH --time=01:30:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
-#SBATCH --output=job_%x_%j.out
+#SBATCH --output=job_%x_%A_%a.out
 #SBATCH --gpus-per-node=h100:1
 #SBATCH --partition=gpubase_bygpu_b1
+#SBATCH --array=0-5
 
 # Saliency-baseline ADE20K mIoU eval (1 full-scene glimpse + T saliency glimpses).
 #
 # Usage:
 #   export COMET_API_KEY=...   # sbatch forwards the submitting shell's env
-#   sbatch --job-name=sal-deepgaze-fixed05 slurm/eval_saliency.sh deepgaze fixed05
-#   sbatch --job-name=sal-gbvs-blobcont    slurm/eval_saliency.sh gbvs blobcont
+#   sbatch slurm/eval_saliency.sh                  # all runs in --array (deepgaze + gbvs)
+#   sbatch --array=6-8 slurm/eval_saliency.sh      # pick runs by index from RUNS
+#   sbatch --array=0 slurm/eval_saliency.sh deepgaze blobcont   # explicit single run
 #
 # METHOD: itti | gbvs | deepgaze  (cache/saliency/ade20k_validation/<METHOD>)
 # MODE:
@@ -21,12 +23,28 @@
 #   blobcont     blob_continuous, scale in [0.25, 1.0]
 #   blob025-05   blob, quantized to {0.25, 0.5}
 # T: saliency glimpses after t0 (default 4)
-#
 
 set -euo pipefail
 
-METHOD=${1:?usage: eval_saliency.sh METHOD MODE [T]}
-MODE=${2:?usage: eval_saliency.sh METHOD MODE [T]}
+RUNS=(
+  "deepgaze fixed05"     # 0
+  "deepgaze blobcont"    # 1
+  "deepgaze blob025-05"  # 2
+  "gbvs fixed05"         # 3
+  "gbvs blobcont"        # 4
+  "gbvs blob025-05"      # 5
+  "itti fixed05"         # 6
+  "itti blobcont"        # 7
+  "itti blob025-05"      # 8
+)
+
+if [[ $# -ge 2 ]]; then
+  METHOD=$1
+  MODE=$2
+else
+  TASK_ID=${SLURM_ARRAY_TASK_ID:?no METHOD MODE given and not running as an array task}
+  read -r METHOD MODE <<< "${RUNS[$TASK_ID]:?no RUNS entry for array index $TASK_ID}"
+fi
 T=${3:-4}
 
 case "$MODE" in
